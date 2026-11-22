@@ -10,7 +10,7 @@ Setup steps for `andexor-carmen-api` that a person must do on a platform such as
 
 ## This machine
 
-- [ ] Copy `.env.example` to `.env` and fill in the Client ID and Client Secret of the Cloudflare Access service token `andexor-carmen-api`. `health.sh`, `preview-test.sh`, and `deploy.sh` need it.
+- [X] Copy `.env.example` to `.env` and fill in the Client ID and Client Secret of the Cloudflare Access service token `andexor-carmen-api`. `health.sh`, `preview-test.sh`, and `deploy.sh` need it.
 
 ## Cloudflare
 
