@@ -1,5 +1,5 @@
 
-2026-11-22T03:39:24+00:00
+2026-11-22T05:31:50+00:00
 
 | Name                | Version | License                              |
 |---------------------|---------|--------------------------------------|
@@ -8,7 +8,7 @@
 | annotated-types     | 0.8.0   | MIT                                  |
 | anyio               | 4.16.0  | MIT                                  |
 | click               | 8.5.1   | BSD-3-Clause                         |
-| fastapi             | 0.162.7 | MIT                                  |
+| fastapi             | 0.163.0 | MIT                                  |
 | idna                | 3.20    | BSD-3-Clause                         |
 | markdown-it-py      | 4.3.0   | MIT License                          |
 | mdurl               | 0.1.2   | MIT License                          |
