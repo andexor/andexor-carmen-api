@@ -54,6 +54,8 @@ jobs:
   production:
     name: Deploy to production
     needs: preview
+    # Records each deploy as a GitHub deployment, shown in the repo's Deployments panel.
+    environment: production
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:

@@ -106,6 +106,15 @@ Decided 2026-11-22. The action versions copied from `andexor-net-website-ping` w
 - **FR-026**: `.github/workflows/ci.yml` uses `actions/checkout@v7.0.1`, `actions/setup-node@v7.1.0`, and `astral-sh/setup-uv@v10.4.0`, each of which declares Node.js 24.
 - **FR-027**: `.github/dependabot.yml` also watches the `github-actions` ecosystem, weekly, so a later release arrives as a pull request and is accepted only when the check `Preview and smoke test` passes with it.
 
+## Change 8: production deploys are recorded as GitHub deployments
+
+Decided 2026-11-22. The production job runs only after a merge, on the new commit on `main`, so it does not appear on the pull request that caused it and was hard to find.
+
+### Requirements
+
+- **FR-028**: The `Deploy to production` job declares `environment: production`, so GitHub records each run of it as a deployment and the repo shows the latest production deploy and its history.
+- **FR-029**: The `production` environment has no protection rules and no secrets of its own. The gate stays the required check `Preview and smoke test`, and the job keeps using the repo's secrets.
+
 ## Success criteria
 
 - **SC-001**: `.specify/memory/constitution.md` is identical to the file in `andexor-carmen-main` (version 2.1.0).
