@@ -8,7 +8,7 @@ Author: Ed Jenkins <ed@andexor.net>
 
 Thank you for helping keep Andexor Network, Inc. and its ecosystem secure. This policy covers the source code in this
 repository. For a security problem with the live website at https://andexor.net/, with an email address at
-andexor.net, or with a service Andexor hosts, use the company's [Security Policy](https://andexor.net/security-policy)
+andexor.net, or with a service Andexor hosts, use the company's [Security Policy](https://andexor.net/company/security-policy)
 instead. It states the scope, the response times, the coordinated disclosure window, and the safe harbor for
 good-faith research. Reports about the code are welcome through either channel.
 
@@ -66,12 +66,11 @@ The following categories **are** considered security vulnerabilities when they a
 
 - **Content injection or cross-site scripting (XSS)**: any way for a page to run script or render markup that the
   Markdown source or the components did not intend
-- **Path traversal or information disclosure in `server.ts`**: serving a file outside `out/`, or exposing the
-  container's file system or environment
-- **Supply chain**: a build script, dependency override, or Dockerfile step that could fetch or run code from an
+- **Path traversal or information disclosure in `server.ts` for front-end apps**: serving a file outside `out/`
+- **Supply chain**: a build script or dependency override that could fetch or run code from an
   untrusted source, or that bypasses the frozen lockfile
 - **Build-time code execution**: a Markdown file, front matter, or asset that causes the build to run code
-- **Denial of service in `server.ts`** from a single malformed request, such as a crash or a hang, as distinct from
+- **Denial of service in `server.ts` for front-end apps** from a single malformed request, such as a crash or a hang, as distinct from
   volume-based attacks, which are out of scope
 - **Secrets in the repository or the built site**: a credential, token, or private key committed by mistake
 
@@ -84,7 +83,7 @@ reporting is enabled on this repository and should be enabled on every repositor
 
 We acknowledge reports within 3 business days and aim to fix a confirmed issue within 90 days. Please give us that
 time before you discuss the issue publicly. Research that follows this policy and the website's
-[Security Policy](https://andexor.net/security-policy) is covered by the safe harbor described there.
+[Security Policy](https://andexor.net/company/security-policy) is covered by the safe harbor described there.
 
 ### Reporting Guidelines
 

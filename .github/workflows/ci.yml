@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andexor Network, Inc.
+# Author: Ed Jenkins <ed@andexor.net>
+
+# Pull request: migrate the preview database, deploy the preview Worker, smoke test it (required check).
+# Push to main: the same, then migrate the production database and deploy to production.
+# Both hostnames are behind Cloudflare Access. The smoke test signs in to the preview with a service
+# token. That token is refused on production by design, so production has no HTTP check here.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  # The migrations and their runner live in andexor-carmen-main, checked out beside this repo's files.
+  CARMEN_MAIN: carmen-main
+
+jobs:
+  preview:
+    name: Preview and smoke test
+    runs-on: ubuntu-latest
+    # One shared preview: runs take turns so a smoke test never meets a preview another run just overwrote.
+    concurrency:
+      group: preview-environment
+      cancel-in-progress: false
+    env:
+      ACCESS_CLIENT_ID: ${{ secrets.ACCESS_CLIENT_ID }}
+      ACCESS_CLIENT_SECRET: ${{ secrets.ACCESS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: andexor/andexor-carmen-main
+          path: carmen-main
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6.0.1
+      - name: Install dependencies
+        run: |
+          npm install -g cf@latest
+          uv sync
+      - name: Migrate, deploy the preview, and smoke test
+        run: ./preview-test.sh
+
+  production:
+    name: Deploy to production
+    needs: preview
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4.2.2
+        with:
+          repository: andexor/andexor-carmen-main
+          path: carmen-main
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6.0.1
+      - name: Install dependencies
+        run: |
+          npm install -g cf@latest
+          uv sync
+      - name: Migrate the production database
+        run: python3 carmen-main/tools/migrate.py prod
+      - name: Deploy to production
+        run: uv run pywrangler deploy

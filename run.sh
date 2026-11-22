@@ -4,10 +4,5 @@
 # Copyright 2026 Andexor Network, Inc.
 # Author: Ed Jenkins <ed@andexor.net>
 
-# variables
-APP=$(basename "$PWD")
-IMAGE=andexor/${APP}
-VERSION=1
-
-# run
-docker run --rm -p 3000:3000 ${IMAGE}:${VERSION}
+# Local run at http://localhost:8787, with a local database. Cloudflare Access is not in front of it.
+uv run pywrangler dev

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andexor Network, Inc.
+# Author: Ed Jenkins <ed@andexor.net>
+
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # uv only resolves packages older than a week (exclude-newer in pyproject.toml), so Dependabot
+    # must not propose anything newer.
+    cooldown:
+      default-days: 7
