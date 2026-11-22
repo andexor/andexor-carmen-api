@@ -35,15 +35,15 @@ jobs:
       ACCESS_CLIENT_ID: ${{ secrets.ACCESS_CLIENT_ID }}
       ACCESS_CLIENT_SECRET: ${{ secrets.ACCESS_CLIENT_SECRET }}
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           repository: andexor/andexor-carmen-main
           path: carmen-main
-      - uses: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
-      - uses: astral-sh/setup-uv@v6.0.1
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Install dependencies
         run: |
           npm install -g cf@latest
@@ -57,15 +57,15 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           repository: andexor/andexor-carmen-main
           path: carmen-main
-      - uses: actions/setup-node@v4.4.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: "22"
-      - uses: astral-sh/setup-uv@v6.0.1
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Install dependencies
         run: |
           npm install -g cf@latest

@@ -97,6 +97,15 @@ Decided 2026-11-22, issue #4. `fastapi<0.163` was copied from `andexor-net-websi
 
 Checked 2026-11-22: FastAPI 0.163.0 deploys to the preview Worker and `GET /api/v1/health` returns 200, from a development machine and in the pipeline.
 
+## Change 7: the pipeline's actions run on Node.js 24
+
+Decided 2026-11-22. The action versions copied from `andexor-net-website-ping` were built for Node.js 20, which GitHub has deprecated, so every run carried a warning.
+
+### Requirements
+
+- **FR-026**: `.github/workflows/ci.yml` uses `actions/checkout@v7.0.1`, `actions/setup-node@v7.1.0`, and `astral-sh/setup-uv@v10.4.0`, each of which declares Node.js 24.
+- **FR-027**: `.github/dependabot.yml` also watches the `github-actions` ecosystem, weekly, so a later release arrives as a pull request and is accepted only when the check `Preview and smoke test` passes with it.
+
 ## Success criteria
 
 - **SC-001**: `.specify/memory/constitution.md` is identical to the file in `andexor-carmen-main` (version 2.1.0).
