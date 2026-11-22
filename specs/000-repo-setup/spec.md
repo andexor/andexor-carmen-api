@@ -86,6 +86,17 @@ Decided 2026-11-22. Version 1 has one user, an `ADMIN`, so nothing would show a 
 
 No second person is onboarded, so no test signs in as a real `MEMBER` or `READER` through Cloudflare Access. The tests call the rule and the routes with simulated users of each role. The first real sign-in by a second person is the first end-to-end test, and that person starts as `READER`.
 
+## Change 6: FastAPI is no longer pinned
+
+Decided 2026-11-22, issue #4. `fastapi<0.163` was copied from `andexor-net-website-ping`, where it was set because Cloudflare Python Workers did not run FastAPI 0.163 or later. That no longer holds. This replaces the pin in FR-003.
+
+### Requirements
+
+- **FR-024**: `pyproject.toml` lists `fastapi` with no upper bound. `uv.lock` and the one-week `exclude-newer` rule decide the version, and Dependabot proposes upgrades.
+- **FR-025**: A FastAPI upgrade is accepted only when the check `Preview and smoke test` passes with it, because that check deploys the new version to a real Python Worker.
+
+Checked 2026-11-22: FastAPI 0.163.0 deploys to the preview Worker and `GET /api/v1/health` returns 200, from a development machine and in the pipeline.
+
 ## Success criteria
 
 - **SC-001**: `.specify/memory/constitution.md` is identical to the file in `andexor-carmen-main` (version 2.1.0).
