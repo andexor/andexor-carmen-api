@@ -74,6 +74,14 @@ Both Carmen hostnames sit behind Cloudflare Access. `health.sh` signs in to the 
 
 `.env` is git-ignored. Never commit the token.
 
+## Local runs
+
+A local run has no Cloudflare Access in front of it. To act as a user, create `.dev.vars` (git-ignored) with one line:
+
+> `DEV_USER_EMAIL=<your email>`
+
+Then run `./run.sh`. The first user in the local database is an `ADMIN`, and every later one is a `READER`. Never put `DEV_USER_EMAIL` in `wrangler.jsonc`.
+
 ## PlantUML
 
 Only needed to draw diagrams in `doc/uml`. It needs Java.

@@ -11,6 +11,7 @@ Setup steps for `andexor-carmen-api` that a person must do on a platform such as
 ## This machine
 
 - [X] Copy `.env.example` to `.env` and fill in the Client ID and Client Secret of the Cloudflare Access service token `andexor-carmen-api`. `health.sh`, `preview-test.sh`, and `deploy.sh` need it.
+- [ ] For local runs, create `.dev.vars` with the line `DEV_USER_EMAIL=<your email>` (see `setup.md`).
 
 ## Cloudflare
 
@@ -20,6 +21,13 @@ Setup steps for `andexor-carmen-api` that a person must do on a platform such as
 ## GitHub
 
 - [x] (found active 2026-11-22) Default-branch ruleset `andexor-default-ruleset` with the required check `Preview and smoke test`.
+
+## First sign-in
+
+The first user in an empty database becomes the `ADMIN`. Only you are on the Cloudflare Access allow-list, so only you can be first, but do it before adding anyone else.
+
+- [ ] After feature 001 is deployed, open `https://carmen.andexor.net/api/v1/me` and check that it shows your email and `"role": "ADMIN"`.
+- [ ] Do the same at `https://carmen-preview.andexor.net/api/v1/me`.
 
 ## Later, in the running app
 

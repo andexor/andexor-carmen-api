@@ -64,7 +64,7 @@ The default-branch ruleset already requires the check `Preview and smoke test`, 
 
 - **FR-012**: `src/worker.py` serves only `GET /api/v1/health`, which returns 200 `{"ok": true}` and touches no dependency.
 - **FR-013**: `.github/workflows/ci.yml` has a job named `Preview and smoke test` that checks out `andexor-carmen-main`, installs `cf` and the dependencies, and runs `./preview-test.sh`. On a push to `main`, a second job migrates the production database and deploys production.
-- **FR-014**: The production job has no HTTP check, because Cloudflare Access refuses the service token on production by design. How production is checked after a deploy is an open question for feature 001.
+- **FR-014**: The production job has no HTTP check, because Cloudflare Access refuses the service token on production by design. Decided 2026-11-22: it stays that way. Ed confirms production in a signed-in browser at `https://carmen.andexor.net/api/v1/health` when he wants to. No Access bypass and no production service token are added.
 - **FR-015**: `.github/CODEOWNERS` and `.github/dependabot.yml` are as in `andexor-net-website-ping`.
 
 ## Change 5: roles are enforced from the first protected endpoint
