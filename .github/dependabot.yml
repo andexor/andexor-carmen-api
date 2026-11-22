@@ -12,3 +12,7 @@ updates:
     # must not propose anything newer.
     cooldown:
       default-days: 7
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
