@@ -7,6 +7,11 @@
 Every route declares one action with @action. A route that declares none is refused for everyone.
 """
 
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+Endpoint = TypeVar("Endpoint", bound=Callable[..., Any])
+
 # Actions a route can perform.
 PUBLIC = "PUBLIC"  # no identity needed; only the health check
 READ = "READ"
@@ -20,25 +25,25 @@ READER = "READER"
 MEMBER = "MEMBER"
 ADMIN = "ADMIN"
 
-_ALLOWED = {
-    READER: {READ},
-    MEMBER: {READ, WRITE},
-    ADMIN: {READ, WRITE, DELETE, MANAGE},
+_ALLOWED: dict[str, frozenset[str]] = {
+    READER: frozenset({READ}),
+    MEMBER: frozenset({READ, WRITE}),
+    ADMIN: frozenset({READ, WRITE, DELETE, MANAGE}),
 }
 
 
-def allowed(role, needed) -> bool:
+def allowed(role: object, needed: object) -> bool:
     """True when the role may perform the action. An unknown role or action is refused."""
-    return needed in _ALLOWED.get(role, ())
+    return isinstance(role, str) and needed in _ALLOWED.get(role, frozenset())
 
 
-def action(name: str):
+def action(name: str) -> Callable[[Endpoint], Endpoint]:
     """Mark an endpoint with the action it performs."""
     if name not in ACTIONS:
         raise ValueError(f"unknown action {name}")
 
-    def mark(endpoint):
-        endpoint.action = name
+    def mark(endpoint: Endpoint) -> Endpoint:
+        setattr(endpoint, "action", name)
         return endpoint
 
     return mark

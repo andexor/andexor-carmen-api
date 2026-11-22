@@ -10,11 +10,14 @@ import json
 import pathlib
 import sys
 import unittest
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any, cast
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from fastapi import Request  # noqa: E402
 from fastapi.routing import APIRoute  # noqa: E402
 from starlette.exceptions import HTTPException  # noqa: E402
 
@@ -51,21 +54,21 @@ class RoleRule(unittest.TestCase):
             roles.action("READ_ALL")
 
 
-def request_for(endpoint, identity):
+def request_for(endpoint: Callable[..., Any], identity: dict[str, Any] | None) -> Request:
     """A stand-in for a request that has matched a route and been identified."""
     state = SimpleNamespace() if identity is None else SimpleNamespace(identity=identity)
-    return SimpleNamespace(scope={"endpoint": endpoint}, state=state)
+    return cast(Request, SimpleNamespace(scope={"endpoint": endpoint}, state=state))
 
 
-def endpoint_with(needed):
-    async def endpoint():
+def endpoint_with(needed: str | None) -> Callable[..., Any]:
+    async def endpoint() -> None:
         pass
 
     return roles.action(needed)(endpoint) if needed else endpoint
 
 
 class Authorize(unittest.TestCase):
-    def refused(self, needed, identity) -> bool:
+    def refused(self, needed: str | None, identity: dict[str, Any] | None) -> bool:
         try:
             asyncio.run(api.authorize(request_for(endpoint_with(needed), identity)))
             return False
@@ -76,7 +79,7 @@ class Authorize(unittest.TestCase):
     def test_simulated_users(self):
         for role in (READER, MEMBER, ADMIN):
             for needed in (READ, WRITE, DELETE, MANAGE):
-                identity = {"role": role}
+                identity: dict[str, Any] = {"role": role}
                 self.assertEqual(self.refused(needed, identity), not roles.allowed(role, needed), f"{role} {needed}")
 
     def test_route_with_no_action_is_refused_for_everyone(self):
@@ -99,12 +102,13 @@ class Routes(unittest.TestCase):
             self.assertIn(getattr(route.endpoint, "action", None), roles.ACTIONS, f"{route.path} declares no action")
 
     def test_only_health_is_public(self):
-        public = [r.path for r in api.app.routes if getattr(r.endpoint, "action", None) == PUBLIC]
+        routes = [r for r in api.app.routes if isinstance(r, APIRoute)]
+        public = [r.path for r in routes if getattr(r.endpoint, "action", None) == PUBLIC]
         self.assertEqual(public, [api.HEALTH_PATH])
 
 
 class Claims(unittest.TestCase):
-    def claims(self, **changes):
+    def claims(self, **changes: Any) -> dict[str, Any]:
         return {"iss": f"https://{TEAM}", "aud": [AUD], "exp": NOW + 60, "nbf": NOW - 60, **changes}
 
     def test_good_claims_pass(self):
@@ -112,7 +116,7 @@ class Claims(unittest.TestCase):
         access.check_claims(self.claims(aud=AUD), TEAM, AUD, NOW)
 
     def test_bad_claims_are_rejected(self):
-        bad = {
+        bad: dict[str, dict[str, Any]] = {
             "wrong issuer": {"iss": "https://other.invalid"},
             "no issuer": {"iss": None},
             "wrong audience": {"aud": ["b" * 64]},
@@ -132,7 +136,7 @@ class Claims(unittest.TestCase):
                 asyncio.run(access.verify(token, TEAM, AUD, NOW))
 
     def test_unsigned_algorithm_is_rejected(self):
-        def part(obj):
+        def part(obj: dict[str, Any]) -> str:
             return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
 
         token = f"{part({'alg': 'none'})}.{part(self.claims())}."

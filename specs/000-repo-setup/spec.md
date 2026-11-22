@@ -115,6 +115,17 @@ Decided 2026-11-22. The production job runs only after a merge, on the new commi
 - **FR-028**: The `Deploy to production` job declares `environment: production`, so GitHub records each run of it as a deployment and the repo shows the latest production deploy and its history.
 - **FR-029**: The `production` environment has no protection rules and no secrets of its own. The gate stays the required check `Preview and smoke test`, and the job keeps using the repo's secrets.
 
+## Change 9: the code passes strict type checking
+
+Decided 2026-11-22, issue #12. Pylance in strict mode reported 111 errors in the code of feature 001: missing annotations, values of unknown type, and the `js` module, which exists only inside a Worker.
+
+### Requirements
+
+- **FR-030**: `pyrightconfig.json` sets strict type checking for `src/` and `tests/`. Pylance reads it, so every editor and the command line apply the same rules.
+- **FR-031**: Every parameter and return value is annotated. A JavaScript object from the Workers runtime is typed `Any`. The `js` module is loaded by name at run time in one helper, with no ignore comments.
+- **FR-032**: `unit-test.sh` runs Pyright, the checker behind Pylance, at a pinned version before the unit tests, and fails on any error. The pipeline therefore fails on a type error.
+- **FR-033**: The change alters no behavior.
+
 ## Success criteria
 
 - **SC-001**: `.specify/memory/constitution.md` is identical to the file in `andexor-carmen-main` (version 2.1.0).

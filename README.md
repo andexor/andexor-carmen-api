@@ -20,6 +20,7 @@ tests/               unit tests, run by unit-test.sh
 .github/workflows/   the pipeline: preview and smoke test, then production
 wrangler.jsonc       the production Worker, and the preview Worker under env.preview
 pyproject.toml       dependencies, managed with uv
+pyrightconfig.json   strict type checking, for Pylance and for unit-test.sh
 reports/             license and vulnerability reports, written by setup.sh
 .specify/            Spec Kit; memory/constitution.md is a copy, do not edit it here
 ```
@@ -39,7 +40,7 @@ Nothing is served from `workers.dev`.
 | Script | Does |
 | --- | --- |
 | `setup.sh` | Installs the dependencies and writes the license and vulnerability reports |
-| `unit-test.sh` | Unit tests: roles, token claims, every route declares an action |
+| `unit-test.sh` | Strict type check (Pyright, as Pylance uses), then the unit tests: roles, token claims, every route declares an action |
 | `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
 | `preview-create.sh` | Finds or creates the preview database and applies the migrations. Safe to run again |
 | `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |

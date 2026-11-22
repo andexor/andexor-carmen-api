@@ -15,9 +15,11 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException
 
 import access
@@ -25,6 +27,9 @@ from roles import ADMIN, PUBLIC, READ, action, allowed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("carmen")
+
+# Who is calling: the app_user row plus "machine". Kept in request.state.identity.
+Identity = dict[str, Any]
 
 HEALTH_PATH = "/api/v1/health"
 ERROR_CODES = {
@@ -58,9 +63,9 @@ def log_error(request: Request, step: str, e: Exception) -> None:
     )
 
 
-def env_var(env, name: str) -> str | None:
+def env_var(env: Any, name: str) -> str | None:
     """A Worker variable, or None when it is not set."""
-    value = getattr(env, name, None)
+    value: Any = getattr(env, name, None)
     return value if isinstance(value, str) and value else None
 
 
@@ -69,7 +74,7 @@ async def authorize(request: Request) -> None:
     needed = getattr(request.scope.get("endpoint"), "action", None)
     if needed == PUBLIC:
         return
-    identity = getattr(request.state, "identity", None)
+    identity: Identity | None = getattr(request.state, "identity", None)
     if needed is None or identity is None or not allowed(identity.get("role"), needed):
         raise HTTPException(403)
 
@@ -83,13 +88,13 @@ async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
     return error(request, exc.status_code)
 
 
-async def resolve_identity(request: Request):
+async def resolve_identity(request: Request) -> tuple[Identity | None, JSONResponse | None]:
     """Return (identity, None), or (None, error response)."""
-    env = request.scope["env"]
+    env: Any = request.scope["env"]
 
     # Local runs only: act as the person named in .dev.vars. Never set in wrangler.jsonc (a test checks).
     # Cloudflare adds Cf-Ray to every request it carries, and a local run has none.
-    email = None
+    email: str | None = None
     try:
         if "cf-ray" not in request.headers:
             email = env_var(env, "DEV_USER_EMAIL")
@@ -142,7 +147,7 @@ async def resolve_identity(request: Request):
             insert = "INSERT INTO app_user (id, email) VALUES (?, ?) ON CONFLICT(email) DO NOTHING"
             await env.DB.prepare(insert).bind(str(uuid.uuid4()), email).run()
             row = await env.DB.prepare(select).bind(email).first()
-        user = dict(row)  # the Workers runtime returns a row as a dict, and no row as nothing
+        user: Identity = dict(row)  # the Workers runtime returns a row as a dict, and no row as nothing
     except Exception as e:
         log_error(request, "load_user", e)
         return None, error(request, 500)
@@ -153,9 +158,9 @@ async def resolve_identity(request: Request):
 
 
 @app.middleware("http")
-async def identify(request: Request, call_next):
+async def identify(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     request.state.request_id = request.headers.get("cf-ray") or str(uuid.uuid4())
-    response = None
+    response: Response | None = None
     if request.url.path != HEALTH_PATH:
         request.state.identity, response = await resolve_identity(request)
     if response is None:
@@ -166,12 +171,12 @@ async def identify(request: Request, call_next):
 
 @app.get(HEALTH_PATH)
 @action(PUBLIC)
-async def health():
+async def health() -> dict[str, bool]:
     # Liveness only: touches no dependency.
     return {"ok": True}
 
 
 @app.get("/api/v1/me")
 @action(READ)
-async def me(request: Request):
+async def me(request: Request) -> Identity:
     return request.state.identity
