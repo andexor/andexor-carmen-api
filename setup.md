@@ -6,21 +6,11 @@ Author: Ed Jenkins <ed@andexor.net>
 
 # Install Pre-requisites
 
-Most projects have certain pre-requisites that are required for development, testing, or running in production. Install the ones that are needed.
-
-## Bun
-
-For projects written in TypeScript, use Bun for package management, builds, and execution.
-Install it with this script.
-
-> Run `install-bun.sh`
+What a development machine needs to work on `andexor-carmen-api`.
 
 ## NodeJS
 
-I like to use Bun for best performance.
-Cloudflare does not support Bun. It uses NodeJS.
-For static websites, you can build with Bun and deploy to Cloudflare.
-So you should have both deployed.
+The Cloudflare CLI (`cf`) and Wrangler run on NodeJS. `pywrangler` starts Wrangler through `npx`, so Wrangler itself needs no install.
 
 The following script was copied from
 [Node.js — Download Node.js®](https://nodejs.org/en/download/current).
@@ -42,115 +32,51 @@ The following script was copied from
 
 > `npm -v`
 
-## Docker
+## uv and Spec Kit
 
-For projects that are built in Docker or run in Docker, you need to have Docker properly installed.
-
-> Run `install-docker.sh`
-
-This script requires a reboot, so the system will be rebooted automatically.
-After rebooting, run this to verify that it is working:
-
-> Run `docker run hello-world`
-
-## Spec Kit
-
-Some projects use Spec Kit to manage feature requirements and development.
-
-If you have not installed uv yet, install it first.
+Python, the dependencies, and `pywrangler` are managed with uv. Spec Kit manages feature requirements.
 
 > Run `install-uv.sh`<br/>
 > Run `install-spec-kit.sh`
 
-## License Checker
+## Project dependencies
 
-> Run `bunx license-checker-rseidelsohn`
-
-## Playwright System Dependencies
-
-> Run `bunx playwright install-deps webkit`
-
-Here are some additional optional dependencies
-you can install if you want, but Firefox is low priority,
-so it is not included by default.
-
-> Run `bunx playwright install firefox`<br/>
-> Run `bunx playwright install-deps firefox`
-
-Likewise, if you want to run tests for iPhone and iPad,
-you can install these optional dependencies.
-This hangs on my current development machine,
-so they are not included by default at this time.
-In the mean time, I use the device browser
-in Chrome Dev Tools.
-
-> Run `bunx playwright install webkit`<br/>
-> Run `bunx playwright install-deps webkit`
-
-## FontAwesome
-
-Front-end applications may use FontAwesome icons.
-The packages are added by setup.sh.
-The Duotone icons are Font Awesome Pro,
-used under a commercial annual
-subscription held by Andexor Network, Inc.
-
-- Purchased: 08/25/2026.
-- Expires, or must be renewed: 08/25/2027. Renew before that date and update the expiration date here. After it lapses, a new install of the Pro icons fails, and so does the build.
-- The license file is `.npmrc`. It is excluded from GitHub by `.gitignore`. `build.sh` passes it to the Docker builder stage as a BuildKit secret, so it is not stored in the image.
-
-## Higgsfield
-
-Front-end applications may use Higgsfield skills to create images and videos with AI.
-
-To install them,
-
-> Run `install-higgsfield.sh`
-
-Then
+Installs everything in `pyproject.toml` and writes the license report and the vulnerability report to `reports/`.
 
 > Run `./setup.sh`
 
-## Cloudflare Workers
+## The governing repo
 
-Applications may be deployed to Cloudflare Workers.
+Clone `andexor-carmen-main` beside this repo. The migrations and the migration runner live there, and `preview-create.sh`, `preview-test.sh`, and `deploy.sh` call `../andexor-carmen-main/tools/migrate.py`. Set `CARMEN_MAIN` if it is somewhere else.
 
-> Run `bunx wrangler login`
-
-Then `bun run deploy`. See the README for the commands.
-
-### www redirect
-
-The Worker answers only at andexor.net (a Custom Domain matches the exact hostname).
-A zone Redirect Rule, created once on 2026-10-22 and independent of the Worker,
-sends www.andexor.net to andexor.net with a 301, keeping the path and query string.
-The proxied www DNS record stays so Cloudflare can answer. To recreate the rule:
-
-> Run `cf rulesets entrypoint update http_request_dynamic_redirect --zone andexor.net --body '{"name":"Redirect rules","rules":[{"ref":"redirect_www_to_root","description":"Redirect www.andexor.net to andexor.net","expression":"(http.host eq \"www.andexor.net\")","action":"redirect","action_parameters":{"from_value":{"target_url":{"expression":"concat(\"https://andexor.net\", http.request.uri.path)"},"status_code":301,"preserve_query_string":true}}}]}'`
+## Cloudflare
 
 If you do not have Cloudflare installed and integrated with Claude Code,
-then open Claud Code and paste this text into the prompt.
+then open Claude Code and paste this text into the prompt.
 
 > Fetch and execute the appropriate instructions<br/>
 > to set me up for Cloudflare from<br/>
 > https://developers.cloudflare.com/agent-setup/prompt.md
 
-This will install everything but the CLI. I told Claude Code this:
-
-> Install the CLI, using bun instead of npm.
-
-Then I told him to create a BASH script that I can run every time the CLI gets updated.
-He created install-cf.sh.
-
-The Cloudflare CLI, `cf`, is installed globally with Bun.
-Its launcher expects Node, which is not installed,
-so the script wraps it to run with Bun.
-Run the same script again to upgrade `cf`;
-a plain `bun install -g cf` undoes the wrappers.
+Install or upgrade the Cloudflare CLI.
 
 > Run `install-cf.sh`
 
-Then log in. Use the browser-callback flow, not the default device-code flow: under Bun the device-code polling
-stops after about forty seconds and the command hangs silently, so an approval made after that is never seen.
+Then log in. Use the browser-callback flow, not the default device-code flow.
 
 > Run `cf auth login --no-device`
+
+## Cloudflare Access service token
+
+Both Carmen hostnames sit behind Cloudflare Access. `health.sh` signs in to the preview with the service token `andexor-carmen-api`.
+
+> Copy `.env.example` to `.env` and fill in the Client ID and the Client Secret.
+
+`.env` is git-ignored. Never commit the token.
+
+## PlantUML
+
+Only needed to draw diagrams in `doc/uml`. It needs Java.
+
+> Run `install-plantuml.sh`<br/>
+> Run `plantuml.sh`

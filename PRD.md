@@ -43,7 +43,7 @@ The schema is `andexor-carmen-main/db/carmen/`. This repo does not define tables
 
 - **Base path:** `/api/v1`.
 - **Authentication:** every request must carry a valid Cloudflare Access JSON Web Token (JWT) in `Cf-Access-Jwt-Assertion`, verified against the team's public keys, audience, and expiry. The user's email comes from the token. On first sight of an allowed email the API creates the `app_user` row. No valid token: 401. The one exception is `GET /api/v1/health`.
-- **Roles:** recorded, not enforced, in version 1 (master section 6).
+- **Roles:** enforced on every request, deny by default (constitution Principle VI; `specs/000-repo-setup/spec.md`, Change 5).
 - **Required fields:** only those in master section 7. Unknown JSON keys are ignored. Missing optional keys are stored as NULL.
 - **Validation:** types, SRT codes (the triggers are the last line of defense, not the first), and the required fields. Nothing else.
 - **Lists:** `limit` (default 50, maximum 200) and `cursor`; a response carries `next_cursor` when there is more. Filters are query parameters named after columns. `q` searches name, domain, and contact name and email.
@@ -266,11 +266,10 @@ These cannot be scripted and will be listed in `MANUAL-TASKS.md`, batched as in 
 ## 12. Out of scope
 
 - Everything out of scope in master section 1.
-- Role enforcement, per-user data visibility, and audit logs beyond the timeline.
+- Per-user data visibility, and audit logs beyond the timeline.
 - Rate limiting and bot checks (Access stands in front).
 - Automatic, scheduled, or bulk AI runs.
 - Server-Sent Events (SSE); polling is enough for version 1.
-- Docker packaging.
 
 ## 13. Spec Kit feature backlog
 
@@ -278,7 +277,7 @@ Specify these in order with `/speckit-specify`. Each is a vertical slice that le
 
 | # | Feature | Covers |
 | --- | --- | --- |
-| 001 | Skeleton and pipeline | Worker, health, Access verification, `/me`, migrations runner, preview scripts, CI/CD, discovery D1, D3, D8 |
+| 001 | Skeleton and pipeline | Worker, health, Access verification, role enforcement, `/me`, migrations runner, preview scripts, CI/CD, discovery D1, D3, D8 |
 | 002 | Companies and contacts | 5.2, `/srt`, duplicate detection |
 | 003 | Activities and tasks | 5.8, automatic timeline entries |
 | 004 | Services, rubric, and scoring | 5.4, section 6, unit tests |

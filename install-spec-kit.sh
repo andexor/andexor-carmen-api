@@ -5,7 +5,7 @@
 # NOTE: If you have not done so already, run install-uv.sh first.
 
 # Install Spec Kit.
-uv tool install specify-cli --from git+https://github.com/github/spec-kit.git@v1.4.0
+uv tool install specify-cli --from git+https://github.com/github/spec-kit.git@v1.4.3
 
 # Upgrade Spec Kit.
 # If specify-cli is already installed,

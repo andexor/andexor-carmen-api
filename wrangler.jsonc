@@ -1,0 +1,71 @@
+{
+    "name": "andexor-carmen-api",
+    "main": "src/worker.py",
+    "compatibility_date": "2026-10-28",
+    "compatibility_flags": [
+        "python_workers",
+        "python_dedicated_snapshot"
+    ],
+    "vars": {
+        "ALLOWED_ORIGINS": "",
+        "ACCESS_TEAM_DOMAIN": "andexor.cloudflareaccess.com",
+        "ACCESS_AUD": "17fc8e216219c7456af6fce2bb529e0c99df04b37eb244317d5ac662c2aa451c"
+    },
+    "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "redact_query_string": false,
+        "logs": {
+            "enabled": true,
+            "head_sampling_rate": 1,
+            "invocation_logs": true,
+            "persist": true
+        },
+        "traces": {
+            "enabled": true,
+            "head_sampling_rate": 1,
+            "persist": true
+        },
+        "issue_detection": {
+            "enabled": true
+        }
+    },
+    "routes": [
+        {
+            "pattern": "carmen.andexor.net/api/*",
+            "zone_name": "andexor.net"
+        }
+    ],
+    "workers_dev": false,
+    "preview_urls": false,
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "andexor-carmen-api-prod",
+            "database_id": "bb0d52ff-1646-4ea8-a03e-a48edf8fe3bd"
+        }
+    ],
+    "env": {
+        "preview": {
+            "name": "andexor-carmen-api-preview",
+            "vars": {
+                "ALLOWED_ORIGINS": "http://localhost:8787",
+                "ACCESS_TEAM_DOMAIN": "andexor.cloudflareaccess.com",
+                "ACCESS_AUD": "8154464c2b9aa058e7457872b661ce7b80996e8437f1b7e3fe678ab5068c0429"
+            },
+            "routes": [
+                {
+                    "pattern": "carmen-preview.andexor.net/api/*",
+                    "zone_name": "andexor.net"
+                }
+            ],
+            "d1_databases": [
+                {
+                    "binding": "DB",
+                    "database_name": "andexor-carmen-api-prev",
+                    "database_id": "17fbf861-75a5-465e-8a99-03342b0de39a"
+                }
+            ]
+        }
+    }
+}
