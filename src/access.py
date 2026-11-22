@@ -10,7 +10,11 @@ unit tested without a Worker.
 """
 
 import base64
+import importlib
 import json
+from typing import Any, cast
+
+Claims = dict[str, Any]
 
 
 class AccessError(Exception):
@@ -21,14 +25,13 @@ def b64url_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def check_claims(claims: dict, team_domain: str, aud: str, now: float) -> None:
+def check_claims(claims: Claims, team_domain: str, aud: str, now: float) -> None:
     """Raise AccessError unless the issuer, audience, and expiry are right."""
     if claims.get("iss") != f"https://{team_domain}":
         raise AccessError("wrong issuer")
-    audiences = claims.get("aud")
-    if isinstance(audiences, str):
-        audiences = [audiences]
-    if not isinstance(audiences, list) or aud not in audiences:
+    raw_aud = claims.get("aud")
+    audiences = cast(list[Any], raw_aud) if isinstance(raw_aud, list) else [raw_aud]
+    if aud not in audiences:
         raise AccessError("wrong audience")
     exp = claims.get("exp")
     if not isinstance(exp, (int, float)) or exp <= now:
@@ -40,24 +43,29 @@ def check_claims(claims: dict, team_domain: str, aud: str, now: float) -> None:
 
 # Signing keys by key id, kept for the life of the isolate. Access rotates keys every six weeks and
 # publishes the new one beforehand, so an unknown key id means "fetch the list again".
-_keys: dict = {}
+_keys: dict[str, Any] = {}
 
 
-async def _signing_key(team_domain: str, kid: str):
+def _js() -> Any:
+    """The JavaScript globals of the Workers runtime. The module exists only inside a Worker."""
+    return importlib.import_module("js")
+
+
+async def _signing_key(team_domain: str, kid: str) -> Any:
     if kid not in _keys:
-        from js import Object, crypto, fetch
         from pyodide.ffi import to_js
 
-        response = await fetch(f"https://{team_domain}/cdn-cgi/access/certs")
+        js = _js()
+        response = await js.fetch(f"https://{team_domain}/cdn-cgi/access/certs")
         if not response.ok:
             raise AccessError(f"could not fetch the signing keys: status {response.status}")
         jwks = json.loads(await response.text())
         _keys.clear()
         for jwk in jwks["keys"]:
-            _keys[jwk["kid"]] = await crypto.subtle.importKey(
+            _keys[jwk["kid"]] = await js.crypto.subtle.importKey(
                 "jwk",
-                to_js(jwk, dict_converter=Object.fromEntries),
-                to_js({"name": "RSASSA-PKCS1-v1_5", "hash": "SHA-256"}, dict_converter=Object.fromEntries),
+                to_js(jwk, dict_converter=js.Object.fromEntries),
+                to_js({"name": "RSASSA-PKCS1-v1_5", "hash": "SHA-256"}, dict_converter=js.Object.fromEntries),
                 False,
                 to_js(["verify"]),
             )
@@ -66,26 +74,25 @@ async def _signing_key(team_domain: str, kid: str):
     return _keys[kid]
 
 
-async def verify(token: str | None, team_domain: str, aud: str, now: float) -> dict:
+async def verify(token: str | None, team_domain: str, aud: str, now: float) -> Claims:
     """Return the token's claims, or raise AccessError."""
     if not token:
         raise AccessError("no token")
     try:
         header_b64, payload_b64, signature_b64 = token.split(".")
-        header = json.loads(b64url_decode(header_b64))
-        claims = json.loads(b64url_decode(payload_b64))
+        header: Claims = json.loads(b64url_decode(header_b64))
+        claims: Claims = json.loads(b64url_decode(payload_b64))
         signature = b64url_decode(signature_b64)
     except Exception as e:
         raise AccessError(f"malformed token: {type(e).__name__}") from e
     if header.get("alg") != "RS256":
         raise AccessError("wrong algorithm")
 
-    from js import crypto
     from pyodide.ffi import to_js
 
-    key = await _signing_key(team_domain, header.get("kid"))
+    key = await _signing_key(team_domain, str(header.get("kid")))
     signed = f"{header_b64}.{payload_b64}".encode()
-    if not await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, to_js(signature), to_js(signed)):
+    if not await _js().crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, to_js(signature), to_js(signed)):
         raise AccessError("bad signature")
 
     check_claims(claims, team_domain, aud, now)
