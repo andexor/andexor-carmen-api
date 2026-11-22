@@ -51,7 +51,8 @@
             "vars": {
                 "ALLOWED_ORIGINS": "http://localhost:8787",
                 "ACCESS_TEAM_DOMAIN": "andexor.cloudflareaccess.com",
-                "ACCESS_AUD": "8154464c2b9aa058e7457872b661ce7b80996e8437f1b7e3fe678ab5068c0429"
+                "ACCESS_AUD": "8154464c2b9aa058e7457872b661ce7b80996e8437f1b7e3fe678ab5068c0429",
+                "SERVICE_TOKENS_ARE_ADMIN": "true"
             },
             "routes": [
                 {

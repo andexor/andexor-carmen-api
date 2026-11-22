@@ -12,7 +12,11 @@ Work follows Spec Kit. The feature backlog is section 13 of the PRD.
 ```
 PRD.md               what this app must do (frozen)
 specs/               Spec Kit specifications; 000-repo-setup records what changed since the PRD
-src/worker.py        the Worker (health only until feature 001)
+src/worker.py        the Worker entry point
+src/app.py           the FastAPI application: identity, role check, endpoints
+src/access.py        Cloudflare Access token verification
+src/roles.py         who may do what
+tests/               unit tests, run by unit-test.sh
 .github/workflows/   the pipeline: preview and smoke test, then production
 wrangler.jsonc       the production Worker, and the preview Worker under env.preview
 pyproject.toml       dependencies, managed with uv
@@ -35,9 +39,10 @@ Nothing is served from `workers.dev`.
 | Script | Does |
 | --- | --- |
 | `setup.sh` | Installs the dependencies and writes the license and vulnerability reports |
-| `run.sh` | Local run at `http://localhost:8787` |
+| `unit-test.sh` | Unit tests: roles, token claims, every route declares an action |
+| `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
 | `preview-create.sh` | Finds or creates the preview database and applies the migrations. Safe to run again |
-| `preview-test.sh` | Migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |
+| `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |
 | `preview-delete.sh` | Deletes the preview Worker and the preview database. Never touches production |
 | `health.sh` | Health check through Cloudflare Access: `./health.sh [preview\|production] [tries]` |
 | `deploy.sh` | Production deploy by hand: runs `preview-test.sh` first, then migrates and deploys production |

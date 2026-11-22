@@ -22,4 +22,7 @@ A change that conflicts with the master PRD or the data model starts with a pull
 - Both hostnames are behind Cloudflare Access, so a plain `curl` gets a sign-in redirect or 403. Use `./health.sh`, which sends the service token from `.env`. The token is allowed on the preview only.
 - Scripts are listed in `README.md`. `preview-test.sh` is the smoke test; each feature adds its calls to it.
 - A manual step on Cloudflare or GitHub goes in `MANUAL-TASKS.md`.
-- Roles are enforced, deny by default: every route declares its action, and a test fails if one does not (`specs/000-repo-setup/spec.md`, Change 5). List the lowest allowed role for each endpoint in every feature spec.
+- Roles are enforced, deny by default (`specs/001-skeleton-and-pipeline/spec.md`). Every endpoint goes in `src/app.py` with `@action(READ)`, `WRITE`, `DELETE`, or `MANAGE` under the route decorator; a route without one is refused with 403 and fails `./unit-test.sh`. List the action of each endpoint in every feature spec.
+- The identity of the caller is `request.state.identity` (the `app_user` row plus `machine`). A service token is a machine caller: `ADMIN` on the preview only, never in production, and it has no `app_user` row.
+- The Workers runtime returns a D1 row as a Python dict, and no row as a false value. Do not call `to_py()` on it.
+- Run `./unit-test.sh` for unit tests. For a local run, put `DEV_USER_EMAIL=<email>` in `.dev.vars`; change the email to act as another user, and that user's role in the local database to test a role.
