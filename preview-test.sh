@@ -105,6 +105,21 @@ expect 200 '"title":"Smoke task"' "${BASE}/companies/${ID}"
 expect 200 '"completed_at":"2' -X PATCH "${JSON[@]}" -d '{"status":"DONE"}' "${BASE}/tasks/${TASK}"
 expect 200 '"title":"Smoke task"' "${BASE}/tasks?status=DONE&company_id=${ID}"
 
+# Services, the rubric, and scores (specs/004-services-rubric-and-scoring/spec.md). The catalog and
+# the rubric cannot be deleted, so nothing is added to them here; only the test company is answered.
+expect 200 '"offered":' "${BASE}/services"
+expect 200 '"section":"FIT"' "${BASE}/rubric"
+CRITERION=$(jq -r '[.items[] | select(.active == 1 and .section == "FIT" and .answer_type == "YES_NO")][0].id' "${BODY}")
+answer() { echo "{\"answers\":[{\"criterion_id\":\"${CRITERION}\",\"value\":$1}]}"; }
+expect 200 '"fit_score":[0-9]' -X PUT "${JSON[@]}" -d "$(answer '"YES"')" "${BASE}/companies/${ID}/answers"
+expect 200 '"value":"YES"' "${BASE}/companies/${ID}/answers"
+expect 200 '"recommendation":"' "${BASE}/companies/${ID}"
+expect 200 '"kind":"SCORE_CHANGE"' "${BASE}/companies/${ID}/activities?kind=SCORE_CHANGE"
+expect 400 '"error":"BAD_REQUEST"' -X PUT "${JSON[@]}" -d "$(answer '"PERHAPS"')" "${BASE}/companies/${ID}/answers"
+expect 200 '"fit_score":null' -X PUT "${JSON[@]}" -d "$(answer null)" "${BASE}/companies/${ID}/answers"
+expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"prompt":"Smoke","config_json":"{not json"}' "${BASE}/rubric"
+expect 200 '"companies":' -X POST "${BASE}/rubric/recompute"
+
 expect 204 '' -X DELETE "${BASE}/companies/${ID}"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${ID}"
 expect 200 '"items":\[\]' "${BASE}/tasks?company_id=${ID}"

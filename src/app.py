@@ -8,6 +8,7 @@ Every request except the health check is identified first (identify), then the r
 action is checked against the caller's role (authorize). See specs/001-skeleton-and-pipeline/spec.md.
 Companies, contacts, and the reference codes: specs/002-companies-and-contacts/spec.md.
 The timeline and tasks: specs/003-activities-and-tasks/spec.md.
+Services, the rubric, and scores: specs/004-services-rubric-and-scoring/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -19,7 +20,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -35,6 +36,10 @@ from records import (
     COMPANY_FIELDS,
     CONTACT_CODES,
     CONTACT_FIELDS,
+    CRITERION_CODES,
+    CRITERION_FIELDS,
+    SERVICE_CODES,
+    SERVICE_FIELDS,
     TASK_CODES,
     TASK_FIELDS,
     BadBody,
@@ -42,8 +47,10 @@ from records import (
     clean,
     derive_domain,
     iso_date,
+    slug,
 )
-from roles import ADMIN, DELETE, PUBLIC, READ, WRITE, action, allowed
+from roles import ADMIN, DELETE, MANAGE, PUBLIC, READ, WRITE, action, allowed
+from scoring import Row, notable, points, score, valid_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("carmen")
@@ -412,11 +419,14 @@ async def get_company(request: Request, company_id: str) -> JSONResponse:
         row = await db(request).prepare("SELECT * FROM company WHERE id = ?").bind(company_id).first()
         contacts = await db(request).prepare(CONTACTS_OF).bind(company_id).all()
         tasks = await db(request).prepare(OPEN_TASKS_OF).bind(company_id).all()
+        services = await db(request).prepare(SERVICE_SCORES_OF).bind(company_id).all()
     except Exception as e:
         return failed(request, "load_company", e)
     if not row:
         return error(request, 404)
-    return JSONResponse({**row, "contacts": contacts["results"], "open_tasks": tasks["results"]})
+    return JSONResponse(
+        {**row, "contacts": contacts["results"], "open_tasks": tasks["results"], "services": services["results"]}
+    )
 
 
 @app.patch("/api/v1/companies/{company_id}")
@@ -866,3 +876,376 @@ async def delete_task(request: Request, task_id: str) -> Response:
     except Exception as e:
         return failed(request, "delete_task", e)
     return Response(status_code=204)
+
+
+# ---- Scores --------------------------------------------------------------------------------------
+# The arithmetic is in scoring.py. Here the rubric is read, and the scores are written.
+
+SERVICE_SCORES_OF = (
+    "SELECT cs.service_id, s.name, s.offered, cs.need_score, cs.confidence FROM company_service cs"
+    " JOIN service s ON s.id = cs.service_id WHERE cs.company_id = ? ORDER BY cs.need_score DESC, s.sort_order, s.id"
+)
+# Fit first, then each service in catalog order.
+RUBRIC_FROM = "FROM rubric_criterion c LEFT JOIN service s ON s.id = c.service_id"
+RUBRIC_ORDER = "ORDER BY c.section = 'NEED', s.sort_order, s.id, c.sort_order, c.id"
+
+
+async def load_rubric(database: Any) -> tuple[list[Row], list[Row], dict[str, float]]:
+    """Every criterion, every service, and the score thresholds, read on every call."""
+    results = await database.batch(
+        [
+            database.prepare("SELECT * FROM rubric_criterion"),
+            database.prepare("SELECT * FROM service"),
+            database.prepare("SELECT key, value FROM setting WHERE key LIKE 'score.%'"),
+        ]
+    )
+    thresholds: dict[str, float] = {}
+    for row in results[2]["results"]:
+        try:
+            thresholds[row["key"]] = float(row["value"])
+        except ValueError:
+            pass  # a setting that is not a number falls back to the default
+    return results[0]["results"], results[1]["results"], thresholds
+
+
+def score_writes(request: Request, company: Row, scores: Row) -> list[Any]:
+    """The statements that store a company's scores, with a timeline entry when the change is notable.
+
+    company holds the id and the scores before the change.
+    """
+    database, company_id = db(request), company["id"]
+    statements = [database.prepare("DELETE FROM company_service WHERE company_id = ?").bind(company_id)]
+    for service_id, own in scores["services"].items():
+        row = {"company_id": company_id, "service_id": service_id, **own}
+        statements.append(insert(database, "company_service", row))
+    sql = (
+        "UPDATE company SET fit_score = ?, need_score = ?, confidence = ?, recommendation = ?,"
+        f" scored_at = {NOW}, updated_at = {NOW} WHERE id = ?"
+    )
+    values = [scores[key] for key in ("fit_score", "need_score", "confidence", "recommendation")]
+    statements.append(database.prepare(sql).bind(*values, company_id))
+    if notable(company, scores):
+
+        def moved(key: str) -> str:
+            return f"{company.get(key) if company.get(key) is not None else 'none'} to {scores[key] if scores[key] is not None else 'none'}"
+
+        entry = {
+            "id": str(uuid.uuid4()),
+            "company_id": company_id,
+            "kind": "SCORE_CHANGE",
+            "body": f"Fit {moved('fit_score')}, Need {moved('need_score')}, recommendation {moved('recommendation')}",
+            "created_by": request.state.identity["id"],
+        }
+        statements.append(insert(database, "activity", entry))
+    return statements
+
+
+async def rescore_all(request: Request) -> int:
+    """Recompute and store the scores of every company that has answers. Returns how many.
+
+    Called after a change to a service or to the rubric. Stored points are brought up to date too.
+    """
+    # shortcut: runs inside the request; move it to the background or a queue when it is consistently slow
+    database = db(request)
+    criteria, services, thresholds = await load_rubric(database)
+    by_id = {criterion["id"]: criterion for criterion in criteria}
+    results = await database.batch(
+        [
+            database.prepare("SELECT company_id, criterion_id, value, points FROM rubric_answer"),
+            database.prepare(
+                "SELECT id, fit_score, need_score, recommendation FROM company"
+                " WHERE id IN (SELECT company_id FROM rubric_answer)"
+            ),
+        ]
+    )
+    answers: dict[str, Row] = {}
+    pending: list[Any] = []
+    for row in results[0]["results"]:
+        answers.setdefault(row["company_id"], {})[row["criterion_id"]] = row["value"]
+        earned = points(by_id[row["criterion_id"]], row["value"])
+        if earned is not None and abs(earned - row["points"]) > 1e-9:
+            sql = "UPDATE rubric_answer SET points = ? WHERE company_id = ? AND criterion_id = ?"
+            pending.append(database.prepare(sql).bind(earned, row["company_id"], row["criterion_id"]))
+    companies: list[Row] = results[1]["results"]
+    for company in companies:
+        pending += score_writes(request, company, score(criteria, answers[company["id"]], services, thresholds))
+        if len(pending) >= 50:  # each batch is one transaction; a company's statements stay together
+            await database.batch(pending)
+            pending = []
+    if pending:
+        await database.batch(pending)
+    return len(companies)
+
+
+def scores_body(scores: Row, services: list[Row]) -> Row:
+    """The scores as returned to a caller, with the per-service part in the shape of SERVICE_SCORES_OF."""
+    named = {service["id"]: service for service in services}
+    per_service = [
+        {"service_id": service_id, "name": named[service_id]["name"], "offered": named[service_id]["offered"], **own}
+        for service_id, own in scores["services"].items()
+    ]
+    per_service.sort(key=lambda row: -row["need_score"])
+    return {**scores, "services": per_service}
+
+
+# ---- Services ------------------------------------------------------------------------------------
+
+
+@app.get("/api/v1/services")
+@action(READ)
+async def list_services(request: Request) -> JSONResponse:
+    try:
+        result = await db(request).prepare("SELECT * FROM service ORDER BY sort_order, name, id").all()
+    except Exception as e:
+        return failed(request, "list_services", e)
+    return JSONResponse({"items": result["results"]})
+
+
+@app.post("/api/v1/services")
+@action(MANAGE)
+async def create_service(request: Request, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, SERVICE_FIELDS)
+        if not values.get("name"):
+            raise BadBody("name is required")
+        values["id"] = values.get("id") or slug(values["name"])
+        if not values["id"]:
+            raise BadBody("the name gives no id")
+    except BadBody as e:
+        return failed(request, "read_service", e)
+
+    try:
+        column = await unknown_code(db(request), values, SERVICE_CODES)
+    except Exception as e:
+        return failed(request, "check_service", e)
+    if column:
+        return error(request, 400)
+
+    try:
+        # A new service has no criteria yet, so no score changes.
+        row = await insert(db(request), "service", values).first()
+    except Exception as e:
+        return failed(request, "insert_service", e)
+    return JSONResponse(row, status_code=201)
+
+
+@app.patch("/api/v1/services/{service_id}")
+@action(MANAGE)
+async def update_service(request: Request, service_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, SERVICE_FIELDS)
+    except BadBody as e:
+        return failed(request, "read_service", e)
+    values.pop("id", None)  # the id is in other tables and in page names; it does not change
+
+    try:
+        current = await db(request).prepare("SELECT * FROM service WHERE id = ?").bind(service_id).first()
+    except Exception as e:
+        return failed(request, "load_service", e)
+    if not current:
+        return error(request, 404)
+    if not values:
+        return JSONResponse(current)
+
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    try:
+        column = await unknown_code(db(request), changed, SERVICE_CODES)
+    except Exception as e:
+        return failed(request, "check_service", e)
+    if column:
+        return error(request, 400)
+
+    try:
+        row = await update(db(request), "service", values, service_id, stamp=False).first()
+    except Exception as e:
+        return failed(request, "update_service", e)
+
+    if "offered" in changed or "active" in changed:
+        try:
+            await rescore_all(request)
+        except Exception as e:
+            return failed(request, "rescore_after_service", e)
+    return JSONResponse(row)
+
+
+# ---- Rubric --------------------------------------------------------------------------------------
+
+# A change to one of these changes scores.
+SCORING_COLUMNS = {"section", "service_id", "answer_type", "weight", "config_json", "active"}
+
+
+@app.get("/api/v1/rubric")
+@action(READ)
+async def list_rubric(request: Request) -> JSONResponse:
+    try:
+        result = await db(request).prepare(f"SELECT c.* {RUBRIC_FROM} {RUBRIC_ORDER}").all()
+    except Exception as e:
+        return failed(request, "list_rubric", e)
+    return JSONResponse({"items": result["results"]})
+
+
+@app.post("/api/v1/rubric/recompute")
+@action(WRITE)
+async def recompute_scores(request: Request) -> JSONResponse:
+    try:
+        count = await rescore_all(request)
+    except Exception as e:
+        return failed(request, "rescore", e)
+    return JSONResponse({"companies": count})
+
+
+@app.post("/api/v1/rubric")
+@action(MANAGE)
+async def create_criterion(request: Request, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, CRITERION_FIELDS)
+        if not values.get("prompt"):
+            raise BadBody("prompt is required")
+        if not valid_config(values.get("answer_type") or "YES_NO", values.get("config_json")):
+            raise BadBody("the configuration does not suit the answer type")
+    except BadBody as e:
+        return failed(request, "read_criterion", e)
+    values["id"] = str(uuid.uuid4())
+    # A criterion of a service is a Need criterion; any other is a Fit criterion.
+    values["section"] = values.get("section") or ("NEED" if values.get("service_id") else "FIT")
+
+    try:
+        column = await unknown_code(db(request), values, CRITERION_CODES)
+    except Exception as e:
+        return failed(request, "check_criterion", e)
+    if column:
+        return error(request, 400)
+
+    try:
+        row = await insert(db(request), "rubric_criterion", values).first()
+    except Exception as e:
+        return failed(request, "insert_criterion", e)
+
+    try:
+        # A new criterion is unanswered everywhere, which lowers confidence.
+        await rescore_all(request)
+    except Exception as e:
+        return failed(request, "rescore_after_criterion", e)
+    return JSONResponse(row, status_code=201)
+
+
+@app.patch("/api/v1/rubric/{criterion_id}")
+@action(MANAGE)
+async def update_criterion(request: Request, criterion_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, CRITERION_FIELDS)
+    except BadBody as e:
+        return failed(request, "read_criterion", e)
+
+    try:
+        current = await db(request).prepare("SELECT * FROM rubric_criterion WHERE id = ?").bind(criterion_id).first()
+    except Exception as e:
+        return failed(request, "load_criterion", e)
+    if not current:
+        return error(request, 404)
+    if not values:
+        return JSONResponse(current)
+
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    merged = {**current, **values}
+    try:
+        column = await unknown_code(db(request), changed, CRITERION_CODES)
+    except Exception as e:
+        return failed(request, "check_criterion", e)
+    if column or not valid_config(merged["answer_type"], merged["config_json"]):
+        return error(request, 400)
+
+    try:
+        row = await update(db(request), "rubric_criterion", values, criterion_id, stamp=False).first()
+    except Exception as e:
+        return failed(request, "update_criterion", e)
+
+    if SCORING_COLUMNS & set(changed):
+        try:
+            await rescore_all(request)
+        except Exception as e:
+            return failed(request, "rescore_after_criterion", e)
+    return JSONResponse(row)
+
+
+# ---- Answers -------------------------------------------------------------------------------------
+
+
+@app.get("/api/v1/companies/{company_id}/answers")
+@action(READ)
+async def list_answers(request: Request, company_id: str) -> JSONResponse:
+    # Every criterion in use, with the company's answer beside it. An unanswered one has a null value.
+    sql = (
+        "SELECT c.*, a.value, a.points, a.source, a.ai_run_id, a.answered_by, a.answered_at"
+        f" {RUBRIC_FROM} LEFT JOIN rubric_answer a ON a.criterion_id = c.id AND a.company_id = ?"
+        f" WHERE c.active = 1 {RUBRIC_ORDER}"
+    )
+    try:
+        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        result = await db(request).prepare(sql).bind(company_id).all()
+    except Exception as e:
+        return failed(request, "list_answers", e)
+    if not company:
+        return error(request, 404)
+    return JSONResponse({"items": result["results"]})
+
+
+@app.put("/api/v1/companies/{company_id}/answers")
+@action(WRITE)
+async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
+    entries: Any = body.get("answers")
+    if not isinstance(entries, list) or not entries:
+        return error(request, 400)
+
+    database = db(request)
+    try:
+        company = await database.prepare(
+            "SELECT id, fit_score, need_score, recommendation FROM company WHERE id = ?"
+        ).bind(company_id).first()
+        criteria, services, thresholds = await load_rubric(database)
+        stored = await database.prepare("SELECT criterion_id, value FROM rubric_answer WHERE company_id = ?").bind(company_id).all()
+    except Exception as e:
+        return failed(request, "load_answers", e)
+    if not company:
+        return error(request, 404)
+
+    in_use = {criterion["id"]: criterion for criterion in criteria if criterion["active"]}
+    answers: Row = {row["criterion_id"]: row["value"] for row in stored["results"]}
+    statements: list[Any] = []
+    try:
+        for entry in cast(list[Any], entries):
+            given: Row = cast(Row, entry) if isinstance(entry, dict) else {}
+            criterion = in_use.get(given.get("criterion_id"))
+            if criterion is None:
+                raise BadBody("an answer names no criterion in use")
+            value = given.get("value")
+            if value is None or value == "":
+                # Cleared: the criterion is unknown again.
+                answers.pop(criterion["id"], None)
+                sql = "DELETE FROM rubric_answer WHERE company_id = ? AND criterion_id = ?"
+                statements.append(database.prepare(sql).bind(company_id, criterion["id"]))
+                continue
+            text = str(value).strip()
+            text = text.upper() if criterion["answer_type"] == "YES_NO" else text
+            earned = None if isinstance(value, bool) else points(criterion, text)
+            if earned is None:
+                raise BadBody("a value does not suit its criterion")
+            answers[criterion["id"]] = text
+            sql = (
+                "INSERT INTO rubric_answer (company_id, criterion_id, value, points, source, answered_by)"
+                " VALUES (?, ?, ?, ?, 'MANUAL', ?) ON CONFLICT (company_id, criterion_id) DO UPDATE SET"
+                " value = excluded.value, points = excluded.points, source = 'MANUAL', ai_run_id = NULL,"
+                f" answered_by = excluded.answered_by, answered_at = {NOW}"
+            )
+            caller = request.state.identity["id"]
+            statements.append(database.prepare(sql).bind(company_id, criterion["id"], text, earned, caller))
+        scores = score(criteria, answers, services, thresholds)
+    except BadBody as e:
+        return failed(request, "read_answers", e)
+
+    try:
+        # The answers and the scores they give are stored in one transaction.
+        await database.batch(statements + score_writes(request, company, scores))
+    except Exception as e:
+        return failed(request, "store_answers", e)
+    return JSONResponse(scores_body(scores, services))
