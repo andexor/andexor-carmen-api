@@ -287,6 +287,34 @@ class Records(unittest.TestCase):
                 if fields[column] is str:
                     self.assertEqual(records.clean({column: "12/01/2026"}, fields)[column], expected, column)
 
+    def test_fact_keys_and_values_are_normalized(self):
+        keys = {"Has Website": "has_website", "has-website": "has_website", " employee_count ": "employee_count", "A.B/C": "a_b_c", "--": "", "": ""}
+        for text, key in keys.items():
+            self.assertEqual(records.fact_key(text), key, text)
+        values: list[tuple[str, str | None, str]] = [
+            ("yes", "YES_NO", "YES"),
+            ("No", "YES_NO", "NO"),
+            ("probably", "YES_NO", "probably"),
+            ("yes", "TEXT", "yes"),
+            ("yes", None, "yes"),
+            ("12/01/2026", "DATE", "2026-12-01"),
+            ("12/01/2026", "TEXT", "12/01/2026"),
+            ("12", "NUMBER", "12"),
+        ]
+        for value, value_type, expected in values:
+            self.assertEqual(records.fact_value(value, value_type), expected, f"{value} {value_type}")
+        with self.assertRaises(records.BadBody):
+            records.fact_value("13/45/2026", "DATE")
+
+    def test_a_change_is_described_with_the_old_values(self):
+        before = {"value": "YES", "notes": None, "source": "MANUAL"}
+        self.assertEqual(records.describe_change("Fact has_website", before, {"value": "NO"}), "Fact has_website edited: value 'YES' to 'NO'")
+        self.assertEqual(
+            records.describe_change("Fact has_website", before, {"value": "NO", "notes": "checked"}),
+            "Fact has_website edited: value 'YES' to 'NO', notes None to 'checked'",
+        )
+        self.assertEqual(records.describe_change("Fact has_website", before, None), "Fact has_website deleted. It held: value 'YES', source 'MANUAL'")
+
     def test_database_errors_map_to_statuses(self):
         cases = {
             "D1_ERROR: UNIQUE constraint failed: company.domain: SQLITE_CONSTRAINT": 409,

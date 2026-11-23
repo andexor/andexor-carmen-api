@@ -120,6 +120,26 @@ expect 200 '"fit_score":null' -X PUT "${JSON[@]}" -d "$(answer null)" "${BASE}/c
 expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"prompt":"Smoke","config_json":"{not json"}' "${BASE}/rubric"
 expect 200 '"companies":' -X POST "${BASE}/rubric/recompute"
 
+# Enrichment facts (specs/005-enrichment-facts/spec.md). They go with the test company.
+expect 201 '"key":"smoke_fact"' -X POST "${JSON[@]}" -d '{"key":"Smoke Fact","value":"old","observed_at":"2026-01-01"}' "${BASE}/companies/${ID}/facts"
+FACT=$(jq -r '.items[0].id' "${BODY}")
+expect 201 '"source":"MANUAL"' -X POST "${JSON[@]}" \
+    -d '{"facts":[{"key":"smoke_fact","value":"new"},{"key":"smoke_count","value":12}]}' "${BASE}/companies/${ID}/facts"
+expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"facts":[{"key":"smoke_fact","value":"x"},{"key":"smoke_fact"}]}' "${BASE}/companies/${ID}/facts"
+expect 200 '"value":"old"' "${BASE}/companies/${ID}/facts"
+expect 200 '"value":"new"' "${BASE}/companies/${ID}/facts?latest=true"
+if grep -q '"value":"old"' "${BODY}"; then
+    echo "FAILED: latest=true returned an older fact of the same key"
+    exit 1
+fi
+expect 200 '"key":"smoke_count"' "${BASE}/facts/keys"
+# An edit and a delete are each recorded on the timeline, with the old value, in the same transaction.
+expect 200 '"value":"older"' -X PATCH "${JSON[@]}" -d '{"value":"older"}' "${BASE}/facts/${FACT}"
+expect 200 "Fact smoke_fact edited: value 'old' to 'older'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+expect 204 '' -X DELETE "${BASE}/facts/${FACT}"
+expect 200 "Fact smoke_fact deleted. It held: value 'older'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+expect 404 '"error":"NOT_FOUND"' -X DELETE "${BASE}/facts/${FACT}"
+
 expect 204 '' -X DELETE "${BASE}/companies/${ID}"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${ID}"
 expect 200 '"items":\[\]' "${BASE}/tasks?company_id=${ID}"

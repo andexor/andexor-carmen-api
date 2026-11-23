@@ -9,6 +9,7 @@ action is checked against the caller's role (authorize). See specs/001-skeleton-
 Companies, contacts, and the reference codes: specs/002-companies-and-contacts/spec.md.
 The timeline and tasks: specs/003-activities-and-tasks/spec.md.
 Services, the rubric, and scores: specs/004-services-rubric-and-scoring/spec.md.
+Enrichment facts: specs/005-enrichment-facts/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -38,6 +39,7 @@ from records import (
     CONTACT_FIELDS,
     CRITERION_CODES,
     CRITERION_FIELDS,
+    FACT_FIELDS,
     SERVICE_CODES,
     SERVICE_FIELDS,
     TASK_CODES,
@@ -46,6 +48,9 @@ from records import (
     Values,
     clean,
     derive_domain,
+    describe_change,
+    fact_key,
+    fact_value,
     iso_date,
     slug,
 )
@@ -1249,3 +1254,191 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
     except Exception as e:
         return failed(request, "store_answers", e)
     return JSONResponse(scores_body(scores, services))
+
+
+# ---- Enrichment facts ----------------------------------------------------------------------------
+
+FACT_COLUMNS = "id, company_id, key, value, source, source_detail, notes, ai_run_id, observed_at, created_at"
+NEWEST_FACT = "observed_at DESC, created_at DESC, id"
+
+
+def fact_fields(entry: object) -> Values:
+    """The writable keys of one fact in a request. Raises BadBody for a wrong type."""
+    fact: Row = dict(cast(Row, entry)) if isinstance(entry, dict) else {}
+    if isinstance(fact.get("value"), (int, float)) and not isinstance(fact["value"], bool):
+        fact["value"] = str(fact["value"])  # a number is stored as text, like every value
+    return clean(fact, FACT_FIELDS)
+
+
+def audit(request: Request, what: str, company_id: str, before: Row, after: Values | None) -> Any:
+    """Record an edit (after is the new values) or a delete (after is None) before it is carried out.
+
+    Writes a line to the Worker log now, and returns the statement that adds a permanent SYSTEM entry,
+    holding the old values, to the company's timeline. The caller puts that statement first in the
+    same transaction as the change, so the change cannot happen without its record.
+    """
+    body = describe_change(what, before, after)
+    record = {
+        "event": "carmen_audit",
+        "change": body,
+        "company_id": company_id,
+        "by": request.state.identity["id"],
+        "request_id": request.state.request_id,
+    }
+    logger.info(json.dumps(record))
+    entry = {
+        "id": str(uuid.uuid4()),
+        "company_id": company_id,
+        "kind": "SYSTEM",
+        "body": body,
+        "created_by": request.state.identity["id"],
+    }
+    return insert(db(request), "activity", entry)
+
+
+@app.get("/api/v1/facts/keys")
+@action(READ)
+async def list_fact_keys(request: Request) -> JSONResponse:
+    # For auto-complete: the well-known keys, then any other key already in use.
+    sql = (
+        "SELECT * FROM (SELECT key, label, value_type, description, sort_order FROM enrichment_key WHERE active = 1"
+        " UNION ALL SELECT DISTINCT key, NULL, 'TEXT', NULL, NULL FROM enrichment_fact"
+        " WHERE key NOT IN (SELECT key FROM enrichment_key)) ORDER BY sort_order IS NULL, sort_order, key"
+    )
+    try:
+        result = await db(request).prepare(sql).all()
+    except Exception as e:
+        return failed(request, "list_fact_keys", e)
+    return JSONResponse({"items": result["results"]})
+
+
+@app.get("/api/v1/companies/{company_id}/facts")
+@action(READ)
+async def list_facts(
+    request: Request,
+    company_id: str,
+    latest: bool = False,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: int = Query(0, ge=0),
+) -> JSONResponse:
+    if latest:
+        # The newest fact of each key, by key.
+        sql = (
+            f"SELECT {FACT_COLUMNS} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY {NEWEST_FACT}) AS place"
+            " FROM enrichment_fact WHERE company_id = ?) WHERE place = 1 ORDER BY key LIMIT ? OFFSET ?"
+        )
+    else:
+        sql = f"SELECT {FACT_COLUMNS} FROM enrichment_fact WHERE company_id = ? ORDER BY {NEWEST_FACT} LIMIT ? OFFSET ?"
+    try:
+        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        result = await db(request).prepare(sql).bind(company_id, limit + 1, cursor).all()
+    except Exception as e:
+        return failed(request, "list_facts", e)
+    if not company:
+        return error(request, 404)
+    return page(result, limit, cursor)
+
+
+@app.post("/api/v1/companies/{company_id}/facts")
+@action(WRITE)
+async def create_facts(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
+    given: Any = body.get("facts", [body])  # many facts under "facts", or the body is one fact
+    if not isinstance(given, list) or not given:
+        return error(request, 400)
+
+    try:
+        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        known = await db(request).prepare("SELECT key, value_type FROM enrichment_key").all()
+    except Exception as e:
+        return failed(request, "load_fact_keys", e)
+    if not company:
+        return error(request, 404)
+    types: dict[str, str] = {row["key"]: row["value_type"] for row in known["results"]}
+
+    statements: list[Any] = []
+    try:
+        for entry in cast(list[Any], given):
+            values = fact_fields(entry)
+            values["key"] = fact_key(values.get("key") or "")
+            if not values["key"] or not values.get("value"):
+                raise BadBody("a fact needs a key and a value")
+            values["value"] = fact_value(values["value"], types.get(values["key"]))
+            values.update(id=str(uuid.uuid4()), company_id=company_id, source="MANUAL")
+            statements.append(insert(db(request), "enrichment_fact", values))
+    except BadBody as e:
+        return failed(request, "read_facts", e)
+
+    try:
+        # All of them or none: one transaction.
+        results = await db(request).batch(statements)
+        rows = [result["results"][0] for result in results]
+    except Exception as e:
+        return failed(request, "insert_facts", e)
+    return JSONResponse({"items": rows}, status_code=201)
+
+
+@app.patch("/api/v1/facts/{fact_id}")
+@action(WRITE)
+async def update_fact(request: Request, fact_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = fact_fields(body)
+        if "key" in values:
+            values["key"] = fact_key(values["key"] or "")
+        if ("key" in values and not values["key"]) or ("value" in values and not values["value"]):
+            raise BadBody("a fact needs a key and a value")
+    except BadBody as e:
+        return failed(request, "read_fact", e)
+
+    try:
+        current = await db(request).prepare(f"SELECT {FACT_COLUMNS} FROM enrichment_fact WHERE id = ?").bind(fact_id).first()
+    except Exception as e:
+        return failed(request, "load_fact", e)
+    if not current:
+        return error(request, 404)
+
+    if "value" in values:
+        key = values.get("key", current["key"])
+        try:
+            known = await db(request).prepare("SELECT value_type FROM enrichment_key WHERE key = ?").bind(key).first()
+            values["value"] = fact_value(values["value"], known["value_type"] if known else None)
+        except Exception as e:
+            return failed(request, "check_fact", e)
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    if not changed:
+        return JSONResponse(current)
+
+    try:
+        # The record of the old values is written first, in the same transaction as the edit.
+        statements = [
+            audit(request, f"Fact {current['key']}", current["company_id"], current, changed),
+            update(db(request), "enrichment_fact", changed, fact_id, stamp=False),
+        ]
+        results = await db(request).batch(statements)
+        row = results[-1]["results"][0]
+    except Exception as e:
+        return failed(request, "update_fact", e)
+    return JSONResponse(row)
+
+
+@app.delete("/api/v1/facts/{fact_id}")
+@action(WRITE)
+async def delete_fact(request: Request, fact_id: str) -> Response:
+    sql = "SELECT company_id, key, value, source, source_detail, notes, observed_at FROM enrichment_fact WHERE id = ?"
+    try:
+        current = await db(request).prepare(sql).bind(fact_id).first()
+    except Exception as e:
+        return failed(request, "load_fact", e)
+    if not current:
+        return error(request, 404)
+
+    try:
+        # The record of what is deleted is written first, in the same transaction as the delete.
+        held = {column: value for column, value in current.items() if column not in ("company_id", "key")}
+        statements = [
+            audit(request, f"Fact {current['key']}", current["company_id"], held, None),
+            db(request).prepare("DELETE FROM enrichment_fact WHERE id = ?").bind(fact_id),
+        ]
+        await db(request).batch(statements)
+    except Exception as e:
+        return failed(request, "delete_fact", e)
+    return Response(status_code=204)
