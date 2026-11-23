@@ -11,7 +11,7 @@ import importlib
 import re
 from datetime import UTC, datetime
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 Values = dict[str, Any]
@@ -81,6 +81,31 @@ DEAL_FIELDS: dict[str, type] = {
     ),
     **dict.fromkeys(("one_time_value_cents", "monthly_value_cents"), int),
 }
+AGREEMENT_FIELDS: dict[str, type] = {
+    **dict.fromkeys(
+        (
+            "company_id",
+            "deal_id",
+            "parent_agreement_id",
+            "type",
+            "title",
+            "status",
+            "engagement_model",
+            "amount_period",
+            "performance_terms",
+            "currency",
+            "signed_date",
+            "effective_date",
+            "end_date",
+            "terminated_at",
+            "notes",
+            "owner_id",
+        ),
+        str,
+    ),
+    **dict.fromkeys(("amount_cents", "setup_fee_cents", "renewal_notice_days"), int),
+    "auto_renews": bool,
+}
 
 # Timeline kinds that only the API writes. An entry of one of these kinds is permanent.
 AUTOMATIC_KINDS = ("STAGE_CHANGE", "SCORE_CHANGE", "SYSTEM")
@@ -92,6 +117,12 @@ ACTIVITY_CODES = {"kind": "ACTIVITY_KIND"}
 TASK_CODES = {"status": "TASK_STATUS"}
 SERVICE_CODES = {"category": "SERVICE_CATEGORY"}
 DEAL_CODES = {"stage": "DEAL_STAGE", "engagement_model": "ENGAGEMENT_MODEL"}
+AGREEMENT_CODES = {
+    "type": "AGREEMENT_TYPE",
+    "status": "AGREEMENT_STATUS",
+    "engagement_model": "ENGAGEMENT_MODEL",
+    "amount_period": "AMOUNT_PERIOD",
+}
 CRITERION_CODES = {"section": "RUBRIC_SECTION", "answer_type": "ANSWER_TYPE"}
 
 
@@ -216,6 +247,22 @@ def id_list(body: Values, key: str) -> list[str] | None:
     if not isinstance(given, list) or not all(isinstance(item, str) and item for item in cast(list[Any], given)):
         raise BadBody(f"{key} must be a list of ids")
     return sorted(set(cast(list[str], given)))
+
+
+def file_name_of(given: str | None) -> str:
+    """A stored file name: the last part of a path, with no control characters, at most 255 long."""
+    name = re.split(r"[/\\]", given or "")[-1]
+    name = "".join(character for character in name if character.isprintable()).strip()
+    return name[:255] or "document"
+
+
+def download_header(file_name: str) -> str:
+    """The Content-Disposition value that makes a browser save the file under its name.
+
+    It carries a plain ASCII name for old clients and the exact name, percent-encoded, for the rest.
+    """
+    plain = "".join(c if c.isascii() and c.isprintable() and c not in '"\\' else "_" for c in file_name)
+    return f"attachment; filename=\"{plain}\"; filename*=UTF-8''{quote(file_name, safe='')}"
 
 
 def fact_key(text: str) -> str:

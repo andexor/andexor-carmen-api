@@ -66,7 +66,19 @@
                     "database_name": "andexor-carmen-api-prev",
                     "database_id": "17fbf861-75a5-465e-8a99-03342b0de39a"
                 }
+            ],
+            "r2_buckets": [
+                {
+                    "binding": "DOCS",
+                    "bucket_name": "andexor-carmen-api-prev"
+                }
             ]
         }
-    }
+    },
+    "r2_buckets": [
+        {
+            "binding": "DOCS",
+            "bucket_name": "andexor-carmen-api-prod"
+        }
+    ]
 }
