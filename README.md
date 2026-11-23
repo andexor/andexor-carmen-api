@@ -14,7 +14,7 @@ PRD.md               what this app must do (frozen)
 specs/               Spec Kit specifications; 000-repo-setup records what changed since the PRD
 src/worker.py        the Worker entry point
 src/app.py           the FastAPI application: identity, role check, endpoints
-src/records.py       what a caller may write to a company or a contact, and the domain rule
+src/records.py       what a caller may write to each kind of record, and the domain rule
 src/access.py        Cloudflare Access token verification
 src/roles.py         who may do what
 tests/               unit tests, run by unit-test.sh

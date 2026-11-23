@@ -84,8 +84,30 @@ expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"owner_id":"no-suc
 expect 201 '"is_primary":1' -X POST "${JSON[@]}" -d '{"name":"Smoke Contact","is_primary":true}' "${BASE}/companies/${ID}/contacts"
 expect 200 '"name":"Smoke Contact"' "${BASE}/companies/${ID}"
 expect 200 '"next_cursor":null' "${BASE}/companies?q=smoke+contact"
+
+# The timeline and tasks (specs/003-activities-and-tasks/spec.md). Both hang off the test company,
+# so deleting it below removes them.
+expect 201 '"kind":"NOTE"' -X POST "${JSON[@]}" -d '{"body":"Smoke note"}' "${BASE}/companies/${ID}/activities"
+expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"kind":"SYSTEM"}' "${BASE}/companies/${ID}/activities"
+# The stage change above wrote an automatic entry, and it is permanent.
+expect 200 '"kind":"STAGE_CHANGE"' "${BASE}/companies/${ID}/activities?kind=STAGE_CHANGE"
+ENTRY=$(jq -r '.items[0].id' "${BODY}")
+expect 409 '"error":"CONFLICT"' -X PATCH "${JSON[@]}" -d '{"body":"edited"}' "${BASE}/activities/${ENTRY}"
+expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/activities/${ENTRY}"
+# A date in another form is stored in ISO 8601 form.
+expect 201 '"due_date":"2026-12-01"' -X POST "${JSON[@]}" \
+    -d "{\"title\":\"Smoke task\",\"company_id\":\"${ID}\",\"due_date\":\"12/1/2026\"}" "${BASE}/tasks"
+TASK=$(jq -r '.id' "${BODY}")
+expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"due_date":"13/45/2026"}' "${BASE}/tasks/${TASK}"
+# A fuzzy date is translated. This also proves that the date library runs in the Worker.
+expect 200 "\"due_date\":\"$(date -u -d tomorrow +%F)\"" -X PATCH "${JSON[@]}" -d '{"due_date":"tomorrow"}' "${BASE}/tasks/${TASK}"
+expect 200 '"title":"Smoke task"' "${BASE}/companies/${ID}"
+expect 200 '"completed_at":"2' -X PATCH "${JSON[@]}" -d '{"status":"DONE"}' "${BASE}/tasks/${TASK}"
+expect 200 '"title":"Smoke task"' "${BASE}/tasks?status=DONE&company_id=${ID}"
+
 expect 204 '' -X DELETE "${BASE}/companies/${ID}"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${ID}"
+expect 200 '"items":\[\]' "${BASE}/tasks?company_id=${ID}"
 
 # Cross-Origin Resource Sharing (specs/017-cors/spec.md): only an origin in ALLOWED_ORIGINS is echoed.
 # header <yes|no> <text>: the response headers of the last call must, or must not, contain the text.

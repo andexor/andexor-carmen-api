@@ -6,6 +6,7 @@
 
 import asyncio
 import base64
+import datetime
 import json
 import pathlib
 import sys
@@ -93,6 +94,23 @@ class Authorize(unittest.TestCase):
 
     def test_public_needs_no_identity(self):
         self.assertFalse(self.refused(PUBLIC, None))
+
+
+class OwnRecords(unittest.TestCase):
+    def may(self, role: str, caller: str | None, owner: str | None) -> bool:
+        request = cast(Request, SimpleNamespace(state=SimpleNamespace(identity={"role": role, "id": caller})))
+        return api.may_delete(request, owner)
+
+    def test_a_member_deletes_only_their_own(self):
+        self.assertTrue(self.may(MEMBER, "u1", "u1"))
+        self.assertFalse(self.may(MEMBER, "u1", "u2"))
+        self.assertFalse(self.may(MEMBER, "u1", None))
+        self.assertFalse(self.may(MEMBER, None, None))
+
+    def test_an_admin_deletes_anything(self):
+        for owner in ("u1", "u2", None):
+            self.assertTrue(self.may(ADMIN, "u1", owner))
+        self.assertTrue(self.may(ADMIN, None, None))  # a machine caller on the preview
 
 
 class Routes(unittest.TestCase):
@@ -183,6 +201,91 @@ class Records(unittest.TestCase):
     def test_code_columns_are_writable_columns(self):
         self.assertLessEqual(set(records.COMPANY_CODES), set(records.COMPANY_FIELDS))
         self.assertLessEqual(set(records.CONTACT_CODES), set(records.CONTACT_FIELDS))
+        self.assertLessEqual(set(records.ACTIVITY_CODES), set(records.ACTIVITY_FIELDS))
+        self.assertLessEqual(set(records.TASK_CODES), set(records.TASK_FIELDS))
+
+    def test_set_by_the_api_is_not_writable(self):
+        for key in ("id", "company_id", "created_by", "created_at"):
+            self.assertNotIn(key, records.ACTIVITY_FIELDS)
+        for key in ("id", "completed_at", "created_at"):
+            self.assertNotIn(key, records.TASK_FIELDS)
+
+    def test_dates_are_put_in_iso_form(self):
+        dates = {
+            "2026-12-01": "2026-12-01",
+            "12/1/2026": "2026-12-01",
+            "12/01/26": "2026-12-01",
+            "12/01/2026": "2026-12-01",
+            "12-01-2026": "2026-12-01",
+            "01-01-2026": "2026-01-01",
+            "1-5-2026": "2026-01-05",
+            "01 Dec 2026": "2026-12-01",
+            "01 December 2026": "2026-12-01",
+            "2026/12/01": "2026-12-01",
+            "December 1, 2026": "2026-12-01",
+            "Dec 1, 2026": "2026-12-01",
+            "1 Dec 2026": "2026-12-01",
+            "2026-12-01T14:30:00Z": "2026-12-01",
+        }
+        for text, expected in dates.items():
+            self.assertEqual(records.iso_date(text), expected, text)
+        moments = {
+            "2026-12-01T14:30:00Z": "2026-12-01T14:30:00Z",
+            "2026-12-01 14:30": "2026-12-01T14:30:00Z",
+            "2026-12-01T09:30:00-05:00": "2026-12-01T14:30:00Z",
+            "2026-12-01": "2026-12-01T00:00:00Z",
+            "12/1/2026 2:30 PM": "2026-12-01T14:30:00Z",
+            "Dec 1, 2026 14:30": "2026-12-01T14:30:00Z",
+            "12-01-2026 14:30": "2026-12-01T14:30:00Z",
+            "01 Dec 2026 2:30 PM": "2026-12-01T14:30:00Z",
+        }
+        for text, expected in moments.items():
+            self.assertEqual(records.iso_timestamp(text), expected, text)
+
+    def test_a_fuzzy_date_is_tried_last(self):
+        now = datetime.datetime(2026, 11, 23, 15, 0, 0)  # a Monday
+        dates = {
+            "tomorrow": "2026-11-24",
+            "today": "2026-11-23",
+            "yesterday": "2026-11-22",
+            "next week": "2026-11-30",
+            "next Tuesday": "2026-12-01",
+            "Friday": "2026-11-27",
+            "in 3 days": "2026-11-26",
+            "next month": "2026-12-01",
+            "end of month": "2026-11-30",
+        }
+        for text, expected in dates.items():
+            self.assertEqual(records.iso_date(text, now), expected, text)
+        self.assertEqual(records.iso_timestamp("friday at 3pm", now), "2026-11-27T15:00:00Z")
+        self.assertEqual(records.iso_timestamp("noon tomorrow", now), "2026-11-24T12:00:00Z")
+        # A real date is never read as a phrase.
+        self.assertEqual(records.iso_date("Dec 1, 2026", now), "2026-12-01")
+
+    def test_a_date_that_is_not_understood_is_refused(self):
+        for text in ("13/45/2026", "2026-02-30", "2026", "soon", "12/01", "x", "TBD", "Acme next week please", "next"):
+            for convert in (records.iso_date, records.iso_timestamp):
+                with self.assertRaises(records.BadBody, msg=text):
+                    convert(text)
+        with self.assertRaises(records.BadBody):
+            records.clean({"due_date": "13/45/2026"}, records.TASK_FIELDS)
+
+    def test_clean_reformats_date_columns_only(self):
+        self.assertEqual(records.clean({"due_date": " 12/1/2026 ", "title": "12/1/2026"}, records.TASK_FIELDS), {"due_date": "2026-12-01", "title": "12/1/2026"})
+        self.assertEqual(records.clean({"occurred_at": "12/1/2026", "body": None}, records.ACTIVITY_FIELDS), {"occurred_at": "2026-12-01T00:00:00Z", "body": None})
+        self.assertEqual(records.clean({"due_date": None}, records.TASK_FIELDS), {"due_date": None})
+
+    def test_every_date_column_is_reformatted_by_its_name(self):
+        # The rule is by column name, so a date field added by any later feature is covered.
+        self.assertEqual(records.iso("signed_date", "12/01/2026"), "2026-12-01")
+        self.assertEqual(records.iso("expected_close_date", "01 Dec 2026"), "2026-12-01")
+        self.assertEqual(records.iso("observed_at", "12-01-2026"), "2026-12-01T00:00:00Z")
+        self.assertEqual(records.iso("name", "12/01/2026"), "12/01/2026")
+        for fields in (records.COMPANY_FIELDS, records.CONTACT_FIELDS, records.ACTIVITY_FIELDS, records.TASK_FIELDS):
+            for column in fields:
+                expected = "2026-12-01" if column.endswith("_date") else "2026-12-01T00:00:00Z" if column.endswith("_at") else "12/01/2026"
+                if fields[column] is str:
+                    self.assertEqual(records.clean({column: "12/01/2026"}, fields)[column], expected, column)
 
     def test_database_errors_map_to_statuses(self):
         cases = {
