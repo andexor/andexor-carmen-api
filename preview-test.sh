@@ -40,7 +40,8 @@ HOST=$(jq -r '.env.preview.routes[0].pattern' wrangler.jsonc)
 BASE="https://${HOST%%/*}/api/v1"
 BODY=$(mktemp)
 HEAD=$(mktemp)
-trap 'rm -f "${BODY}" "${HEAD}"' EXIT
+FILE=$(mktemp)
+trap 'rm -f "${BODY}" "${HEAD}" "${FILE}"' EXIT
 
 # expect <status> <text the body must contain, or '' for any body> <curl arguments, the URL last>
 expect() {
@@ -69,7 +70,18 @@ expect 404 '"error":"NOT_FOUND"' "${BASE}/no-such-path"
 JSON=(-H "Content-Type: application/json")
 expect 200 '"domain":"COMPANY_STAGE"' "${BASE}/srt"
 expect 200 '"items"' "${BASE}/companies?q=smoke-test.invalid"
+# A company with agreements or documents cannot be deleted, so those go first. An agreement must
+# be a draft to be deleted.
 for id in $(jq -r '.items[].id' "${BODY}"); do
+    expect 200 '"items"' "${BASE}/companies/${id}/documents"
+    for document in $(jq -r '.items[].id' "${BODY}"); do
+        expect 204 '' -X DELETE "${BASE}/documents/${document}"
+    done
+    expect 200 '"items"' "${BASE}/agreements?company_id=${id}"
+    for agreement in $(jq -r '.items[].id' "${BODY}"); do
+        expect 200 '"status":"DRAFT"' -X PATCH "${JSON[@]}" -d '{"status":"DRAFT"}' "${BASE}/agreements/${agreement}"
+        expect 204 '' -X DELETE "${BASE}/agreements/${agreement}"
+    done
     expect 204 '' -X DELETE "${BASE}/companies/${id}"
 done
 expect 201 '"domain":"smoke-test.invalid"' -X POST "${JSON[@]}" \
@@ -160,6 +172,36 @@ expect 200 '"city":"Atlanta"' -X PATCH "${JSON[@]}" -d '{"city":"Atlanta"}' "${B
 expect 200 "Company Smoke Test edited: city None to 'Atlanta'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
 expect 200 '"title":"Smoke task 2"' -X PATCH "${JSON[@]}" -d '{"title":"Smoke task 2"}' "${BASE}/tasks/${TASK}"
 expect 200 "Task Smoke task edited: title 'Smoke task' to 'Smoke task 2'" "${BASE}/companies/${ID}/activities?kind=SYSTEM&limit=200"
+
+# Agreements and documents (specs/008-agreements-and-documents/spec.md). The company is a CUSTOMER
+# by hand at this point. Both are removed again here, because they block deleting the company.
+expect 201 '"status":"DRAFT"' -X POST "${JSON[@]}" \
+    -d "{\"company_id\":\"${ID}\",\"type\":\"MSA\",\"title\":\"Smoke MSA\",\"signed_date\":\"11/01/2026\"}" "${BASE}/agreements"
+AGREEMENT=$(jq -r '.id' "${BODY}")
+expect 200 '"status":"ACTIVE"' -X PATCH "${JSON[@]}" -d '{"status":"ACTIVE"}' "${BASE}/agreements/${AGREEMENT}"
+expect 200 '"title":"Smoke MSA"' "${BASE}/agreements?company_id=${ID}&status=ACTIVE"
+printf 'smoke document\n' > "${FILE}"
+expect 201 '"size_bytes":15' -X POST -H "Content-Type: text/plain" --data-binary "@${FILE}" \
+    "${BASE}/companies/${ID}/documents?file_name=smoke.txt&agreement_id=${AGREEMENT}"
+DOCUMENT=$(jq -r '.id' "${BODY}")
+if [[ "$(jq -r '.sha256' "${BODY}")" != "$(sha256sum < "${FILE}" | cut -d' ' -f1)" ]]; then
+    echo "FAILED: the stored checksum is not the file's checksum"
+    exit 1
+fi
+expect 200 'smoke document' "${BASE}/documents/${DOCUMENT}/content"
+if ! grep -qi '^content-disposition: attachment; filename="smoke.txt"' "${HEAD}" || ! grep -qi '^content-type: text/plain' "${HEAD}"; then
+    echo "FAILED: the download does not carry the file's name and type"
+    exit 1
+fi
+expect 200 '"file_name":"smoke.txt"' "${BASE}/agreements/${AGREEMENT}"
+expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/companies/${ID}"
+expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/agreements/${AGREEMENT}"
+expect 204 '' -X DELETE "${BASE}/documents/${DOCUMENT}"
+expect 404 '"error":"NOT_FOUND"' "${BASE}/documents/${DOCUMENT}/content"
+# When the last active agreement ends, the customer becomes a former customer.
+expect 200 '"status":"DRAFT"' -X PATCH "${JSON[@]}" -d '{"status":"DRAFT"}' "${BASE}/agreements/${AGREEMENT}"
+expect 200 '"stage":"FORMER"' "${BASE}/companies/${ID}"
+expect 204 '' -X DELETE "${BASE}/agreements/${AGREEMENT}"
 
 # The Today view (specs/006-today/spec.md). The overdue task goes with the test company.
 expect 201 '"due_date":"2020-01-01"' -X POST "${JSON[@]}" \

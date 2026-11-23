@@ -203,6 +203,8 @@ class Records(unittest.TestCase):
         self.assertLessEqual(set(records.CONTACT_CODES), set(records.CONTACT_FIELDS))
         self.assertLessEqual(set(records.ACTIVITY_CODES), set(records.ACTIVITY_FIELDS))
         self.assertLessEqual(set(records.TASK_CODES), set(records.TASK_FIELDS))
+        self.assertLessEqual(set(records.DEAL_CODES), set(records.DEAL_FIELDS))
+        self.assertLessEqual(set(records.AGREEMENT_CODES), set(records.AGREEMENT_FIELDS))
 
     def test_set_by_the_api_is_not_writable(self):
         for key in ("id", "company_id", "created_by", "created_at"):
@@ -331,6 +333,27 @@ class Records(unittest.TestCase):
             with self.assertRaises(records.BadBody, msg=repr(bad)):
                 records.id_list({"service_ids": bad}, "service_ids")
 
+    def test_file_names(self):
+        names = {
+            "Signed MSA.pdf": "Signed MSA.pdf",
+            "../../etc/passwd": "passwd",
+            "C:\\Users\\ed\\contract.docx": "contract.docx",
+            " spaced.txt ": "spaced.txt",
+            "tab\tname.txt": "tabname.txt",
+            "": "document",
+            None: "document",
+            "dir/": "document",
+        }
+        for given, expected in names.items():
+            self.assertEqual(records.file_name_of(given), expected, repr(given))
+        self.assertEqual(len(records.file_name_of("x" * 400)), 255)
+
+    def test_download_header(self):
+        self.assertEqual(records.download_header("smoke.txt"), "attachment; filename=\"smoke.txt\"; filename*=UTF-8''smoke.txt")
+        accented = records.download_header("Signed MSA \u00e9 \"final\".txt")
+        self.assertEqual(accented, "attachment; filename=\"Signed MSA _ _final_.txt\"; filename*=UTF-8''Signed%20MSA%20%C3%A9%20%22final%22.txt")
+        self.assertNotIn("\n", records.download_header("a\nb"))
+
     def test_database_errors_map_to_statuses(self):
         cases = {
             "D1_ERROR: UNIQUE constraint failed: company.domain: SQLITE_CONSTRAINT": 409,
@@ -366,6 +389,14 @@ class Config(unittest.TestCase):
 
     def test_dev_user_is_never_in_the_config(self):
         self.assertNotIn("DEV_USER_EMAIL", self.text)
+
+    def test_preview_never_shares_data_with_production(self):
+        preview = self.config["env"]["preview"]
+        self.assertNotEqual(preview["d1_databases"][0]["database_id"], self.config["d1_databases"][0]["database_id"])
+        self.assertNotEqual(preview["r2_buckets"][0]["bucket_name"], self.config["r2_buckets"][0]["bucket_name"])
+        for environment in (self.config, preview):
+            self.assertEqual(environment["d1_databases"][0]["binding"], "DB")
+            self.assertEqual(environment["r2_buckets"][0]["binding"], "DOCS")
 
     def test_production_allows_no_other_origin(self):
         self.assertEqual(self.config["vars"]["ALLOWED_ORIGINS"], "")

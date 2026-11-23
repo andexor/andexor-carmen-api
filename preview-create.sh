@@ -9,6 +9,7 @@
 #   1. The preview D1 database named in env.preview of wrangler.jsonc, if it is missing.
 #   2. Its id, written into env.preview of wrangler.jsonc.
 #   3. Every pending migration from andexor-carmen-main, applied to it.
+#   4. The preview R2 bucket for documents named in env.preview, if it is missing.
 #
 # The preview Worker and its route (carmen-preview.andexor.net/api/*) are created by the deploy
 # in preview-test.sh. The DNS record, the Cloudflare Access application, and the service token
@@ -70,6 +71,23 @@ fi
 if [[ "${DB_ID}" == "${PROD_DB_ID}" ]]; then
     echo "error: the preview database id matches the production database id" >&2
     exit 1
+fi
+
+# The preview bucket for documents. A preview must never share a bucket with production.
+PREVIEW_BUCKET=$(jq -r '.env.preview.r2_buckets[0].bucket_name // empty' "${WRANGLER_FILE}")
+PROD_BUCKET=$(jq -r '.r2_buckets[0].bucket_name // empty' "${WRANGLER_FILE}")
+if [[ -n "${PREVIEW_BUCKET}" ]]; then
+    if [[ "${PREVIEW_BUCKET}" == "${PROD_BUCKET}" ]]; then
+        echo "error: the preview bucket name matches the production bucket name" >&2
+        exit 1
+    fi
+    if cf r2 buckets list 2> /dev/null | sed -n '/^{/,$p' \
+        | jq -e --arg n "${PREVIEW_BUCKET}" '.buckets[] | select(.name == $n)' > /dev/null; then
+        echo "R2 bucket ${PREVIEW_BUCKET} already exists"
+    else
+        echo "Creating R2 bucket ${PREVIEW_BUCKET}"
+        cf r2 buckets create --name "${PREVIEW_BUCKET}" --location-hint enam > /dev/null
+    fi
 fi
 
 # 2. Write the id into the config.

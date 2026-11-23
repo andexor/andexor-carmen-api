@@ -12,28 +12,32 @@ Services, the rubric, and scores: specs/004-services-rubric-and-scoring/spec.md.
 Enrichment facts: specs/005-enrichment-facts/spec.md.
 The Today view: specs/006-today/spec.md.
 Deals: specs/007-deals/spec.md.
+Agreements and documents: specs/008-agreements-and-documents/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
 inline try/except, which logs the step, the error, and the line. Detail stays in the log.
 """
 
+import hashlib
 import json
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException
 
 import access
 from records import (
     ACTIVITY_CODES,
     ACTIVITY_FIELDS,
+    AGREEMENT_CODES,
+    AGREEMENT_FIELDS,
     AUTOMATIC_KINDS,
     COMPANY_CODES,
     COMPANY_FIELDS,
@@ -53,8 +57,10 @@ from records import (
     clean,
     derive_domain,
     describe_change,
+    download_header,
     fact_key,
     fact_value,
+    file_name_of,
     id_list,
     iso_date,
     local_date,
@@ -432,6 +438,7 @@ async def get_company(request: Request, company_id: str) -> JSONResponse:
         tasks = await db(request).prepare(OPEN_TASKS_OF).bind(company_id).all()
         services = await db(request).prepare(SERVICE_SCORES_OF).bind(company_id).all()
         deals = await db(request).prepare(OPEN_DEALS_OF).bind(company_id).all()
+        agreements = await db(request).prepare(ACTIVE_AGREEMENTS_OF).bind(company_id).all()
     except Exception as e:
         return failed(request, "load_company", e)
     if not row:
@@ -443,6 +450,7 @@ async def get_company(request: Request, company_id: str) -> JSONResponse:
             "open_tasks": tasks["results"],
             "services": services["results"],
             "open_deals": [deal_out(deal) for deal in deals["results"]],
+            "active_agreements": [agreement_out(agreement) for agreement in agreements["results"]],
         }
     )
 
@@ -1843,4 +1851,424 @@ async def delete_deal(request: Request, deal_id: str) -> Response:
         await database.batch(statements)
     except Exception as e:
         return failed(request, "delete_deal", e)
+    return Response(status_code=204)
+
+
+# ---- Agreements ----------------------------------------------------------------------------------
+
+AGREEMENT_SELECT = (
+    "SELECT a.*, c.name AS company_name,"
+    " (SELECT group_concat(service_id) FROM agreement_service s WHERE s.agreement_id = a.id) AS service_ids"
+    " FROM agreement a JOIN company c ON c.id = a.company_id"
+)
+ACTIVE_AGREEMENTS_OF = f"{AGREEMENT_SELECT} WHERE a.company_id = ? AND a.status = 'ACTIVE' ORDER BY a.end_date IS NULL, a.end_date, a.id"
+# What an agreement may point to. Each must be a record of the agreement's own company.
+AGREEMENT_LINKS = {"parent_agreement_id": "agreement", "deal_id": "deal"}
+DOCUMENT_COLUMNS = "id, company_id, agreement_id, file_name, content_type, size_bytes, sha256, uploaded_by, uploaded_at"
+
+
+def agreement_out(row: Row) -> Row:
+    """An agreement as returned to a caller: the services it covers are a list."""
+    return {**row, "service_ids": sorted(row["service_ids"].split(",")) if row["service_ids"] else []}
+
+
+def agreement_label(agreement: Row) -> str:
+    return f"Agreement {agreement['title'] or agreement['type']}"
+
+
+def agreement_services(database: Any, agreement_id: str, service_ids: list[str]) -> list[Any]:
+    sql = "INSERT INTO agreement_service (agreement_id, service_id) VALUES (?, ?)"
+    return [database.prepare(sql).bind(agreement_id, service_id) for service_id in service_ids]
+
+
+async def link_outside(database: Any, values: Values, company_id: str) -> str | None:
+    """The first link (parent agreement, deal) whose record is not under the company, or None."""
+    for column, table in AGREEMENT_LINKS.items():
+        if values.get(column) is not None:
+            sql = f"SELECT 1 AS found FROM {table} WHERE id = ? AND company_id = ?"
+            if not await database.prepare(sql).bind(values[column], company_id).first():
+                return column
+    return None
+
+
+def company_stage_move(request: Request, company_id: str, old: str, new: str, why: str) -> list[Any]:
+    """The statements for a stage change that follows from a fact: the Worker log first, then the timeline."""
+    moved = f"Stage changed from {old} to {new}: {why}"
+    log_change(request, moved, company_id)
+    entry = {
+        "id": str(uuid.uuid4()),
+        "company_id": company_id,
+        "kind": "STAGE_CHANGE",
+        "body": moved,
+        "created_by": request.state.identity["id"],
+    }
+    sql = f"UPDATE company SET stage = ?, updated_at = {NOW} WHERE id = ?"
+    return [db(request).prepare(sql).bind(new, company_id), insert(db(request), "activity", entry)]
+
+
+@app.get("/api/v1/agreements")
+@action(READ)
+async def list_agreements(
+    request: Request,
+    company_id: str | None = None,
+    type: str | None = None,
+    status: str | None = None,
+    engagement_model: str | None = None,
+    renewing_within_days: int | None = Query(None, ge=0, le=3650),
+    limit: int = Query(50, ge=1, le=200),
+    cursor: int = Query(0, ge=0),
+) -> JSONResponse:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    filters = {"a.company_id = ?": company_id, "a.type = ?": type, "a.status = ?": status, "a.engagement_model = ?": engagement_model}
+    for condition, value in filters.items():
+        if value is not None:
+            where.append(condition)
+            params.append(value)
+    try:
+        if renewing_within_days is not None:
+            # Active agreements that end within the window, counted from today where the business is.
+            sql = "SELECT value FROM setting WHERE key = 'digest.time_zone'"
+            zone = await db(request).prepare(sql).first()
+            where.append("a.status = 'ACTIVE' AND a.end_date IS NOT NULL AND a.end_date <= date(?, ?)")
+            params += [local_date(zone["value"] if zone else None)[0], f"+{renewing_within_days} days"]
+        sql = (
+            f"{AGREEMENT_SELECT} WHERE {' AND '.join(where)}"
+            " ORDER BY a.end_date IS NULL, a.end_date, a.created_at DESC, a.id LIMIT ? OFFSET ?"
+        )
+        result = await db(request).prepare(sql).bind(*params, limit + 1, cursor).all()
+    except Exception as e:
+        return failed(request, "list_agreements", e)
+    result["results"] = [agreement_out(row) for row in result["results"]]
+    return page(result, limit, cursor)
+
+
+@app.post("/api/v1/agreements")
+@action(WRITE)
+async def create_agreement(request: Request, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, AGREEMENT_FIELDS)
+        services = id_list(body, "service_ids") or []
+        if not values.get("company_id") or not values.get("type"):
+            raise BadBody("company_id and type are required")
+    except BadBody as e:
+        return failed(request, "read_agreement", e)
+    company_id = values["company_id"]
+
+    database = db(request)
+    try:
+        company = await database.prepare("SELECT id, stage FROM company WHERE id = ?").bind(company_id).first()
+        column = await unknown_code(database, values, AGREEMENT_CODES)
+        column = column or await link_outside(database, values, company_id)
+    except Exception as e:
+        return failed(request, "check_agreement", e)
+    if not company or column:
+        return error(request, 400)
+
+    values["id"] = str(uuid.uuid4())
+    values.setdefault("owner_id", request.state.identity["id"])  # the creator owns it unless the body says otherwise
+    if values.get("status") == "TERMINATED" and not values.get("terminated_at"):
+        values["terminated_at"] = utc_now()
+    statements = [insert(database, "agreement", values), *agreement_services(database, values["id"], services)]
+    if values.get("status") == "ACTIVE" and company["stage"] != "CUSTOMER":
+        statements += company_stage_move(request, company_id, company["stage"], "CUSTOMER", "an agreement became active")
+    try:
+        await database.batch(statements)
+        row = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(values["id"]).first()
+    except Exception as e:
+        return failed(request, "insert_agreement", e)
+    return JSONResponse(agreement_out(row), status_code=201)
+
+
+@app.get("/api/v1/agreements/{agreement_id}")
+@action(READ)
+async def get_agreement(request: Request, agreement_id: str) -> JSONResponse:
+    database = db(request)
+    try:
+        row = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(agreement_id).first()
+        sql = f"{AGREEMENT_SELECT} WHERE a.parent_agreement_id = ? ORDER BY a.created_at, a.id"
+        children = await database.prepare(sql).bind(agreement_id).all()
+        sql = f"SELECT {DOCUMENT_COLUMNS} FROM document WHERE agreement_id = ? ORDER BY uploaded_at DESC, id"
+        documents = await database.prepare(sql).bind(agreement_id).all()
+    except Exception as e:
+        return failed(request, "load_agreement", e)
+    if not row:
+        return error(request, 404)
+    return JSONResponse(
+        {
+            **agreement_out(row),
+            "children": [agreement_out(child) for child in children["results"]],
+            "documents": documents["results"],
+        }
+    )
+
+
+@app.patch("/api/v1/agreements/{agreement_id}")
+@action(WRITE)
+async def update_agreement(request: Request, agreement_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, AGREEMENT_FIELDS)
+        services = id_list(body, "service_ids")
+    except BadBody as e:
+        return failed(request, "read_agreement", e)
+    values.pop("company_id", None)  # an agreement stays with its company
+
+    database = db(request)
+    try:
+        found = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(agreement_id).first()
+    except Exception as e:
+        return failed(request, "load_agreement", e)
+    if not found:
+        return error(request, 404)
+    current = agreement_out(found)
+    company_id = current["company_id"]
+
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    if services is not None and services == current["service_ids"]:
+        services = None
+    if not changed and services is None:
+        return JSONResponse(current)
+    if "status" in changed and "terminated_at" not in values:
+        # Terminating records when; any other status clears it.
+        changed["terminated_at"] = utc_now() if changed["status"] == "TERMINATED" else None
+        if changed["terminated_at"] == current["terminated_at"]:
+            del changed["terminated_at"]
+    try:
+        column = await unknown_code(database, changed, AGREEMENT_CODES)
+        column = column or await link_outside(database, changed, company_id)
+        sql = (
+            "SELECT stage, (SELECT COUNT(*) FROM agreement WHERE company_id = c.id AND status = 'ACTIVE' AND id != ?)"
+            " AS other_active FROM company c WHERE c.id = ?"
+        )
+        company = await database.prepare(sql).bind(agreement_id, company_id).first()
+    except Exception as e:
+        return failed(request, "check_agreement", e)
+    if column:
+        return error(request, 400)
+
+    edits: Values = dict(changed)
+    if services is not None:
+        edits["service_ids"] = services
+    try:
+        # The record of the old values comes first, in the same transaction as the edit.
+        statements = audit(request, agreement_label(current), company_id, current, edits)
+        if changed:
+            statements.append(update(database, "agreement", changed, agreement_id))
+        if services is not None:
+            statements.append(database.prepare(f"UPDATE agreement SET updated_at = {NOW} WHERE id = ?").bind(agreement_id))
+            statements.append(database.prepare("DELETE FROM agreement_service WHERE agreement_id = ?").bind(agreement_id))
+            statements += agreement_services(database, agreement_id, services)
+        if changed.get("status") == "ACTIVE" and company["stage"] != "CUSTOMER":
+            statements += company_stage_move(request, company_id, company["stage"], "CUSTOMER", "an agreement became active")
+        ended = "status" in changed and current["status"] == "ACTIVE"
+        if ended and not company["other_active"] and company["stage"] == "CUSTOMER":
+            statements += company_stage_move(request, company_id, "CUSTOMER", "FORMER", "the last active agreement ended")
+        await database.batch(statements)
+        row = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(agreement_id).first()
+    except Exception as e:
+        return failed(request, "update_agreement", e)
+    return JSONResponse(agreement_out(row))
+
+
+# WRITE, not DELETE: a MEMBER may delete an agreement they own. may_delete decides.
+@app.delete("/api/v1/agreements/{agreement_id}")
+@action(WRITE)
+async def delete_agreement(request: Request, agreement_id: str) -> Response:
+    database = db(request)
+    try:
+        sql = (
+            f"SELECT *, (SELECT COUNT(*) FROM agreement k WHERE k.parent_agreement_id = x.id) AS children"
+            f" FROM ({AGREEMENT_SELECT}) x WHERE x.id = ?"
+        )
+        found = await database.prepare(sql).bind(agreement_id).first()
+    except Exception as e:
+        return failed(request, "load_agreement", e)
+    if not found:
+        return error(request, 404)
+    if not may_delete(request, found["owner_id"]):
+        return error(request, 403)
+    if found["status"] != "DRAFT" or found["children"]:
+        return error(request, 409)  # only a draft with no children can be deleted
+
+    current = agreement_out(found)
+    was = {**held(current, AGREEMENT_FIELDS), "service_ids": current["service_ids"]}
+    try:
+        statements = [
+            *audit(request, agreement_label(current), current["company_id"], was, None),
+            database.prepare("DELETE FROM agreement WHERE id = ?").bind(agreement_id),
+        ]
+        await database.batch(statements)
+    except Exception as e:
+        return failed(request, "delete_agreement", e)
+    return Response(status_code=204)
+
+
+# ---- Documents -----------------------------------------------------------------------------------
+# The file is an object in the private R2 bucket DOCS, at <company_id>/<document_id>. The row holds
+# its name, type, size, and checksum. The object is written first, then the row; the row is deleted
+# first, then the object.
+
+
+def bucket(request: Request) -> Any:
+    return request.scope["env"].DOCS
+
+
+@app.get("/api/v1/companies/{company_id}/documents")
+@action(READ)
+async def list_documents(request: Request, company_id: str) -> JSONResponse:
+    sql = f"SELECT {DOCUMENT_COLUMNS} FROM document WHERE company_id = ? ORDER BY uploaded_at DESC, id"
+    try:
+        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        result = await db(request).prepare(sql).bind(company_id).all()
+    except Exception as e:
+        return failed(request, "list_documents", e)
+    if not company:
+        return error(request, 404)
+    return JSONResponse({"items": result["results"]})
+
+
+@app.post("/api/v1/companies/{company_id}/documents")
+@action(WRITE)
+async def upload_document(
+    request: Request, company_id: str, file_name: str | None = None, agreement_id: str | None = None
+) -> JSONResponse:
+    database = db(request)
+    try:
+        company = await database.prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        limit = await database.prepare("SELECT value FROM setting WHERE key = 'document.max_size_bytes'").first()
+        max_size = int(limit["value"]) if limit and str(limit["value"]).isdigit() else 26214400
+        attached = True
+        if agreement_id is not None:
+            sql = "SELECT 1 AS found FROM agreement WHERE id = ? AND company_id = ?"
+            attached = bool(await database.prepare(sql).bind(agreement_id, company_id).first())
+    except Exception as e:
+        return failed(request, "check_document", e)
+    if not company:
+        return error(request, 404)
+    if not attached:
+        return error(request, 400)  # the agreement is not one of this company's
+
+    try:
+        # The body is the file itself. It is read in pieces, so only one full copy is held here.
+        data = bytearray()
+        digest = hashlib.sha256()
+        async for piece in request.stream():
+            data += piece
+            digest.update(piece)
+            if len(data) > max_size:
+                return error(request, 413)
+    except Exception as e:
+        return failed(request, "read_document", e)
+    if not data:
+        return error(request, 400)
+
+    document = {
+        "id": str(uuid.uuid4()),
+        "company_id": company_id,
+        "agreement_id": agreement_id,
+        "file_name": file_name_of(file_name),
+        "content_type": request.headers.get("content-type") or "application/octet-stream",
+        "size_bytes": len(data),
+        "sha256": digest.hexdigest(),
+        "uploaded_by": request.state.identity["id"],
+    }
+    document["r2_key"] = f"{company_id}/{document['id']}"
+    try:
+        from pyodide.ffi import to_js
+
+        js = access.js_module()
+        # The bucket checks the checksum it is given and refuses a body that does not match it.
+        options = {"httpMetadata": {"contentType": document["content_type"]}, "sha256": document["sha256"]}
+        # The body is handed over as an ArrayBuffer. A byte array would be walked one byte at a time by the
+        # Workers Python layer, which checks every value given to a binding: about 4 seconds per MiB.
+        body = to_js(data).buffer
+        await bucket(request).put(document["r2_key"], body, to_js(options, dict_converter=js.Object.fromEntries))
+    except Exception as e:
+        return failed(request, "store_document", e)
+
+    try:
+        row = await insert(database, "document", document).first()
+    except Exception as e:
+        log_error(request, "insert_document", e)
+        try:
+            # No row points to the object, so it is removed again.
+            await bucket(request).delete(document["r2_key"])
+        except Exception as cleanup:
+            log_error(request, "remove_orphan_document", cleanup)
+        return error(request, db_status(e))
+    return JSONResponse({column: row[column] for column in DOCUMENT_COLUMNS.split(", ")}, status_code=201)
+
+
+@app.get("/api/v1/documents/{document_id}")
+@action(READ)
+async def get_document(request: Request, document_id: str) -> JSONResponse:
+    sql = f"SELECT {DOCUMENT_COLUMNS} FROM document WHERE id = ?"
+    try:
+        row = await db(request).prepare(sql).bind(document_id).first()
+    except Exception as e:
+        return failed(request, "load_document", e)
+    return JSONResponse(row) if row else error(request, 404)
+
+
+@app.get("/api/v1/documents/{document_id}/content")
+@action(READ)
+async def download_document(request: Request, document_id: str) -> Response:
+    try:
+        row = await db(request).prepare("SELECT * FROM document WHERE id = ?").bind(document_id).first()
+    except Exception as e:
+        return failed(request, "load_document", e)
+    if not row:
+        return error(request, 404)
+
+    try:
+        stored = await bucket(request).get(row["r2_key"])
+    except Exception as e:
+        return failed(request, "fetch_document", e)
+    if not stored:
+        log_error(request, "fetch_document", LookupError(f"no object at {row['r2_key']}"))
+        return error(request, 404)
+
+    async def pieces() -> AsyncIterator[bytes]:
+        # Streamed: the file is passed on piece by piece and never held whole.
+        async for piece in stored.body:
+            yield piece.to_bytes()
+
+    # The type is sent exactly as it was stored: set as a header, the framework adds no character set to it.
+    headers = {
+        "Content-Type": row["content_type"],
+        "Content-Length": str(row["size_bytes"]),
+        "Content-Disposition": download_header(row["file_name"]),
+    }
+    return StreamingResponse(pieces(), headers=headers)
+
+
+# WRITE, not DELETE: a MEMBER may delete a document they uploaded. may_delete decides.
+@app.delete("/api/v1/documents/{document_id}")
+@action(WRITE)
+async def delete_document(request: Request, document_id: str) -> Response:
+    database = db(request)
+    try:
+        row = await database.prepare("SELECT * FROM document WHERE id = ?").bind(document_id).first()
+    except Exception as e:
+        return failed(request, "load_document", e)
+    if not row:
+        return error(request, 404)
+    if not may_delete(request, row["uploaded_by"]):
+        return error(request, 403)
+
+    was = {column: row[column] for column in ("content_type", "size_bytes", "sha256", "agreement_id") if row[column] is not None}
+    try:
+        statements = [
+            *audit(request, f"Document {row['file_name']}", row["company_id"], was, None),
+            database.prepare("DELETE FROM document WHERE id = ?").bind(document_id),
+        ]
+        await database.batch(statements)
+    except Exception as e:
+        return failed(request, "delete_document", e)
+
+    try:
+        # The row is gone first, so a failure here leaves an object nobody can reach, never a row with no file.
+        await bucket(request).delete(row["r2_key"])
+    except Exception as e:
+        log_error(request, "remove_document_object", e)
     return Response(status_code=204)

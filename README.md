@@ -34,6 +34,7 @@ reports/             license and vulnerability reports, written by setup.sh
 | Worker | `andexor-carmen-api` | `andexor-carmen-api-preview` |
 | Route | `carmen.andexor.net/api/*` | `carmen-preview.andexor.net/api/*` |
 | D1 database | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
+| R2 bucket for documents (`DOCS`) | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
 
 Nothing is served from `workers.dev`.
 
@@ -44,9 +45,9 @@ Nothing is served from `workers.dev`.
 | `setup.sh` | Installs the dependencies and writes the license and vulnerability reports |
 | `unit-test.sh` | Strict type check (Pyright, as Pylance uses), then the unit tests: roles, token claims, record rules, the scoring engine, allowed origins, every route declares an action |
 | `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
-| `preview-create.sh` | Finds or creates the preview database and applies the migrations. Safe to run again |
+| `preview-create.sh` | Finds or creates the preview database and the preview bucket, and applies the migrations. Safe to run again |
 | `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |
-| `preview-delete.sh` | Deletes the preview Worker and the preview database. Never touches production |
+| `preview-delete.sh` | Deletes the preview Worker, the preview database, and the preview bucket if it is empty. Never touches production |
 | `health.sh` | Health check through Cloudflare Access: `./health.sh [preview\|production] [tries]` |
 | `deploy.sh` | Production deploy by hand: runs `preview-test.sh` first, then migrates and deploys production |
 
