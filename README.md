@@ -16,6 +16,7 @@ src/worker.py        the Worker entry point
 src/app.py           the FastAPI application: identity, role check, endpoints
 src/records.py       what a caller may write to each kind of record, the date rule, and the domain rule
 src/scoring.py       the scoring engine: points, Fit, Need, confidence, recommendation
+src/ai.py            AI adapters (the stub so far), and the cleaning of what a model returns
 src/access.py        Cloudflare Access token verification
 src/roles.py         who may do what
 tests/               unit tests, run by unit-test.sh
@@ -35,6 +36,7 @@ reports/             license and vulnerability reports, written by setup.sh
 | Route | `carmen.andexor.net/api/*` | `carmen-preview.andexor.net/api/*` |
 | D1 database | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
 | R2 bucket for documents (`DOCS`) | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
+| Queue for AI runs (`RUNS`) | `andexor-carmen-api-runs-prod` | `andexor-carmen-api-runs-prev` |
 
 Nothing is served from `workers.dev`.
 
@@ -45,7 +47,7 @@ Nothing is served from `workers.dev`.
 | `setup.sh` | Installs the dependencies and writes the license and vulnerability reports |
 | `unit-test.sh` | Strict type check (Pyright, as Pylance uses), then the unit tests: roles, token claims, record rules, the scoring engine, allowed origins, every route declares an action |
 | `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
-| `preview-create.sh` | Finds or creates the preview database and the preview bucket, and applies the migrations. Safe to run again |
+| `preview-create.sh` | Finds or creates the preview database, bucket, and queue, and applies the migrations. Safe to run again |
 | `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |
 | `preview-delete.sh` | Deletes the preview Worker, the preview database, and the preview bucket if it is empty. Never touches production |
 | `health.sh` | Health check through Cloudflare Access: `./health.sh [preview\|production] [tries]` |

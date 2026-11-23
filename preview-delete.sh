@@ -8,6 +8,7 @@
 #
 #   1. Deletes the preview Worker named in env.preview of wrangler.jsonc, and with it its route.
 #   2. Deletes the preview D1 database, including all of its data.
+#   4. Deletes the preview queue for AI runs.
 #   3. Deletes the preview R2 bucket for documents, if it is empty. Cloudflare refuses to delete a
 #      bucket that holds objects, so delete the documents first if the script says it could not.
 #
@@ -117,6 +118,19 @@ if [[ -n "${BUCKET_FOUND}" ]]; then
     echo "Deleting R2 bucket ${PREVIEW_BUCKET}"
     cf r2 buckets delete "${PREVIEW_BUCKET}" --force > /dev/null 2>&1 \
         || echo "  warning: could not delete ${PREVIEW_BUCKET}; it must be empty first"
+fi
+
+# 4. The preview queue, after the Worker that consumed it.
+PROD_QUEUE=$(jq -r '.queues.producers[0].queue // empty' "${WRANGLER_FILE}")
+PREVIEW_QUEUE=$(jq -r '.env.preview.queues.producers[0].queue // empty' "${WRANGLER_FILE}")
+if [[ -n "${PREVIEW_QUEUE}" && "${PREVIEW_QUEUE}" != "${PROD_QUEUE}" ]]; then
+    QUEUE_ID=$(cf queues list 2> /dev/null | sed -n '/^\[/,$p' \
+        | jq -r --arg n "${PREVIEW_QUEUE}" '[.[] | select(.queue_name == $n)][0].queue_id // empty')
+    if [[ -n "${QUEUE_ID}" ]]; then
+        echo "Deleting queue ${PREVIEW_QUEUE}"
+        cf queues delete "${QUEUE_ID}" --force > /dev/null 2>&1 \
+            || echo "  warning: could not delete ${PREVIEW_QUEUE}"
+    fi
 fi
 
 echo "Preview environment removed."

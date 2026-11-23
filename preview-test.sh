@@ -203,6 +203,36 @@ expect 200 '"status":"DRAFT"' -X PATCH "${JSON[@]}" -d '{"status":"DRAFT"}' "${B
 expect 200 '"stage":"FORMER"' "${BASE}/companies/${ID}"
 expect 204 '' -X DELETE "${BASE}/agreements/${AGREEMENT}"
 
+# AI runs (specs/009-ai-runs/spec.md). The stub model is enabled on the preview only; it returns
+# fixed results, so no outside service is called. The runs go with the test company.
+expect 200 '"provider":"STUB"' "${BASE}/ai/models?can_research=true"
+STUB=$(jq -r '[.items[] | select(.provider == "STUB")][0].id' "${BODY}")
+expect 200 '"active":1' -X PATCH "${JSON[@]}" -d '{"active":true}' "${BASE}/ai/models/${STUB}"
+expect 202 '"run_ids"' -X POST "${JSON[@]}" \
+    -d "{\"research_model_id\":\"${STUB}\",\"scoring_model_ids\":[\"${STUB}\"]}" "${BASE}/companies/${ID}/runs/research-and-score"
+RESEARCH=$(jq -r '.run_ids[0]' "${BODY}")
+SCORING=$(jq -r '.run_ids[1]' "${BODY}")
+# The work is done from the queue, after the response. The scoring run waits for the research run.
+for attempt in $(seq 1 60); do
+    expect 200 '"kind":"SCORING"' "${BASE}/runs/${SCORING}" > /dev/null
+    STATUS=$(jq -r '.status' "${BODY}")
+    [[ "${STATUS}" == "SUCCEEDED" || "${STATUS}" == "FAILED" ]] && break
+    sleep 2
+done
+echo "ok: the runs finished with ${STATUS} after ${attempt} checks"
+expect 200 '"status":"SUCCEEDED"' "${BASE}/runs/${SCORING}"
+expect 200 '"decision":"PROPOSED"' "${BASE}/runs/${RESEARCH}"
+# Nothing a run produces reaches the company until someone decides.
+expect 200 '"decision":"ACCEPTED"' -X POST "${JSON[@]}" -d '{"all":"ACCEPTED"}' "${BASE}/runs/${RESEARCH}/facts/decide"
+expect 200 '"source":"AI"' "${BASE}/companies/${ID}/facts"
+expect 409 '"error":"CONFLICT"' -X POST "${BASE}/runs/${RESEARCH}/apply"
+expect 200 '"recommendation":"' -X POST "${BASE}/runs/${SCORING}/apply"
+expect 200 '"source":"AI"' "${BASE}/companies/${ID}/answers"
+expect 200 '"disagreement":false' "${BASE}/companies/${ID}/runs/compare?run_ids=${SCORING}"
+expect 200 '"user_rating":5' -X PATCH "${JSON[@]}" -d '{"user_rating":5}' "${BASE}/runs/${SCORING}"
+expect 200 '"agreement_rate":1' "${BASE}/ai/models/stats"
+expect 200 '"kind":"RESEARCH"' "${BASE}/companies/${ID}/runs"
+
 # The Today view (specs/006-today/spec.md). The overdue task goes with the test company.
 expect 201 '"due_date":"2020-01-01"' -X POST "${JSON[@]}" \
     -d "{\"title\":\"Smoke overdue\",\"company_id\":\"${ID}\",\"due_date\":\"2020-01-01\"}" "${BASE}/tasks"

@@ -13,6 +13,7 @@ Enrichment facts: specs/005-enrichment-facts/spec.md.
 The Today view: specs/006-today/spec.md.
 Deals: specs/007-deals/spec.md.
 Agreements and documents: specs/008-agreements-and-documents/spec.md.
+AI models and runs: specs/009-ai-runs/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -24,6 +25,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import UTC, datetime
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal, cast
 
@@ -33,6 +35,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.exceptions import HTTPException
 
 import access
+import ai
 from records import (
     ACTIVITY_CODES,
     ACTIVITY_FIELDS,
@@ -48,6 +51,9 @@ from records import (
     DEAL_CODES,
     DEAL_FIELDS,
     FACT_FIELDS,
+    MODEL_CODES,
+    MODEL_FIELDS,
+    RUN_FIELDS,
     SERVICE_CODES,
     SERVICE_FIELDS,
     TASK_CODES,
@@ -2272,3 +2278,615 @@ async def delete_document(request: Request, document_id: str) -> Response:
     except Exception as e:
         log_error(request, "remove_document_object", e)
     return Response(status_code=204)
+
+
+# ---- AI models -----------------------------------------------------------------------------------
+
+
+@app.get("/api/v1/ai/models")
+@action(READ)
+async def list_models(
+    request: Request, can_research: bool | None = None, can_score: bool | None = None, active: bool | None = None
+) -> JSONResponse:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    for column, value in {"can_research": can_research, "can_score": can_score, "active": active}.items():
+        if value is not None:
+            where.append(f"{column} = ?")
+            params.append(int(value))
+    sql = f"SELECT * FROM ai_model WHERE {' AND '.join(where)} ORDER BY sort_order, label, id"
+    try:
+        result = await db(request).prepare(sql).bind(*params).all()
+    except Exception as e:
+        return failed(request, "list_models", e)
+    # runnable says whether the model's provider has an adapter in this version of the API.
+    return JSONResponse({"items": [{**row, "runnable": row["provider"] in ai.ADAPTERS} for row in result["results"]]})
+
+
+@app.get("/api/v1/ai/models/stats")
+@action(READ)
+async def model_stats(request: Request) -> JSONResponse:
+    # agreement_rate: of a model's answers, the share that equal the company's answer in effect.
+    sql = (
+        "SELECT m.id AS ai_model_id, m.label, m.provider, r.kind, COUNT(*) AS runs,"
+        " SUM(r.status = 'FAILED') AS failures, AVG(r.user_rating) AS average_rating,"
+        " AVG(r.duration_ms) AS average_duration_ms, AVG(r.input_tokens + r.output_tokens) AS average_tokens,"
+        " (SELECT AVG(a.value = e.value) FROM ai_run_answer a JOIN ai_run x ON x.id = a.ai_run_id"
+        " JOIN rubric_answer e ON e.company_id = x.company_id AND e.criterion_id = a.criterion_id"
+        " WHERE x.ai_model_id = m.id AND x.kind = r.kind) AS agreement_rate"
+        " FROM ai_run r JOIN ai_model m ON m.id = r.ai_model_id GROUP BY m.id, r.kind"
+        " ORDER BY m.sort_order, m.label, r.kind"
+    )
+    try:
+        result = await db(request).prepare(sql).all()
+    except Exception as e:
+        return failed(request, "model_stats", e)
+    return JSONResponse({"items": result["results"]})
+
+
+@app.post("/api/v1/ai/models")
+@action(MANAGE)
+async def create_model(request: Request, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, MODEL_FIELDS)
+        if not (values.get("provider") and values.get("model_id") and values.get("label")):
+            raise BadBody("provider, model_id, and label are required")
+        if values["provider"] not in ai.ADAPTERS:
+            raise BadBody("the provider has no adapter")
+    except BadBody as e:
+        return failed(request, "read_model", e)
+    values["id"] = str(uuid.uuid4())
+
+    try:
+        column = await unknown_code(db(request), values, MODEL_CODES)
+    except Exception as e:
+        return failed(request, "check_model", e)
+    if column:
+        return error(request, 400)
+
+    try:
+        row = await insert(db(request), "ai_model", values).first()
+    except Exception as e:
+        return failed(request, "insert_model", e)
+    return JSONResponse(row, status_code=201)
+
+
+@app.patch("/api/v1/ai/models/{model_id}")
+@action(MANAGE)
+async def update_model(request: Request, model_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, MODEL_FIELDS)
+    except BadBody as e:
+        return failed(request, "read_model", e)
+
+    try:
+        current = await db(request).prepare("SELECT * FROM ai_model WHERE id = ?").bind(model_id).first()
+    except Exception as e:
+        return failed(request, "load_model", e)
+    if not current:
+        return error(request, 404)
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    if not changed:
+        return JSONResponse(current)
+    if "provider" in changed and changed["provider"] not in ai.ADAPTERS:
+        return error(request, 400)  # a model can only be moved to a provider that has an adapter
+
+    try:
+        audit(request, f"AI model {current['label']}", None, current, changed)  # no company: the Worker log only
+        row = await update(db(request), "ai_model", changed, model_id, stamp=False).first()
+    except Exception as e:
+        return failed(request, "update_model", e)
+    return JSONResponse(row)
+
+
+# ---- AI runs: starting them ----------------------------------------------------------------------
+# A request only records the runs and puts them on the RUNS queue. The work is done by process_run,
+# called from the queue handler in worker.py: work started after a response is cut off at about
+# 30 seconds, and research can take longer (discovery D2).
+
+RUN_SELECT = (
+    "SELECT r.id, r.company_id, r.kind, r.ai_model_id, m.label AS model_label, m.provider, r.model_id_used,"
+    " r.input_run_id, r.status, r.fit_score, r.need_score, r.confidence, r.recommendation, r.input_tokens,"
+    " r.output_tokens, r.search_count, r.duration_ms, r.model_ms, r.user_rating, r.user_note, r.applied_at,"
+    " r.requested_by, r.error, r.created_at, r.started_at, r.finished_at"
+    " FROM ai_run r JOIN ai_model m ON m.id = r.ai_model_id"
+)
+
+
+def now_ms() -> str:
+    """The current moment in UTC with milliseconds, as a run's started_at and finished_at are stored."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+async def usable_models(database: Any, model_ids: list[str], capability: str) -> list[Row] | None:
+    """The models, in the order given, or None unless every one exists, is enabled, has the
+    capability (can_research or can_score), and belongs to a provider that has an adapter."""
+    if not model_ids:
+        return None
+    marks = ", ".join("?" * len(model_ids))
+    found = await database.prepare(f"SELECT * FROM ai_model WHERE id IN ({marks})").bind(*model_ids).all()
+    by_id = {row["id"]: row for row in found["results"]}
+    models = [by_id.get(model_id) for model_id in model_ids]
+    for model in models:
+        if model is None or not model["active"] or not model[capability] or model["provider"] not in ai.ADAPTERS:
+            return None
+    return cast(list[Row], models)
+
+
+def new_run(request: Request, company_id: str, kind: str, model: Row, input_run_id: str | None) -> Row:
+    return {
+        "id": str(uuid.uuid4()),
+        "company_id": company_id,
+        "kind": kind,
+        "ai_model_id": model["id"],
+        "model_id_used": model["model_id"],  # kept, so a later change to the model does not rewrite history
+        "input_run_id": input_run_id,
+        "requested_by": request.state.identity["id"],
+    }
+
+
+async def store_and_queue(request: Request, runs: list[Row], queue_now: list[Row]) -> JSONResponse:
+    """Store the runs as QUEUED, put queue_now on the queue, and answer 202 with every run id."""
+    database = db(request)
+    try:
+        await database.batch([insert(database, "ai_run", run) for run in runs])
+    except Exception as e:
+        return failed(request, "insert_runs", e)
+    try:
+        for run in queue_now:
+            await request.scope["env"].RUNS.send({"run_id": run["id"]})
+    except Exception as e:
+        log_error(request, "queue_runs", e)
+        try:
+            # A run that never reached the queue would stay QUEUED forever, so it is failed now.
+            marks = ", ".join("?" * len(runs))
+            sql = (
+                "UPDATE ai_run SET status = 'FAILED', error = 'The run could not be queued', finished_at = ?"
+                f" WHERE status = 'QUEUED' AND id IN ({marks})"
+            )
+            await database.prepare(sql).bind(now_ms(), *[run["id"] for run in runs]).run()
+        except Exception as inner:
+            log_error(request, "fail_unqueued_runs", inner)
+        return error(request, 500)
+    return JSONResponse({"run_ids": [run["id"] for run in runs]}, status_code=202)
+
+
+@app.post("/api/v1/companies/{company_id}/runs")
+@action(WRITE)
+async def start_runs(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
+    kind, input_run_id = body.get("kind"), body.get("input_run_id")
+    try:
+        model_ids = id_list(body, "ai_model_ids")
+        if kind not in ("RESEARCH", "SCORING") or not model_ids:
+            raise BadBody("kind and ai_model_ids are required")
+        if input_run_id is not None and (kind != "SCORING" or not isinstance(input_run_id, str)):
+            raise BadBody("input_run_id is for a scoring run")
+    except BadBody as e:
+        return failed(request, "read_runs", e)
+
+    database = db(request)
+    try:
+        company = await database.prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        models = await usable_models(database, model_ids, "can_research" if kind == "RESEARCH" else "can_score")
+        input_ok = True
+        if input_run_id is not None:
+            # Only a finished research run of the same company can be scored.
+            sql = "SELECT 1 AS found FROM ai_run WHERE id = ? AND company_id = ? AND kind = 'RESEARCH' AND status = 'SUCCEEDED'"
+            input_ok = bool(await database.prepare(sql).bind(input_run_id, company_id).first())
+    except Exception as e:
+        return failed(request, "check_runs", e)
+    if not company:
+        return error(request, 404)
+    if models is None or not input_ok:
+        return error(request, 400)
+
+    runs = [new_run(request, company_id, kind, model, input_run_id) for model in models]
+    return await store_and_queue(request, runs, runs)
+
+
+@app.post("/api/v1/companies/{company_id}/runs/research-and-score")
+@action(WRITE)
+async def research_and_score(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
+    research_id = body.get("research_model_id")
+    try:
+        scoring_ids = id_list(body, "scoring_model_ids")
+        if not isinstance(research_id, str) or not scoring_ids:
+            raise BadBody("research_model_id and scoring_model_ids are required")
+    except BadBody as e:
+        return failed(request, "read_runs", e)
+
+    database = db(request)
+    try:
+        company = await database.prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        researchers = await usable_models(database, [research_id], "can_research")
+        scorers = await usable_models(database, scoring_ids, "can_score")
+    except Exception as e:
+        return failed(request, "check_runs", e)
+    if not company:
+        return error(request, 404)
+    if researchers is None or scorers is None:
+        return error(request, 400)
+
+    # Only the research run is queued now. When it succeeds, process_run queues the scoring runs that wait for it.
+    research = new_run(request, company_id, "RESEARCH", researchers[0], None)
+    scoring = [new_run(request, company_id, "SCORING", model, research["id"]) for model in scorers]
+    return await store_and_queue(request, [research, *scoring], [research])
+
+
+# ---- AI runs: doing the work ---------------------------------------------------------------------
+# Called from the queue, with no request. Nothing here changes the company: a run only records what
+# the model proposed, and a timeline entry that it finished.
+
+
+def run_log(run_id: str, step: str, detail: str) -> None:
+    logger.info(json.dumps({"event": "carmen_run", "run_id": run_id, "step": step, "detail": detail}))
+
+
+def run_entry(run: Row, body: str) -> Row:
+    return {
+        "id": str(uuid.uuid4()),
+        "company_id": run["company_id"],
+        "kind": "SYSTEM",
+        "body": body,
+        "created_by": run["requested_by"],
+    }
+
+
+async def call_twice(run: Row, call: Callable[[], Awaitable[Row]]) -> Row:
+    """Ask the model. Output that cannot be read is asked for once more, then the run fails."""
+    try:
+        return await call()
+    except ai.BadOutput as e:
+        run_log(run["id"], "retry", str(e))
+    try:
+        return await call()
+    except ai.BadOutput as e:
+        raise ai.RunError("The model's output could not be read, twice") from e
+
+
+async def research_statements(env: Any, run: Row, model: Row) -> tuple[list[Any], Row, str]:
+    database = env.DB
+    company = await database.prepare("SELECT * FROM company WHERE id = ?").bind(run["company_id"]).first()
+    known = await database.prepare("SELECT key, value_type FROM enrichment_key").all()
+    output = await call_twice(run, lambda: ai.ADAPTERS[model["provider"]].research(env, model, company))
+    facts = ai.clean_facts(output.get("facts"), {row["key"]: row["value_type"] for row in known["results"]})
+    dossier = str(output.get("dossier") or "").strip()[:200000] or None
+    statements = [
+        insert(database, "ai_run_fact", {"id": str(uuid.uuid4()), "ai_run_id": run["id"], **fact}) for fact in facts
+    ]
+    return statements, {**output, "dossier": dossier}, f"{len(facts)} facts proposed"
+
+
+async def scoring_statements(env: Any, run: Row, model: Row) -> tuple[list[Any], Row, str]:
+    database = env.DB
+    company = await database.prepare("SELECT * FROM company WHERE id = ?").bind(run["company_id"]).first()
+    if run["input_run_id"]:
+        # The dossier of one research run and all of its facts, accepted or not.
+        source = await database.prepare("SELECT dossier FROM ai_run WHERE id = ?").bind(run["input_run_id"]).first()
+        sql = "SELECT key, value FROM ai_run_fact WHERE ai_run_id = ? ORDER BY key, id"
+        facts = await database.prepare(sql).bind(run["input_run_id"]).all()
+        text = ai.material(company, facts["results"], source["dossier"] if source else None)
+    else:
+        # The company's latest fact for each key.
+        sql = (
+            "SELECT key, value FROM (SELECT key, value, ROW_NUMBER() OVER (PARTITION BY key ORDER BY"
+            f" {NEWEST_FACT}) AS place FROM enrichment_fact WHERE company_id = ?) WHERE place = 1 ORDER BY key"
+        )
+        facts = await database.prepare(sql).bind(run["company_id"]).all()
+        text = ai.material(company, facts["results"])
+    criteria, services, thresholds = await load_rubric(database)
+    in_use = [criterion for criterion in criteria if criterion["active"]]
+    output = await call_twice(run, lambda: ai.ADAPTERS[model["provider"]].score(env, model, in_use, text))
+    answers, dropped = ai.clean_answers(output.get("answers"), criteria)
+    if dropped:
+        run_log(run["id"], "answers_dropped", str(dropped))
+    # The run's own scores, from the same engine as the company's. Nothing is applied to the company.
+    scores = score(criteria, {answer["criterion_id"]: answer["value"] for answer in answers}, services, thresholds)
+    statements = [insert(database, "ai_run_answer", {"ai_run_id": run["id"], **answer}) for answer in answers]
+    statements += [
+        insert(database, "ai_run_service", {"ai_run_id": run["id"], "service_id": service_id, **own})
+        for service_id, own in scores["services"].items()
+    ]
+    said = (
+        f"{len(answers)} answers; Fit {scores['fit_score']}, Need {scores['need_score']},"
+        f" recommendation {scores['recommendation']}. Nothing was applied"
+    )
+    return statements, {**output, **scores}, said
+
+
+async def fail_run(env: Any, run: Row, message: str) -> None:
+    """Mark the run FAILED, and with it every run that was waiting to score its dossier."""
+    database, now = env.DB, now_ms()
+    run_log(run["id"], "failed", message)
+    waiting = "UPDATE ai_run SET status = 'FAILED', error = ?, finished_at = ? WHERE input_run_id = ? AND status = 'QUEUED'"
+    statements = [
+        database.prepare("UPDATE ai_run SET status = 'FAILED', error = ?, finished_at = ? WHERE id = ?").bind(
+            message, now, run["id"]
+        ),
+        database.prepare(waiting).bind("The research run it was to score failed", now, run["id"]),
+        insert(database, "activity", run_entry(run, f"{run['kind'].capitalize()} run by {run['label']} failed: {message}")),
+    ]
+    await database.batch(statements)
+
+
+async def process_run(env: Any, run_id: str) -> None:
+    """Carry out one queued run. Never raises: a failure is recorded on the run."""
+    database = env.DB
+    run: Row | None = None
+    try:
+        sql = "SELECT r.*, m.label, m.provider FROM ai_run r JOIN ai_model m ON m.id = r.ai_model_id WHERE r.id = ?"
+        run = await database.prepare(sql).bind(run_id).first()
+        if not run:
+            return run_log(run_id, "skipped", "no such run")
+        if run["status"] == "RUNNING":
+            # Delivered a second time: the first attempt was cut off before it could finish.
+            return await fail_run(env, run, "The run was interrupted and did not finish")
+        if run["status"] != "QUEUED":
+            return run_log(run_id, "skipped", f"status {run['status']}")
+        if run["provider"] not in ai.ADAPTERS:
+            return await fail_run(env, run, "The model's provider has no adapter")
+
+        started = now_ms()
+        await database.prepare("UPDATE ai_run SET status = 'RUNNING', started_at = ? WHERE id = ?").bind(started, run_id).run()
+        model = await database.prepare("SELECT * FROM ai_model WHERE id = ?").bind(run["ai_model_id"]).first()
+        clock = time.monotonic()
+        if run["kind"] == "RESEARCH":
+            statements, output, said = await research_statements(env, run, model)
+        else:
+            statements, output, said = await scoring_statements(env, run, model)
+        model_ms = int((time.monotonic() - clock) * 1000)
+
+        tokens_in, tokens_out = ai.token_counts(output)
+        finish = (
+            "UPDATE ai_run SET status = 'SUCCEEDED', finished_at = ?, dossier = ?, fit_score = ?, need_score = ?,"
+            " confidence = ?, recommendation = ?, input_tokens = ?, output_tokens = ?, search_count = ?, model_ms = ?"
+            " WHERE id = ?"
+        )
+        results = [output.get(key) for key in ("dossier", "fit_score", "need_score", "confidence", "recommendation")]
+        searches = output.get("search_count") if isinstance(output.get("search_count"), int) else None
+        statements.append(database.prepare(finish).bind(now_ms(), *results, tokens_in, tokens_out, searches, model_ms, run_id))
+        statements.append(
+            insert(database, "activity", run_entry(run, f"{run['kind'].capitalize()} run by {run['label']} finished: {said}"))
+        )
+        await database.batch(statements)
+        run_log(run_id, "succeeded", said)
+
+        if run["kind"] == "RESEARCH":
+            # The scoring runs that were waiting for this dossier can start now.
+            waiting = await database.prepare("SELECT id FROM ai_run WHERE input_run_id = ? AND status = 'QUEUED'").bind(run_id).all()
+            for row in waiting["results"]:
+                await env.RUNS.send({"run_id": row["id"]})
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_run", "run_id": run_id, "step": "error", "error": type(e).__name__, "detail": str(e)}))
+        try:
+            if run:
+                # Our own messages are safe to show. Anything else stays in the log.
+                shown = str(e) if isinstance(e, ai.RunError) else f"The run failed unexpectedly ({type(e).__name__}); see the Worker log"
+                await fail_run(env, run, shown)
+        except Exception as inner:
+            logger.error(json.dumps({"event": "carmen_run", "run_id": run_id, "step": "fail_run", "error": type(inner).__name__}))
+
+
+# ---- AI runs: reading and deciding ---------------------------------------------------------------
+
+
+@app.get("/api/v1/companies/{company_id}/runs")
+@action(READ)
+async def list_runs(
+    request: Request, company_id: str, limit: int = Query(50, ge=1, le=200), cursor: int = Query(0, ge=0)
+) -> JSONResponse:
+    sql = f"{RUN_SELECT} WHERE r.company_id = ? ORDER BY r.created_at DESC, r.id LIMIT ? OFFSET ?"
+    try:
+        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        result = await db(request).prepare(sql).bind(company_id, limit + 1, cursor).all()
+    except Exception as e:
+        return failed(request, "list_runs", e)
+    if not company:
+        return error(request, 404)
+    return page(result, limit, cursor)
+
+
+@app.get("/api/v1/companies/{company_id}/runs/compare")
+@action(READ)
+async def compare_runs(request: Request, company_id: str, run_ids: str) -> JSONResponse:
+    wanted = [run_id for run_id in run_ids.split(",") if run_id]
+    if not wanted:
+        return error(request, 400)
+    database, marks = db(request), ", ".join("?" * len(wanted))
+    try:
+        sql = f"{RUN_SELECT} WHERE r.company_id = ? AND r.kind = 'SCORING' AND r.id IN ({marks})"
+        runs = await database.prepare(sql).bind(company_id, *wanted).all()
+        sql = f"SELECT ai_run_id, criterion_id, value, points, probability, rationale FROM ai_run_answer WHERE ai_run_id IN ({marks})"
+        answers = await database.prepare(sql).bind(*wanted).all()
+        sql = "SELECT criterion_id, value, points, source, ai_run_id FROM rubric_answer WHERE company_id = ?"
+        effect = await database.prepare(sql).bind(company_id).all()
+        criteria = await database.prepare(f"SELECT c.* {RUBRIC_FROM} {RUBRIC_ORDER}").all()
+    except Exception as e:
+        return failed(request, "compare_runs", e)
+    found: list[Row] = runs["results"]
+    if len(found) != len(set(wanted)):
+        return error(request, 400)  # every id must be a scoring run of this company
+
+    by_run: dict[str, dict[str, Row]] = {run_id: {} for run_id in wanted}
+    for answer in answers["results"]:
+        own = {column: answer[column] for column in ("value", "points", "probability", "rationale")}
+        by_run[answer["ai_run_id"]][answer["criterion_id"]] = own
+    in_effect = {row["criterion_id"]: row for row in effect["results"]}
+    return JSONResponse({"runs": found, "items": ai.compare(criteria["results"], in_effect, by_run)})
+
+
+@app.get("/api/v1/runs/{run_id}")
+@action(READ)
+async def get_run(request: Request, run_id: str) -> JSONResponse:
+    database = db(request)
+    try:
+        run = await database.prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run_id).first()
+        if not run:
+            return error(request, 404)
+        if run["kind"] == "RESEARCH":
+            dossier = await database.prepare("SELECT dossier FROM ai_run WHERE id = ?").bind(run_id).first()
+            sql = "SELECT id, key, value, source_url, notes, decision FROM ai_run_fact WHERE ai_run_id = ? ORDER BY key, id"
+            facts = await database.prepare(sql).bind(run_id).all()
+            return JSONResponse({**run, "dossier": dossier["dossier"], "facts": facts["results"]})
+        sql = (
+            "SELECT a.criterion_id, c.section, c.service_id, c.prompt, c.answer_type, a.value, a.points, a.probability,"
+            f" a.rationale FROM ai_run_answer a JOIN rubric_criterion c ON c.id = a.criterion_id"
+            " LEFT JOIN service s ON s.id = c.service_id WHERE a.ai_run_id = ?"
+            " ORDER BY c.section = 'NEED', s.sort_order, s.id, c.sort_order, c.id"
+        )
+        answers = await database.prepare(sql).bind(run_id).all()
+        sql = (
+            "SELECT x.service_id, s.name, s.offered, x.need_score, x.confidence FROM ai_run_service x"
+            " JOIN service s ON s.id = x.service_id WHERE x.ai_run_id = ? ORDER BY x.need_score DESC, s.sort_order, s.id"
+        )
+        services = await database.prepare(sql).bind(run_id).all()
+    except Exception as e:
+        return failed(request, "load_run", e)
+    return JSONResponse({**run, "answers": answers["results"], "services": services["results"]})
+
+
+@app.patch("/api/v1/runs/{run_id}")
+@action(WRITE)
+async def rate_run(request: Request, run_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, RUN_FIELDS)
+    except BadBody as e:
+        return failed(request, "read_run", e)
+
+    database = db(request)
+    try:
+        current = await database.prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run_id).first()
+    except Exception as e:
+        return failed(request, "load_run", e)
+    if not current:
+        return error(request, 404)
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    if not changed:
+        return JSONResponse(current)
+
+    try:
+        what = f"{current['kind'].capitalize()} run by {current['model_label']}"
+        statements = [
+            *audit(request, what, current["company_id"], current, changed),
+            update(database, "ai_run", changed, run_id, stamp=False),
+        ]
+        await database.batch(statements)
+        row = await database.prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run_id).first()
+    except Exception as e:
+        return failed(request, "update_run", e)
+    return JSONResponse(row)
+
+
+@app.post("/api/v1/runs/{run_id}/facts/decide")
+@action(WRITE)
+async def decide_facts(request: Request, run_id: str, body: dict[str, Any]) -> JSONResponse:
+    database = db(request)
+    try:
+        run = await database.prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run_id).first()
+        proposed = await database.prepare("SELECT * FROM ai_run_fact WHERE ai_run_id = ? AND decision = 'PROPOSED'").bind(run_id).all()
+    except Exception as e:
+        return failed(request, "load_run_facts", e)
+    if not run:
+        return error(request, 404)
+    open_facts: dict[str, Row] = {row["id"]: row for row in proposed["results"]}
+
+    # Either one decision for every fact still proposed, or a list of decisions by fact id.
+    everything: Any = body.get("all")
+    listed: Any = body.get("decisions")
+    decisions: dict[str, Any] = {}
+    if everything is not None:
+        decisions = {fact_id: everything for fact_id in open_facts}
+    elif isinstance(listed, list):
+        for item in cast(list[Any], listed):
+            entry: Row = cast(Row, item) if isinstance(item, dict) else {}
+            decisions[str(entry.get("id"))] = entry.get("decision")
+    allowed_decisions = ("ACCEPTED", "REJECTED")
+    if everything is None and not decisions:
+        return error(request, 400)
+    if (everything is not None and everything not in allowed_decisions) or any(
+        decision not in allowed_decisions for decision in decisions.values()
+    ):
+        return error(request, 400)
+    if any(fact_id not in open_facts for fact_id in decisions):
+        return error(request, 409)  # not a fact of this run, or already decided
+
+    try:
+        statements: list[Any] = []
+        if decisions:
+            before = {open_facts[fact_id]["key"]: "PROPOSED" for fact_id in decisions}
+            after = {open_facts[fact_id]["key"]: decision for fact_id, decision in decisions.items()}
+            statements += audit(request, f"Proposed facts of the run by {run['model_label']}", run["company_id"], before, after)
+        for fact_id, decision in decisions.items():
+            fact = open_facts[fact_id]
+            statements.append(database.prepare("UPDATE ai_run_fact SET decision = ? WHERE id = ?").bind(decision, fact_id))
+            if decision == "ACCEPTED":
+                # An accepted fact becomes one of the company's facts, and keeps where it came from.
+                accepted = {
+                    "id": str(uuid.uuid4()),
+                    "company_id": run["company_id"],
+                    "key": fact["key"],
+                    "value": fact["value"],
+                    "source": "AI",
+                    "source_detail": fact["source_url"],
+                    "notes": fact["notes"],
+                    "ai_run_id": run_id,
+                }
+                statements.append(insert(database, "enrichment_fact", accepted))
+        if statements:
+            await database.batch(statements)
+        sql = "SELECT id, key, value, source_url, notes, decision FROM ai_run_fact WHERE ai_run_id = ? ORDER BY key, id"
+        facts = await database.prepare(sql).bind(run_id).all()
+    except Exception as e:
+        return failed(request, "decide_facts", e)
+    return JSONResponse({"items": facts["results"]})
+
+
+@app.post("/api/v1/runs/{run_id}/apply")
+@action(WRITE)
+async def apply_run(request: Request, run_id: str) -> JSONResponse:
+    database = db(request)
+    try:
+        run = await database.prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run_id).first()
+        if not run:
+            return error(request, 404)
+        if run["kind"] != "SCORING" or run["status"] != "SUCCEEDED":
+            return error(request, 409)  # only a finished scoring run can be applied
+        company_id = run["company_id"]
+        company = await database.prepare(
+            "SELECT id, fit_score, need_score, recommendation FROM company WHERE id = ?"
+        ).bind(company_id).first()
+        criteria, services, thresholds = await load_rubric(database)
+        stored = await database.prepare("SELECT criterion_id, value FROM rubric_answer WHERE company_id = ?").bind(company_id).all()
+        given = await database.prepare("SELECT criterion_id, value FROM ai_run_answer WHERE ai_run_id = ?").bind(run_id).all()
+    except Exception as e:
+        return failed(request, "load_run", e)
+
+    by_id = {criterion["id"]: criterion for criterion in criteria}
+    old: Row = {row["criterion_id"]: row["value"] for row in stored["results"]}
+    new: Row = {}
+    try:
+        sql = (
+            "INSERT INTO rubric_answer (company_id, criterion_id, value, points, source, ai_run_id, answered_by)"
+            " VALUES (?, ?, ?, ?, 'AI', ?, ?)"
+        )
+        caller = request.state.identity["id"]
+        inserts: list[Any] = []
+        for row in given["results"]:
+            # Points are computed again, in case the rubric changed since the run.
+            earned = points(by_id[row["criterion_id"]], row["value"])
+            if earned is not None:
+                new[row["criterion_id"]] = row["value"]
+                inserts.append(database.prepare(sql).bind(company_id, row["criterion_id"], row["value"], earned, run_id, caller))
+        # An answer that changes or goes away is an edit, and is recorded first. A first answer is not.
+        before = {by_id[key]["prompt"]: value for key, value in old.items() if new.get(key) != value}
+        after = {by_id[key]["prompt"]: new.get(key) for key, value in old.items() if new.get(key) != value}
+        scores = score(criteria, new, services, thresholds)
+        statements = audit(request, f"Answers, replaced by the run by {run['model_label']}", company_id, before, after) if after else []
+        statements.append(database.prepare("DELETE FROM rubric_answer WHERE company_id = ?").bind(company_id))
+        statements += inserts
+        statements += score_writes(request, company, scores)
+        statements.append(database.prepare(f"UPDATE ai_run SET applied_at = {NOW} WHERE id = ?").bind(run_id))
+        await database.batch(statements)
+    except Exception as e:
+        return failed(request, "apply_run", e)
+    return JSONResponse(scores_body(scores, services))
