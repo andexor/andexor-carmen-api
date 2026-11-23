@@ -10,6 +10,7 @@
 #   2. Its id, written into env.preview of wrangler.jsonc.
 #   3. Every pending migration from andexor-carmen-main, applied to it.
 #   4. The preview R2 bucket for documents named in env.preview, if it is missing.
+#   5. The preview queue for AI runs named in env.preview, if it is missing.
 #
 # The preview Worker and its route (carmen-preview.andexor.net/api/*) are created by the deploy
 # in preview-test.sh. The DNS record, the Cloudflare Access application, and the service token
@@ -87,6 +88,23 @@ if [[ -n "${PREVIEW_BUCKET}" ]]; then
     else
         echo "Creating R2 bucket ${PREVIEW_BUCKET}"
         cf r2 buckets create --name "${PREVIEW_BUCKET}" --location-hint enam > /dev/null
+    fi
+fi
+
+# The preview queue for AI runs. A preview must never share a queue with production.
+PREVIEW_QUEUE=$(jq -r '.env.preview.queues.producers[0].queue // empty' "${WRANGLER_FILE}")
+PROD_QUEUE=$(jq -r '.queues.producers[0].queue // empty' "${WRANGLER_FILE}")
+if [[ -n "${PREVIEW_QUEUE}" ]]; then
+    if [[ "${PREVIEW_QUEUE}" == "${PROD_QUEUE}" ]]; then
+        echo "error: the preview queue name matches the production queue name" >&2
+        exit 1
+    fi
+    if cf queues list 2> /dev/null | sed -n '/^\[/,$p' \
+        | jq -e --arg n "${PREVIEW_QUEUE}" '.[] | select(.queue_name == $n)' > /dev/null; then
+        echo "Queue ${PREVIEW_QUEUE} already exists"
+    else
+        echo "Creating queue ${PREVIEW_QUEUE}"
+        cf queues create --queue-name "${PREVIEW_QUEUE}" > /dev/null
     fi
 fi
 

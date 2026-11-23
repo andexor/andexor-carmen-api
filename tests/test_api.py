@@ -394,9 +394,15 @@ class Config(unittest.TestCase):
         preview = self.config["env"]["preview"]
         self.assertNotEqual(preview["d1_databases"][0]["database_id"], self.config["d1_databases"][0]["database_id"])
         self.assertNotEqual(preview["r2_buckets"][0]["bucket_name"], self.config["r2_buckets"][0]["bucket_name"])
+        self.assertNotEqual(preview["queues"]["producers"][0]["queue"], self.config["queues"]["producers"][0]["queue"])
         for environment in (self.config, preview):
             self.assertEqual(environment["d1_databases"][0]["binding"], "DB")
             self.assertEqual(environment["r2_buckets"][0]["binding"], "DOCS")
+            self.assertEqual(environment["queues"]["producers"][0]["binding"], "RUNS")
+            # Each Worker consumes its own queue, one run at a time, with one more delivery after a crash.
+            consumer = environment["queues"]["consumers"][0]
+            self.assertEqual(consumer["queue"], environment["queues"]["producers"][0]["queue"])
+            self.assertEqual((consumer["max_batch_size"], consumer["max_retries"]), (1, 1))
 
     def test_production_allows_no_other_origin(self):
         self.assertEqual(self.config["vars"]["ALLOWED_ORIGINS"], "")

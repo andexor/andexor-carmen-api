@@ -72,7 +72,23 @@
                     "binding": "DOCS",
                     "bucket_name": "andexor-carmen-api-prev"
                 }
-            ]
+            ],
+            "queues": {
+                "producers": [
+                    {
+                        "binding": "RUNS",
+                        "queue": "andexor-carmen-api-runs-prev"
+                    }
+                ],
+                "consumers": [
+                    {
+                        "queue": "andexor-carmen-api-runs-prev",
+                        "max_batch_size": 1,
+                        "max_batch_timeout": 0,
+                        "max_retries": 1
+                    }
+                ]
+            }
         }
     },
     "r2_buckets": [
@@ -80,5 +96,21 @@
             "binding": "DOCS",
             "bucket_name": "andexor-carmen-api-prod"
         }
-    ]
+    ],
+    "queues": {
+        "producers": [
+            {
+                "binding": "RUNS",
+                "queue": "andexor-carmen-api-runs-prod"
+            }
+        ],
+        "consumers": [
+            {
+                "queue": "andexor-carmen-api-runs-prod",
+                "max_batch_size": 1,
+                "max_batch_timeout": 0,
+                "max_retries": 1
+            }
+        ]
+    }
 }

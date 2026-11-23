@@ -106,6 +106,12 @@ AGREEMENT_FIELDS: dict[str, type] = {
     **dict.fromkeys(("amount_cents", "setup_fee_cents", "renewal_notice_days"), int),
     "auto_renews": bool,
 }
+MODEL_FIELDS: dict[str, type] = {
+    **dict.fromkeys(("provider", "model_id", "label", "notes"), str),
+    **dict.fromkeys(("can_research", "can_score", "web_search", "active"), bool),
+    "sort_order": int,
+}
+RUN_FIELDS: dict[str, type] = {"user_rating": int, "user_note": str}
 
 # Timeline kinds that only the API writes. An entry of one of these kinds is permanent.
 AUTOMATIC_KINDS = ("STAGE_CHANGE", "SCORE_CHANGE", "SYSTEM")
@@ -123,6 +129,7 @@ AGREEMENT_CODES = {
     "engagement_model": "ENGAGEMENT_MODEL",
     "amount_period": "AMOUNT_PERIOD",
 }
+MODEL_CODES = {"provider": "AI_PROVIDER"}
 CRITERION_CODES = {"section": "RUBRIC_SECTION", "answer_type": "ANSWER_TYPE"}
 
 
