@@ -10,7 +10,7 @@ and specs/003-activities-and-tasks/spec.md.
 import importlib
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -63,6 +63,24 @@ CRITERION_FIELDS: dict[str, type] = {
     "active": bool,
 }
 FACT_FIELDS: dict[str, type] = dict.fromkeys(("key", "value", "source_detail", "notes", "observed_at"), str)
+DEAL_FIELDS: dict[str, type] = {
+    **dict.fromkeys(
+        (
+            "company_id",
+            "name",
+            "stage",
+            "engagement_model",
+            "primary_contact_id",
+            "currency",
+            "expected_close_date",
+            "lost_reason",
+            "notes",
+            "owner_id",
+        ),
+        str,
+    ),
+    **dict.fromkeys(("one_time_value_cents", "monthly_value_cents"), int),
+}
 
 # Timeline kinds that only the API writes. An entry of one of these kinds is permanent.
 AUTOMATIC_KINDS = ("STAGE_CHANGE", "SCORE_CHANGE", "SYSTEM")
@@ -73,6 +91,7 @@ CONTACT_CODES = {"role": "CONTACT_ROLE"}
 ACTIVITY_CODES = {"kind": "ACTIVITY_KIND"}
 TASK_CODES = {"status": "TASK_STATUS"}
 SERVICE_CODES = {"category": "SERVICE_CATEGORY"}
+DEAL_CODES = {"stage": "DEAL_STAGE", "engagement_model": "ENGAGEMENT_MODEL"}
 CRITERION_CODES = {"section": "RUBRIC_SECTION", "answer_type": "ANSWER_TYPE"}
 
 
@@ -186,6 +205,17 @@ def clean(body: Values, fields: dict[str, type]) -> Values:
 def slug(name: str) -> str:
     """A service id from its name: lowercase words joined by hyphens, as in the page names on andexor.net."""
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def id_list(body: Values, key: str) -> list[str] | None:
+    """The list of ids under the key, without repeats and in order, or None when the key is absent.
+    Raises BadBody when it is not a list of text."""
+    if key not in body:
+        return None
+    given = body[key]
+    if not isinstance(given, list) or not all(isinstance(item, str) and item for item in cast(list[Any], given)):
+        raise BadBody(f"{key} must be a list of ids")
+    return sorted(set(cast(list[str], given)))
 
 
 def fact_key(text: str) -> str:

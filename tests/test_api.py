@@ -323,6 +323,14 @@ class Records(unittest.TestCase):
         for zone in (None, "", "Not/AZone", "../etc/passwd"):
             self.assertEqual(records.local_date(zone, late), ("2026-11-24", "UTC"), repr(zone))
 
+    def test_a_list_of_ids(self):
+        self.assertIsNone(records.id_list({}, "service_ids"))
+        self.assertEqual(records.id_list({"service_ids": []}, "service_ids"), [])
+        self.assertEqual(records.id_list({"service_ids": ["b", "a", "b"]}, "service_ids"), ["a", "b"])
+        for bad in ("a", None, [1], ["a", ""], {"a": 1}):
+            with self.assertRaises(records.BadBody, msg=repr(bad)):
+                records.id_list({"service_ids": bad}, "service_ids")
+
     def test_database_errors_map_to_statuses(self):
         cases = {
             "D1_ERROR: UNIQUE constraint failed: company.domain: SQLITE_CONSTRAINT": 409,
