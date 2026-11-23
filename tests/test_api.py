@@ -315,6 +315,14 @@ class Records(unittest.TestCase):
         )
         self.assertEqual(records.describe_change("Fact has_website", before, None), "Fact has_website deleted. It held: value 'YES', source 'MANUAL'")
 
+    def test_today_is_the_date_in_the_time_zone(self):
+        late = datetime.datetime(2026, 11, 24, 3, 30, tzinfo=datetime.UTC)  # 22:30 on the 23rd in New York
+        self.assertEqual(records.local_date("America/New_York", late), ("2026-11-23", "America/New_York"))
+        self.assertEqual(records.local_date("Asia/Tokyo", late), ("2026-11-24", "Asia/Tokyo"))
+        self.assertEqual(records.local_date("UTC", late), ("2026-11-24", "UTC"))
+        for zone in (None, "", "Not/AZone", "../etc/passwd"):
+            self.assertEqual(records.local_date(zone, late), ("2026-11-24", "UTC"), repr(zone))
+
     def test_database_errors_map_to_statuses(self):
         cases = {
             "D1_ERROR: UNIQUE constraint failed: company.domain: SQLITE_CONSTRAINT": 409,

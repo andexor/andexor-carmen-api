@@ -46,7 +46,7 @@ def check_claims(claims: Claims, team_domain: str, aud: str, now: float) -> None
 _keys: dict[str, Any] = {}
 
 
-def _js() -> Any:
+def js_module() -> Any:
     """The JavaScript globals of the Workers runtime. The module exists only inside a Worker."""
     return importlib.import_module("js")
 
@@ -55,7 +55,7 @@ async def _signing_key(team_domain: str, kid: str) -> Any:
     if kid not in _keys:
         from pyodide.ffi import to_js
 
-        js = _js()
+        js = js_module()
         response = await js.fetch(f"https://{team_domain}/cdn-cgi/access/certs")
         if not response.ok:
             raise AccessError(f"could not fetch the signing keys: status {response.status}")
@@ -92,7 +92,7 @@ async def verify(token: str | None, team_domain: str, aud: str, now: float) -> C
 
     key = await _signing_key(team_domain, str(header.get("kid")))
     signed = f"{header_b64}.{payload_b64}".encode()
-    if not await _js().crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, to_js(signature), to_js(signed)):
+    if not await js_module().crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, to_js(signature), to_js(signed)):
         raise AccessError("bad signature")
 
     check_claims(claims, team_domain, aud, now)

@@ -10,6 +10,7 @@ Companies, contacts, and the reference codes: specs/002-companies-and-contacts/s
 The timeline and tasks: specs/003-activities-and-tasks/spec.md.
 Services, the rubric, and scores: specs/004-services-rubric-and-scoring/spec.md.
 Enrichment facts: specs/005-enrichment-facts/spec.md.
+The Today view: specs/006-today/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -52,6 +53,7 @@ from records import (
     fact_key,
     fact_value,
     iso_date,
+    local_date,
     slug,
 )
 from roles import ADMIN, DELETE, MANAGE, PUBLIC, READ, WRITE, action, allowed
@@ -1442,3 +1444,79 @@ async def delete_fact(request: Request, fact_id: str) -> Response:
     except Exception as e:
         return failed(request, "delete_fact", e)
     return Response(status_code=204)
+
+
+# ---- Today ---------------------------------------------------------------------------------------
+
+# The date an agreement enters its renewal window: its own notice days before its end, or the default.
+NOTICE_DATE = "date(a.end_date, '-' || COALESCE(a.renewal_notice_days, ?) || ' days')"
+TODAY_TASKS = (
+    "SELECT t.*, c.name AS company_name FROM task t LEFT JOIN company c ON c.id = t.company_id"
+    " WHERE t.status = 'OPEN' AND t.due_date {} ? ORDER BY t.due_date, t.created_at, t.id LIMIT ?"
+)
+TODAY_LEADS = "SELECT * FROM company WHERE stage = 'LEAD' AND archived_at IS NULL AND {} LIMIT ?"
+
+
+@app.get("/api/v1/today")
+@action(READ)
+async def today(request: Request, limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
+    database = db(request)
+    sql = "SELECT key, value FROM setting WHERE key IN ('digest.time_zone', 'renewal.default_notice_days')"
+    try:
+        found = await database.prepare(sql).all()
+        settings: dict[str, str] = {row["key"]: row["value"] for row in found["results"]}
+        notice = settings.get("renewal.default_notice_days", "")
+        notice_days = int(notice) if notice.isdigit() else 30
+    except Exception as e:
+        return failed(request, "load_today_settings", e)
+
+    # The answer says which zone was used: an unknown name falls back to UTC.
+    date, zone = local_date(settings.get("digest.time_zone"))
+
+    statements = [
+        database.prepare(TODAY_TASKS.format("<")).bind(date, limit),
+        database.prepare(TODAY_TASKS.format("=")).bind(date, limit),
+        # Leads waiting for a first score, newest first.
+        database.prepare(
+            TODAY_LEADS.format("fit_score IS NULL AND need_score IS NULL ORDER BY created_at DESC, id")
+        ).bind(limit),
+        # Reach out before Maybe, then the highest scores.
+        database.prepare(
+            TODAY_LEADS.format(
+                "recommendation IN ('REACH_OUT', 'MAYBE') ORDER BY recommendation = 'REACH_OUT' DESC,"
+                " COALESCE(fit_score, 0) + COALESCE(need_score, 0) DESC, id"
+            )
+        ).bind(limit),
+        # Open deals with nothing planned, the longest untouched first.
+        database.prepare(
+            "SELECT d.*, c.name AS company_name FROM deal d JOIN company c ON c.id = d.company_id"
+            " WHERE d.stage NOT IN ('WON', 'LOST') AND NOT EXISTS"
+            " (SELECT 1 FROM task t WHERE t.deal_id = d.id AND t.status = 'OPEN') ORDER BY d.updated_at, d.id LIMIT ?"
+        ).bind(limit),
+        database.prepare(
+            f"SELECT a.*, c.name AS company_name, {NOTICE_DATE} AS notice_date FROM agreement a"
+            " JOIN company c ON c.id = a.company_id WHERE a.status = 'ACTIVE' AND a.end_date IS NOT NULL"
+            f" AND {NOTICE_DATE} <= ? ORDER BY a.end_date, a.id LIMIT ?"
+        ).bind(notice_days, notice_days, date, limit),
+        # The dossier is left out: it can be long.
+        database.prepare(
+            "SELECT r.id, r.company_id, c.name AS company_name, r.kind, r.ai_model_id, r.status, r.created_at,"
+            " r.started_at FROM ai_run r JOIN company c ON c.id = r.company_id"
+            " WHERE r.status IN ('QUEUED', 'RUNNING') ORDER BY r.created_at, r.id LIMIT ?"
+        ).bind(limit),
+    ]
+    names = (
+        "tasks_overdue",
+        "tasks_due",
+        "leads_unscored",
+        "top_leads",
+        "deals_without_task",
+        "agreements_renewing",
+        "runs_in_progress",
+    )
+    try:
+        results = await database.batch(statements)
+    except Exception as e:
+        return failed(request, "load_today", e)
+    lists = {name: result["results"] for name, result in zip(names, results, strict=True)}
+    return JSONResponse({"date": date, "time_zone": zone, **lists})
