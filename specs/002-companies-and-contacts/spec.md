@@ -156,6 +156,7 @@ Tests:
 - Cross-Origin Resource Sharing (CORS). It is specified in `specs/017-cors/spec.md` and delivered with this feature.
 - Choosing the sort direction.
 - Clearing `disqualified_reason` when a company leaves `DISQUALIFIED`.
+- Facts about a company. See `specs/005-enrichment-facts/spec.md`.
 - Reading the timeline. Feature 003 (`specs/003-activities-and-tasks/spec.md`) serves it.
 
 ### What is not tested

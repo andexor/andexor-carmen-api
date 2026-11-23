@@ -61,6 +61,7 @@ CRITERION_FIELDS: dict[str, type] = {
     **dict.fromkeys(("weight", "sort_order"), int),
     "active": bool,
 }
+FACT_FIELDS: dict[str, type] = dict.fromkeys(("key", "value", "source_detail", "notes", "observed_at"), str)
 
 # Timeline kinds that only the API writes. An entry of one of these kinds is permanent.
 AUTOMATIC_KINDS = ("STAGE_CHANGE", "SCORE_CHANGE", "SYSTEM")
@@ -169,6 +170,35 @@ def clean(body: Values, fields: dict[str, type]) -> Values:
 def slug(name: str) -> str:
     """A service id from its name: lowercase words joined by hyphens, as in the page names on andexor.net."""
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def fact_key(text: str) -> str:
+    """A fact key in lowercase snake case: "Has Website" and "has-website" both become has_website."""
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def fact_value(value: str, value_type: str | None) -> str:
+    """The value as a matcher can use it: YES or NO in capitals for a yes-or-no key, and a date in
+    ISO 8601 form for a date key. value_type is the well-known key's type, or None for any other key.
+    Raises BadBody for a date that is not understood. Nothing else is checked: the key list is a hint.
+    """
+    if value_type == "YES_NO" and value.upper() in ("YES", "NO"):
+        return value.upper()
+    if value_type == "DATE":
+        return iso_date(value)
+    return value
+
+
+def describe_change(what: str, before: Values, after: Values | None) -> str:
+    """One line for the timeline that keeps what an edit or a delete is about to replace.
+
+    before holds the stored values. after holds the new values of an edit, or None for a delete.
+    """
+    if after is None:
+        kept = ", ".join(f"{column} {value!r}" for column, value in before.items() if value is not None)
+        return f"{what} deleted. It held: {kept}"
+    moved = ", ".join(f"{column} {before.get(column)!r} to {value!r}" for column, value in after.items())
+    return f"{what} edited: {moved}"
 
 
 def derive_domain(website: str | None) -> str | None:
