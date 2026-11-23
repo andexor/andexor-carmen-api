@@ -14,7 +14,8 @@ PRD.md               what this app must do (frozen)
 specs/               Spec Kit specifications; 000-repo-setup records what changed since the PRD
 src/worker.py        the Worker entry point
 src/app.py           the FastAPI application: identity, role check, endpoints
-src/records.py       what a caller may write to each kind of record, and the domain rule
+src/records.py       what a caller may write to each kind of record, the date rule, and the domain rule
+src/scoring.py       the scoring engine: points, Fit, Need, confidence, recommendation
 src/access.py        Cloudflare Access token verification
 src/roles.py         who may do what
 tests/               unit tests, run by unit-test.sh
@@ -41,7 +42,7 @@ Nothing is served from `workers.dev`.
 | Script | Does |
 | --- | --- |
 | `setup.sh` | Installs the dependencies and writes the license and vulnerability reports |
-| `unit-test.sh` | Strict type check (Pyright, as Pylance uses), then the unit tests: roles, token claims, record rules, allowed origins, every route declares an action |
+| `unit-test.sh` | Strict type check (Pyright, as Pylance uses), then the unit tests: roles, token claims, record rules, the scoring engine, allowed origins, every route declares an action |
 | `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
 | `preview-create.sh` | Finds or creates the preview database and applies the migrations. Safe to run again |
 | `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |

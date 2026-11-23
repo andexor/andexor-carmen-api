@@ -2,12 +2,13 @@
 # Copyright 2026 Andexor Network, Inc.
 # Author: Ed Jenkins <ed@andexor.net>
 
-"""What a caller may write to a company, a contact, a timeline entry, or a task. Pure: no input or output, so it is tested
+"""What a caller may write to each kind of record. Pure: no input or output, so it is tested
 without a Worker. See specs/002-companies-and-contacts/spec.md
 and specs/003-activities-and-tasks/spec.md.
 """
 
 import importlib
+import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -50,6 +51,16 @@ ACTIVITY_FIELDS: dict[str, type] = dict.fromkeys(("kind", "body", "occurred_at",
 TASK_FIELDS: dict[str, type] = dict.fromkeys(
     ("title", "company_id", "deal_id", "agreement_id", "due_date", "status", "owner_id"), str
 )
+SERVICE_FIELDS: dict[str, type] = {
+    **dict.fromkeys(("id", "name", "category"), str),
+    **dict.fromkeys(("offered", "active"), bool),
+    "sort_order": int,
+}
+CRITERION_FIELDS: dict[str, type] = {
+    **dict.fromkeys(("section", "service_id", "prompt", "help", "answer_type", "config_json", "enrichment_key"), str),
+    **dict.fromkeys(("weight", "sort_order"), int),
+    "active": bool,
+}
 
 # Timeline kinds that only the API writes. An entry of one of these kinds is permanent.
 AUTOMATIC_KINDS = ("STAGE_CHANGE", "SCORE_CHANGE", "SYSTEM")
@@ -59,6 +70,8 @@ COMPANY_CODES = {"stage": "COMPANY_STAGE", "source": "LEAD_SOURCE", "meeting_mod
 CONTACT_CODES = {"role": "CONTACT_ROLE"}
 ACTIVITY_CODES = {"kind": "ACTIVITY_KIND"}
 TASK_CODES = {"status": "TASK_STATUS"}
+SERVICE_CODES = {"category": "SERVICE_CATEGORY"}
+CRITERION_CODES = {"section": "RUBRIC_SECTION", "answer_type": "ANSWER_TYPE"}
 
 
 class BadBody(Exception):
@@ -151,6 +164,11 @@ def clean(body: Values, fields: dict[str, type]) -> Values:
             raise BadBody(f"{key} must be {kind.__name__}")
         values[key] = value
     return values
+
+
+def slug(name: str) -> str:
+    """A service id from its name: lowercase words joined by hyphens, as in the page names on andexor.net."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
 def derive_domain(website: str | None) -> str | None:
