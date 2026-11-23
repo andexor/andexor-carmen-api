@@ -9,6 +9,7 @@ description = "Andexor Carmen API"
 requires-python = ">=3.14"
 dependencies = [
     "fastapi<0.164",
+    "parsedatetime>=2.6",
 ]
 
 [dependency-groups]

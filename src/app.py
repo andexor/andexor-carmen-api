@@ -7,6 +7,7 @@
 Every request except the health check is identified first (identify), then the route's declared
 action is checked against the caller's role (authorize). See specs/001-skeleton-and-pipeline/spec.md.
 Companies, contacts, and the reference codes: specs/002-companies-and-contacts/spec.md.
+The timeline and tasks: specs/003-activities-and-tasks/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -26,7 +27,22 @@ from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException
 
 import access
-from records import COMPANY_CODES, COMPANY_FIELDS, CONTACT_CODES, CONTACT_FIELDS, BadBody, Values, clean, derive_domain
+from records import (
+    ACTIVITY_CODES,
+    ACTIVITY_FIELDS,
+    AUTOMATIC_KINDS,
+    COMPANY_CODES,
+    COMPANY_FIELDS,
+    CONTACT_CODES,
+    CONTACT_FIELDS,
+    TASK_CODES,
+    TASK_FIELDS,
+    BadBody,
+    Values,
+    clean,
+    derive_domain,
+    iso_date,
+)
 from roles import ADMIN, DELETE, PUBLIC, READ, WRITE, action, allowed
 
 logging.basicConfig(level=logging.INFO)
@@ -256,10 +272,10 @@ def insert(database: Any, table: str, values: Values) -> Any:
     return database.prepare(sql).bind(*given.values())
 
 
-def update(database: Any, table: str, values: Values, row_id: str) -> Any:
-    """An UPDATE statement for one row. It also sets updated_at."""
-    sets = ", ".join(f"{column} = ?" for column in values)
-    sql = f"UPDATE {table} SET {sets}, updated_at = {NOW} WHERE id = ? RETURNING *"
+def update(database: Any, table: str, values: Values, row_id: str, stamp: bool = True) -> Any:
+    """An UPDATE statement for one row. It also sets updated_at, unless the table has none (stamp=False)."""
+    sets = ", ".join(f"{column} = ?" for column in values) + (f", updated_at = {NOW}" if stamp else "")
+    sql = f"UPDATE {table} SET {sets} WHERE id = ? RETURNING *"
     return database.prepare(sql).bind(*values.values(), row_id)
 
 
@@ -271,6 +287,20 @@ async def unknown_code(database: Any, values: Values, codes: dict[str, str]) -> 
             if not await database.prepare(sql).bind(domain, values[column]).first():
                 return column
     return None
+
+
+def page(result: Any, limit: int, cursor: int) -> JSONResponse:
+    """One page of a list that was read with LIMIT limit + 1 OFFSET cursor."""
+    # shortcut: the cursor is a row offset, so a row added between pages can repeat one; use a keyset when lists grow large
+    rows: list[Any] = result["results"]
+    next_cursor = str(cursor + limit) if len(rows) > limit else None
+    return JSONResponse({"items": rows[:limit], "next_cursor": next_cursor})
+
+
+def may_delete(request: Request, owner_id: object) -> bool:
+    """True for a role that may delete anything, and for the caller's own record (a note they logged, a task they own)."""
+    identity: Identity = request.state.identity
+    return allowed(identity.get("role"), DELETE) or (owner_id is not None and owner_id == identity.get("id"))
 
 
 async def duplicate(request: Request, condition: str, value: str | None) -> JSONResponse:
@@ -339,15 +369,12 @@ async def list_companies(
             " WHERE contact.company_id = company.id AND (contact.name LIKE ? OR contact.email LIKE ?)))"
         )
         params += [f"%{q}%"] * 4
-    # shortcut: the cursor is a row offset, so a row added between pages can repeat one; use a keyset when lists grow large
     sql = f"SELECT * FROM company WHERE {' AND '.join(where)} ORDER BY {SORTS[sort]}, id LIMIT ? OFFSET ?"
     try:
         result = await db(request).prepare(sql).bind(*params, limit + 1, cursor).all()
     except Exception as e:
         return failed(request, "list_companies", e)
-    rows: list[Any] = result["results"]
-    next_cursor = str(cursor + limit) if len(rows) > limit else None
-    return JSONResponse({"items": rows[:limit], "next_cursor": next_cursor})
+    return page(result, limit, cursor)
 
 
 @app.post("/api/v1/companies")
@@ -384,11 +411,12 @@ async def get_company(request: Request, company_id: str) -> JSONResponse:
     try:
         row = await db(request).prepare("SELECT * FROM company WHERE id = ?").bind(company_id).first()
         contacts = await db(request).prepare(CONTACTS_OF).bind(company_id).all()
+        tasks = await db(request).prepare(OPEN_TASKS_OF).bind(company_id).all()
     except Exception as e:
         return failed(request, "load_company", e)
     if not row:
         return error(request, 404)
-    return JSONResponse({**row, "contacts": contacts["results"]})
+    return JSONResponse({**row, "contacts": contacts["results"], "open_tasks": tasks["results"]})
 
 
 @app.patch("/api/v1/companies/{company_id}")
@@ -584,3 +612,257 @@ async def delete_contact(request: Request, contact_id: str) -> Response:
     except Exception as e:
         return failed(request, "delete_contact", e)
     return Response(status_code=204) if row else error(request, 404)
+
+
+# ---- Timeline ------------------------------------------------------------------------------------
+
+# What a timeline entry may point to. Each must be a record of the entry's own company.
+ACTIVITY_LINKS = {"contact_id": "contact", "deal_id": "deal"}
+
+
+async def outside_company(database: Any, values: Values, company_id: str) -> str | None:
+    """The first link whose record is not under the company, or None."""
+    for column, table in ACTIVITY_LINKS.items():
+        if values.get(column) is not None:
+            sql = f"SELECT 1 AS found FROM {table} WHERE id = ? AND company_id = ?"
+            if not await database.prepare(sql).bind(values[column], company_id).first():
+                return column
+    return None
+
+
+@app.get("/api/v1/companies/{company_id}/activities")
+@action(READ)
+async def list_activities(
+    request: Request,
+    company_id: str,
+    kind: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: int = Query(0, ge=0),
+) -> JSONResponse:
+    params: list[Any] = [company_id] if kind is None else [company_id, kind]
+    sql = (
+        f"SELECT * FROM activity WHERE company_id = ?{'' if kind is None else ' AND kind = ?'}"
+        " ORDER BY occurred_at DESC, created_at DESC, id LIMIT ? OFFSET ?"
+    )
+    try:
+        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        result = await db(request).prepare(sql).bind(*params, limit + 1, cursor).all()
+    except Exception as e:
+        return failed(request, "list_activities", e)
+    if not company:
+        return error(request, 404)
+    return page(result, limit, cursor)
+
+
+@app.post("/api/v1/companies/{company_id}/activities")
+@action(WRITE)
+async def create_activity(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, ACTIVITY_FIELDS)
+        if values.get("kind") in AUTOMATIC_KINDS:
+            raise BadBody("an automatic kind cannot be logged by hand")
+    except BadBody as e:
+        return failed(request, "read_activity", e)
+    values["id"] = str(uuid.uuid4())
+    values["company_id"] = company_id
+    values["created_by"] = request.state.identity["id"]
+
+    try:
+        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        column = await unknown_code(db(request), values, ACTIVITY_CODES)
+        column = column or await outside_company(db(request), values, company_id)
+    except Exception as e:
+        return failed(request, "check_activity", e)
+    if not company:
+        return error(request, 404)
+    if column:
+        return error(request, 400)
+
+    try:
+        row = await insert(db(request), "activity", values).first()
+    except Exception as e:
+        return failed(request, "insert_activity", e)
+    return JSONResponse(row, status_code=201)
+
+
+@app.patch("/api/v1/activities/{activity_id}")
+@action(WRITE)
+async def update_activity(request: Request, activity_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, ACTIVITY_FIELDS)
+        if values.get("kind") in AUTOMATIC_KINDS:
+            raise BadBody("an entry cannot be made automatic")
+    except BadBody as e:
+        return failed(request, "read_activity", e)
+
+    try:
+        current = await db(request).prepare("SELECT * FROM activity WHERE id = ?").bind(activity_id).first()
+    except Exception as e:
+        return failed(request, "load_activity", e)
+    if not current:
+        return error(request, 404)
+    if current["kind"] in AUTOMATIC_KINDS:
+        return error(request, 409)  # automatic entries are permanent
+    if not values:
+        return JSONResponse(current)
+
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    try:
+        column = await unknown_code(db(request), changed, ACTIVITY_CODES)
+        column = column or await outside_company(db(request), changed, current["company_id"])
+    except Exception as e:
+        return failed(request, "check_activity", e)
+    if column:
+        return error(request, 400)
+
+    try:
+        row = await update(db(request), "activity", values, activity_id, stamp=False).first()
+    except Exception as e:
+        return failed(request, "update_activity", e)
+    return JSONResponse(row)
+
+
+# WRITE, not DELETE: a MEMBER may delete an entry they logged. may_delete decides.
+@app.delete("/api/v1/activities/{activity_id}")
+@action(WRITE)
+async def delete_activity(request: Request, activity_id: str) -> Response:
+    sql = "SELECT kind, created_by FROM activity WHERE id = ?"
+    try:
+        current = await db(request).prepare(sql).bind(activity_id).first()
+    except Exception as e:
+        return failed(request, "load_activity", e)
+    if not current:
+        return error(request, 404)
+    if not may_delete(request, current["created_by"]):
+        return error(request, 403)
+    if current["kind"] in AUTOMATIC_KINDS:
+        return error(request, 409)  # automatic entries are permanent
+
+    try:
+        await db(request).prepare("DELETE FROM activity WHERE id = ?").bind(activity_id).run()
+    except Exception as e:
+        return failed(request, "delete_activity", e)
+    return Response(status_code=204)
+
+
+# ---- Tasks ---------------------------------------------------------------------------------------
+
+TASK_ORDER = "due_date IS NULL, due_date, created_at, id"  # soonest first, undated last
+OPEN_TASKS_OF = f"SELECT * FROM task WHERE company_id = ? AND status = 'OPEN' ORDER BY {TASK_ORDER}"
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+@app.get("/api/v1/tasks")
+@action(READ)
+async def list_tasks(
+    request: Request,
+    status: str | None = None,
+    company_id: str | None = None,
+    owner_id: str | None = None,
+    due_before: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: int = Query(0, ge=0),
+) -> JSONResponse:
+    try:
+        due_before = iso_date(due_before) if due_before else None
+    except BadBody as e:
+        return failed(request, "read_due_before", e)
+    where = ["1 = 1"]
+    params: list[Any] = []
+    filters = {"status = ?": status, "company_id = ?": company_id, "owner_id = ?": owner_id, "due_date < ?": due_before}
+    for condition, value in filters.items():
+        if value is not None:
+            where.append(condition)
+            params.append(value)
+    sql = f"SELECT * FROM task WHERE {' AND '.join(where)} ORDER BY {TASK_ORDER} LIMIT ? OFFSET ?"
+    try:
+        result = await db(request).prepare(sql).bind(*params, limit + 1, cursor).all()
+    except Exception as e:
+        return failed(request, "list_tasks", e)
+    return page(result, limit, cursor)
+
+
+@app.post("/api/v1/tasks")
+@action(WRITE)
+async def create_task(request: Request, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, TASK_FIELDS)
+        if not values.get("title"):
+            raise BadBody("title is required")
+    except BadBody as e:
+        return failed(request, "read_task", e)
+    values["id"] = str(uuid.uuid4())
+    values.setdefault("owner_id", request.state.identity["id"])  # the creator owns it unless the body says otherwise
+    if values.get("status") == "DONE":
+        values["completed_at"] = utc_now()
+
+    try:
+        column = await unknown_code(db(request), values, TASK_CODES)
+    except Exception as e:
+        return failed(request, "check_task", e)
+    if column:
+        return error(request, 400)
+
+    try:
+        row = await insert(db(request), "task", values).first()
+    except Exception as e:
+        return failed(request, "insert_task", e)
+    return JSONResponse(row, status_code=201)
+
+
+@app.patch("/api/v1/tasks/{task_id}")
+@action(WRITE)
+async def update_task(request: Request, task_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, TASK_FIELDS)
+    except BadBody as e:
+        return failed(request, "read_task", e)
+
+    try:
+        current = await db(request).prepare("SELECT * FROM task WHERE id = ?").bind(task_id).first()
+    except Exception as e:
+        return failed(request, "load_task", e)
+    if not current:
+        return error(request, 404)
+    if not values:
+        return JSONResponse(current)
+
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    try:
+        column = await unknown_code(db(request), changed, TASK_CODES)
+    except Exception as e:
+        return failed(request, "check_task", e)
+    if column:
+        return error(request, 400)
+    if "status" in changed:
+        # Done records when; any other status clears it.
+        values["completed_at"] = utc_now() if changed["status"] == "DONE" else None
+
+    try:
+        row = await update(db(request), "task", values, task_id, stamp=False).first()
+    except Exception as e:
+        return failed(request, "update_task", e)
+    return JSONResponse(row)
+
+
+# WRITE, not DELETE: a MEMBER may delete a task they own. may_delete decides.
+@app.delete("/api/v1/tasks/{task_id}")
+@action(WRITE)
+async def delete_task(request: Request, task_id: str) -> Response:
+    try:
+        current = await db(request).prepare("SELECT owner_id FROM task WHERE id = ?").bind(task_id).first()
+    except Exception as e:
+        return failed(request, "load_task", e)
+    if not current:
+        return error(request, 404)
+    if not may_delete(request, current["owner_id"]):
+        return error(request, 403)
+
+    try:
+        await db(request).prepare("DELETE FROM task WHERE id = ?").bind(task_id).run()
+    except Exception as e:
+        return failed(request, "delete_task", e)
+    return Response(status_code=204)
