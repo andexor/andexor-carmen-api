@@ -2,7 +2,7 @@
 # Copyright 2026 Andexor Network, Inc.
 # Author: Ed Jenkins
 
-"""Unit tests for identity and roles. Run with ./unit-test.sh. No Worker and no second user is needed."""
+"""Unit tests for identity, roles, and record rules. Run with ./unit-test.sh. No Worker and no second user is needed."""
 
 import asyncio
 import base64
@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException  # noqa: E402
 
 import access  # noqa: E402
 import app as api  # noqa: E402
+import records  # noqa: E402
 import roles  # noqa: E402
 from roles import ADMIN, DELETE, MANAGE, MEMBER, PUBLIC, READ, READER, WRITE  # noqa: E402
 
@@ -144,6 +145,73 @@ class Claims(unittest.TestCase):
             asyncio.run(access.verify(token, TEAM, AUD, NOW))
 
 
+class Records(unittest.TestCase):
+    def test_domain_is_derived_from_the_website(self):
+        cases = {
+            "https://WWW.Acme.com/about?x=1": "acme.com",
+            "acme.com": "acme.com",
+            "www.acme.com/": "acme.com",
+            "http://shop.acme.com:8080/a": "shop.acme.com",
+            "  Acme.com  ": "acme.com",
+            "": None,
+            None: None,
+            "https://": None,
+        }
+        for website, domain in cases.items():
+            self.assertEqual(records.derive_domain(website), domain, repr(website))
+
+    def test_clean_keeps_only_writable_keys(self):
+        body = {"name": " Acme ", "city": "", "employee_count": 12, "summary": None, "id": "x", "fit_score": 99, "junk": 1}
+        expected = {"name": "Acme", "city": None, "employee_count": 12, "summary": None}
+        self.assertEqual(records.clean(body, records.COMPANY_FIELDS), expected)
+        self.assertEqual(records.clean({"is_primary": True}, records.CONTACT_FIELDS), {"is_primary": 1})
+        self.assertEqual(records.clean({"is_primary": 0}, records.CONTACT_FIELDS), {"is_primary": 0})
+
+    def test_clean_rejects_a_wrong_type(self):
+        bad: list[tuple[dict[str, Any], dict[str, type]]] = [
+            ({"name": 5}, records.COMPANY_FIELDS),
+            ({"employee_count": "12"}, records.COMPANY_FIELDS),
+            ({"employee_count": True}, records.COMPANY_FIELDS),
+            ({"employee_count": 1.5}, records.COMPANY_FIELDS),
+            ({"is_primary": "yes"}, records.CONTACT_FIELDS),
+            ({"is_primary": 2}, records.CONTACT_FIELDS),
+        ]
+        for body, fields in bad:
+            with self.assertRaises(records.BadBody, msg=repr(body)):
+                records.clean(body, fields)
+
+    def test_code_columns_are_writable_columns(self):
+        self.assertLessEqual(set(records.COMPANY_CODES), set(records.COMPANY_FIELDS))
+        self.assertLessEqual(set(records.CONTACT_CODES), set(records.CONTACT_FIELDS))
+
+    def test_database_errors_map_to_statuses(self):
+        cases = {
+            "D1_ERROR: UNIQUE constraint failed: company.domain: SQLITE_CONSTRAINT": 409,
+            "D1_ERROR: FOREIGN KEY constraint failed: SQLITE_CONSTRAINT": 400,
+            "D1_ERROR: NOT NULL constraint failed: company.stage: SQLITE_CONSTRAINT": 400,
+            "D1_ERROR: SRT violation: company.stage not in COMPANY_STAGE": 400,
+            "D1_ERROR: no such table: company": 500,
+        }
+        for text, status in cases.items():
+            self.assertEqual(api.db_status(Exception(text)), status, text)
+        self.assertEqual(api.db_status(records.BadBody("x")), 400)
+
+
+class Cors(unittest.TestCase):
+    def test_only_a_listed_origin_gets_headers(self):
+        allowed = "http://localhost:3000, https://app.example.invalid"
+        for origin in ("http://localhost:3000", "https://app.example.invalid"):
+            headers = api.cors_headers(origin, allowed)
+            self.assertEqual(headers["Access-Control-Allow-Origin"], origin)
+            self.assertEqual(headers["Access-Control-Allow-Credentials"], "true")
+        for origin in (None, "", "http://localhost:3001", "https://evil.invalid", "localhost:3000", "*", "null"):
+            self.assertEqual(api.cors_headers(origin, allowed), {}, repr(origin))
+
+    def test_no_allowed_origins_means_no_headers(self):
+        for allowed in (None, "", " "):
+            self.assertEqual(api.cors_headers("http://localhost:3000", allowed), {}, repr(allowed))
+
+
 class Config(unittest.TestCase):
     def setUp(self):
         self.text = (ROOT / "wrangler.jsonc").read_text()
@@ -151,6 +219,10 @@ class Config(unittest.TestCase):
 
     def test_dev_user_is_never_in_the_config(self):
         self.assertNotIn("DEV_USER_EMAIL", self.text)
+
+    def test_production_allows_no_other_origin(self):
+        self.assertEqual(self.config["vars"]["ALLOWED_ORIGINS"], "")
+        self.assertNotIn("*", self.config["env"]["preview"]["vars"]["ALLOWED_ORIGINS"])
 
     def test_service_tokens_are_admin_on_preview_only(self):
         self.assertNotIn("SERVICE_TOKENS_ARE_ADMIN", self.config["vars"])

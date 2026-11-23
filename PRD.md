@@ -6,8 +6,8 @@ Author: Ed Jenkins <ed@andexor.net>
 
 # PRD: Andexor Carmen API
 
-Status: DRAFT 0.1
-Date: 2026-11-15
+Status: DRAFT 1.0
+Date: 2026-11-23
 Governed by: `andexor-carmen-main/PRD.md` (the master PRD). Section numbers below prefixed "master" refer to it. This document refines the master and may not contradict it.
 
 ## 1. Goal
