@@ -140,6 +140,21 @@ expect 204 '' -X DELETE "${BASE}/facts/${FACT}"
 expect 200 "Fact smoke_fact deleted. It held: value 'older'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
 expect 404 '"error":"NOT_FOUND"' -X DELETE "${BASE}/facts/${FACT}"
 
+# The Today view (specs/006-today/spec.md). The overdue task goes with the test company.
+expect 201 '"due_date":"2020-01-01"' -X POST "${JSON[@]}" \
+    -d "{\"title\":\"Smoke overdue\",\"company_id\":\"${ID}\",\"due_date\":\"2020-01-01\"}" "${BASE}/tasks"
+expect 200 '"title":"Smoke overdue"' "${BASE}/today"
+for name in tasks_overdue tasks_due leads_unscored top_leads deals_without_task agreements_renewing runs_in_progress; do
+    jq -e --arg name "${name}" '.[$name] | type == "array"' "${BODY}" > /dev/null || { echo "FAILED: /today has no list ${name}"; exit 1; }
+done
+# The date is in the configured time zone, which proves the tzdata package works inside the Worker.
+ZONE=$(jq -r '.time_zone' "${BODY}")
+if [[ "${ZONE}" == "UTC" || "$(jq -r '.date' "${BODY}")" != "$(TZ=${ZONE} date +%F)" ]]; then
+    echo "FAILED: /today date $(jq -r '.date' "${BODY}") is not today in ${ZONE}"
+    exit 1
+fi
+echo "ok: today is $(jq -r '.date' "${BODY}") in ${ZONE}"
+
 expect 204 '' -X DELETE "${BASE}/companies/${ID}"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${ID}"
 expect 200 '"items":\[\]' "${BASE}/tasks?company_id=${ID}"

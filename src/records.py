@@ -12,6 +12,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 Values = dict[str, Any]
 
@@ -135,6 +136,21 @@ def iso_timestamp(text: str, now: datetime | None = None) -> str:
     if moment.tzinfo:
         moment = moment.astimezone(UTC)
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def local_date(zone: str | None, now: datetime | None = None) -> tuple[str, str]:
+    """Today's date in the time zone, and the zone that was used.
+
+    zone is a name such as America/New_York. A missing or unknown zone falls back to UTC, and the
+    second value says so. now is the current moment unless a test gives one.
+    """
+    moment = now or datetime.now(UTC)
+    try:
+        if zone:
+            return moment.astimezone(ZoneInfo(zone)).date().isoformat(), zone
+    except Exception:  # an unknown name; the zone data itself comes from the tzdata package
+        pass
+    return moment.astimezone(UTC).date().isoformat(), "UTC"
 
 
 def iso(column: str, text: str) -> str:
