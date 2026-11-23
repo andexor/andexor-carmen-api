@@ -11,6 +11,7 @@ The timeline and tasks: specs/003-activities-and-tasks/spec.md.
 Services, the rubric, and scores: specs/004-services-rubric-and-scoring/spec.md.
 Enrichment facts: specs/005-enrichment-facts/spec.md.
 The Today view: specs/006-today/spec.md.
+Deals: specs/007-deals/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -40,6 +41,8 @@ from records import (
     CONTACT_FIELDS,
     CRITERION_CODES,
     CRITERION_FIELDS,
+    DEAL_CODES,
+    DEAL_FIELDS,
     FACT_FIELDS,
     SERVICE_CODES,
     SERVICE_FIELDS,
@@ -52,6 +55,7 @@ from records import (
     describe_change,
     fact_key,
     fact_value,
+    id_list,
     iso_date,
     local_date,
     slug,
@@ -427,12 +431,19 @@ async def get_company(request: Request, company_id: str) -> JSONResponse:
         contacts = await db(request).prepare(CONTACTS_OF).bind(company_id).all()
         tasks = await db(request).prepare(OPEN_TASKS_OF).bind(company_id).all()
         services = await db(request).prepare(SERVICE_SCORES_OF).bind(company_id).all()
+        deals = await db(request).prepare(OPEN_DEALS_OF).bind(company_id).all()
     except Exception as e:
         return failed(request, "load_company", e)
     if not row:
         return error(request, 404)
     return JSONResponse(
-        {**row, "contacts": contacts["results"], "open_tasks": tasks["results"], "services": services["results"]}
+        {
+            **row,
+            "contacts": contacts["results"],
+            "open_tasks": tasks["results"],
+            "services": services["results"],
+            "open_deals": [deal_out(deal) for deal in deals["results"]],
+        }
     )
 
 
@@ -464,20 +475,24 @@ async def update_company(request: Request, company_id: str, body: dict[str, Any]
     if column:
         return error(request, 400)
 
-    statements = [update(db(request), "company", values, company_id)]
+    # Every edit is recorded: the Worker log first, then the timeline entry with the change, in one transaction.
+    edits = {column: value for column, value in changed.items() if column != "stage"}
+    statements = audit(request, company_label(current), company_id, current, edits) if edits else []
+    statements.append(update(db(request), "company", values, company_id))
     if "stage" in changed:
-        # The timeline entry is written with the change, in one transaction.
+        moved = f"Stage changed from {current['stage']} to {changed['stage']}"
+        log_change(request, moved, company_id)
         entry = {
             "id": str(uuid.uuid4()),
             "company_id": company_id,
             "kind": "STAGE_CHANGE",
-            "body": f"Stage changed from {current['stage']} to {changed['stage']}",
+            "body": moved,
             "created_by": request.state.identity["id"],
         }
         statements.append(insert(db(request), "activity", entry))
     try:
         results = await db(request).batch(statements)
-        row = results[0]["results"][0]
+        row = results[len(statements) - (2 if "stage" in changed else 1)]["results"][0]
     except Exception as e:
         if db_status(e) == 409:
             return await duplicate(request, "domain = ?", values.get("domain"))
@@ -485,23 +500,29 @@ async def update_company(request: Request, company_id: str, body: dict[str, Any]
     return JSONResponse(row)
 
 
+def company_label(company: Row) -> str:
+    return f"Company {company['name'] or company['domain'] or company['id']}"
+
+
 @app.delete("/api/v1/companies/{company_id}")
 @action(DELETE)
 async def delete_company(request: Request, company_id: str) -> Response:
-    held = (
-        "SELECT (SELECT COUNT(*) FROM agreement WHERE company_id = ?1)"
-        " + (SELECT COUNT(*) FROM document WHERE company_id = ?1) AS held FROM company WHERE id = ?1"
+    sql = (
+        "SELECT *, (SELECT COUNT(*) FROM agreement WHERE company_id = ?1)"
+        " + (SELECT COUNT(*) FROM document WHERE company_id = ?1) AS blocked FROM company WHERE id = ?1"
     )
     try:
-        row = await db(request).prepare(held).bind(company_id).first()
+        row = await db(request).prepare(sql).bind(company_id).first()
     except Exception as e:
         return failed(request, "load_company", e)
     if not row:
         return error(request, 404)
-    if row["held"]:
+    if row["blocked"]:
         return error(request, 409)
 
     try:
+        # The timeline is deleted with the company, so the Worker log is the only record of this delete.
+        log_change(request, describe_change(company_label(row), held(row, COMPANY_FIELDS), None), company_id)
         # Everything else under the company goes with it: the foreign keys cascade.
         await db(request).prepare("DELETE FROM company WHERE id = ?").bind(company_id).run()
     except Exception as e:
@@ -509,27 +530,47 @@ async def delete_company(request: Request, company_id: str) -> Response:
     return Response(status_code=204)
 
 
-async def set_archived(request: Request, company_id: str, archived_at: str) -> JSONResponse:
-    sql = f"UPDATE company SET archived_at = {archived_at}, updated_at = {NOW} WHERE id = ? RETURNING *"
+async def set_archived(request: Request, company_id: str, archive: bool) -> JSONResponse:
     try:
-        row = await db(request).prepare(sql).bind(company_id).first()
+        current = await db(request).prepare("SELECT * FROM company WHERE id = ?").bind(company_id).first()
+    except Exception as e:
+        return failed(request, "load_company", e)
+    if not current:
+        return error(request, 404)
+    if archive == (current["archived_at"] is not None):
+        return JSONResponse(current)  # already so: nothing to change, nothing to record
+
+    sql = f"UPDATE company SET archived_at = {NOW if archive else 'NULL'}, updated_at = {NOW} WHERE id = ? RETURNING *"
+    try:
+        change = f"{company_label(current)} {'archived' if archive else 'unarchived'}"
+        log_change(request, change, company_id)
+        entry = {
+            "id": str(uuid.uuid4()),
+            "company_id": company_id,
+            "kind": "SYSTEM",
+            "body": change,
+            "created_by": request.state.identity["id"],
+        }
+        statements = [insert(db(request), "activity", entry), db(request).prepare(sql).bind(company_id)]
+        results = await db(request).batch(statements)
+        row = results[-1]["results"][0]
     except Exception as e:
         if db_status(e) == 409:
             return await duplicate(request, "domain = (SELECT domain FROM company WHERE id = ?)", company_id)
         return failed(request, "archive_company", e)
-    return JSONResponse(row) if row else error(request, 404)
+    return JSONResponse(row)
 
 
 @app.post("/api/v1/companies/{company_id}/archive")
 @action(WRITE)
 async def archive_company(request: Request, company_id: str) -> JSONResponse:
-    return await set_archived(request, company_id, f"COALESCE(archived_at, {NOW})")
+    return await set_archived(request, company_id, True)
 
 
 @app.post("/api/v1/companies/{company_id}/unarchive")
 @action(WRITE)
 async def unarchive_company(request: Request, company_id: str) -> JSONResponse:
-    return await set_archived(request, company_id, "NULL")
+    return await set_archived(request, company_id, False)
 
 
 # ---- Contacts ------------------------------------------------------------------------------------
@@ -613,6 +654,8 @@ async def update_contact(request: Request, contact_id: str, body: dict[str, Any]
     statements = [update(db(request), "contact", values, contact_id)]
     if values.get("is_primary"):
         statements.insert(0, db(request).prepare(CLEAR_PRIMARY).bind(current["company_id"], contact_id))
+    if changed:
+        statements = audit(request, contact_label(current), current["company_id"], current, changed) + statements
     try:
         results = await db(request).batch(statements)
         row = results[-1]["results"][0]
@@ -621,14 +664,29 @@ async def update_contact(request: Request, contact_id: str, body: dict[str, Any]
     return JSONResponse(row)
 
 
+def contact_label(contact: Row) -> str:
+    return f"Contact {contact['name'] or contact['email']}"
+
+
 @app.delete("/api/v1/contacts/{contact_id}")
 @action(DELETE)
 async def delete_contact(request: Request, contact_id: str) -> Response:
     try:
-        row = await db(request).prepare("DELETE FROM contact WHERE id = ? RETURNING id").bind(contact_id).first()
+        current = await db(request).prepare("SELECT * FROM contact WHERE id = ?").bind(contact_id).first()
+    except Exception as e:
+        return failed(request, "load_contact", e)
+    if not current:
+        return error(request, 404)
+
+    try:
+        statements = [
+            *audit(request, contact_label(current), current["company_id"], held(current, CONTACT_FIELDS), None),
+            db(request).prepare("DELETE FROM contact WHERE id = ?").bind(contact_id),
+        ]
+        await db(request).batch(statements)
     except Exception as e:
         return failed(request, "delete_contact", e)
-    return Response(status_code=204) if row else error(request, 404)
+    return Response(status_code=204)
 
 
 # ---- Timeline ------------------------------------------------------------------------------------
@@ -732,8 +790,15 @@ async def update_activity(request: Request, activity_id: str, body: dict[str, An
     if column:
         return error(request, 400)
 
+    if not changed:
+        return JSONResponse(current)
     try:
-        row = await update(db(request), "activity", values, activity_id, stamp=False).first()
+        statements = [
+            *audit(request, f"{current['kind']} entry", current["company_id"], current, changed),
+            update(db(request), "activity", changed, activity_id, stamp=False),
+        ]
+        results = await db(request).batch(statements)
+        row = results[-1]["results"][0]
     except Exception as e:
         return failed(request, "update_activity", e)
     return JSONResponse(row)
@@ -743,7 +808,7 @@ async def update_activity(request: Request, activity_id: str, body: dict[str, An
 @app.delete("/api/v1/activities/{activity_id}")
 @action(WRITE)
 async def delete_activity(request: Request, activity_id: str) -> Response:
-    sql = "SELECT kind, created_by FROM activity WHERE id = ?"
+    sql = "SELECT * FROM activity WHERE id = ?"
     try:
         current = await db(request).prepare(sql).bind(activity_id).first()
     except Exception as e:
@@ -756,7 +821,11 @@ async def delete_activity(request: Request, activity_id: str) -> Response:
         return error(request, 409)  # automatic entries are permanent
 
     try:
-        await db(request).prepare("DELETE FROM activity WHERE id = ?").bind(activity_id).run()
+        statements = [
+            *audit(request, f"{current['kind']} entry", current["company_id"], held(current, ACTIVITY_FIELDS), None),
+            db(request).prepare("DELETE FROM activity WHERE id = ?").bind(activity_id),
+        ]
+        await db(request).batch(statements)
     except Exception as e:
         return failed(request, "delete_activity", e)
     return Response(status_code=204)
@@ -858,8 +927,16 @@ async def update_task(request: Request, task_id: str, body: dict[str, Any]) -> J
         # Done records when; any other status clears it.
         values["completed_at"] = utc_now() if changed["status"] == "DONE" else None
 
+    if not changed:
+        return JSONResponse(current)
     try:
-        row = await update(db(request), "task", values, task_id, stamp=False).first()
+        # A task with no company has no timeline to write to: the Worker log is then its only record.
+        statements = [
+            *audit(request, f"Task {current['title']}", current["company_id"], current, changed),
+            update(db(request), "task", values, task_id, stamp=False),
+        ]
+        results = await db(request).batch(statements)
+        row = results[-1]["results"][0]
     except Exception as e:
         return failed(request, "update_task", e)
     return JSONResponse(row)
@@ -870,7 +947,7 @@ async def update_task(request: Request, task_id: str, body: dict[str, Any]) -> J
 @action(WRITE)
 async def delete_task(request: Request, task_id: str) -> Response:
     try:
-        current = await db(request).prepare("SELECT owner_id FROM task WHERE id = ?").bind(task_id).first()
+        current = await db(request).prepare("SELECT * FROM task WHERE id = ?").bind(task_id).first()
     except Exception as e:
         return failed(request, "load_task", e)
     if not current:
@@ -879,7 +956,11 @@ async def delete_task(request: Request, task_id: str) -> Response:
         return error(request, 403)
 
     try:
-        await db(request).prepare("DELETE FROM task WHERE id = ?").bind(task_id).run()
+        statements = [
+            *audit(request, f"Task {current['title']}", current["company_id"], held(current, TASK_FIELDS), None),
+            db(request).prepare("DELETE FROM task WHERE id = ?").bind(task_id),
+        ]
+        await db(request).batch(statements)
     except Exception as e:
         return failed(request, "delete_task", e)
     return Response(status_code=204)
@@ -936,11 +1017,13 @@ def score_writes(request: Request, company: Row, scores: Row) -> list[Any]:
         def moved(key: str) -> str:
             return f"{company.get(key) if company.get(key) is not None else 'none'} to {scores[key] if scores[key] is not None else 'none'}"
 
+        change = f"Fit {moved('fit_score')}, Need {moved('need_score')}, recommendation {moved('recommendation')}"
+        log_change(request, change, company_id)
         entry = {
             "id": str(uuid.uuid4()),
             "company_id": company_id,
             "kind": "SCORE_CHANGE",
-            "body": f"Fit {moved('fit_score')}, Need {moved('need_score')}, recommendation {moved('recommendation')}",
+            "body": change,
             "created_by": request.state.identity["id"],
         }
         statements.append(insert(database, "activity", entry))
@@ -1062,8 +1145,11 @@ async def update_service(request: Request, service_id: str, body: dict[str, Any]
     if column:
         return error(request, 400)
 
+    if not changed:
+        return JSONResponse(current)
     try:
-        row = await update(db(request), "service", values, service_id, stamp=False).first()
+        audit(request, f"Service {current['name']}", None, current, changed)  # no company: the Worker log only
+        row = await update(db(request), "service", changed, service_id, stamp=False).first()
     except Exception as e:
         return failed(request, "update_service", e)
 
@@ -1162,8 +1248,11 @@ async def update_criterion(request: Request, criterion_id: str, body: dict[str, 
     if column or not valid_config(merged["answer_type"], merged["config_json"]):
         return error(request, 400)
 
+    if not changed:
+        return JSONResponse(current)
     try:
-        row = await update(db(request), "rubric_criterion", values, criterion_id, stamp=False).first()
+        audit(request, f"Rubric question {current['prompt']}", None, current, changed)  # no company: the Worker log only
+        row = await update(db(request), "rubric_criterion", changed, criterion_id, stamp=False).first()
     except Exception as e:
         return failed(request, "update_criterion", e)
 
@@ -1218,6 +1307,8 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
 
     in_use = {criterion["id"]: criterion for criterion in criteria if criterion["active"]}
     answers: Row = {row["criterion_id"]: row["value"] for row in stored["results"]}
+    before: Row = {}
+    after: Values = {}
     statements: list[Any] = []
     try:
         for entry in cast(list[Any], entries):
@@ -1228,6 +1319,8 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
             value = given.get("value")
             if value is None or value == "":
                 # Cleared: the criterion is unknown again.
+                if criterion["id"] in answers:
+                    before[criterion["prompt"]], after[criterion["prompt"]] = answers[criterion["id"]], None
                 answers.pop(criterion["id"], None)
                 sql = "DELETE FROM rubric_answer WHERE company_id = ? AND criterion_id = ?"
                 statements.append(database.prepare(sql).bind(company_id, criterion["id"]))
@@ -1237,6 +1330,8 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
             earned = None if isinstance(value, bool) else points(criterion, text)
             if earned is None:
                 raise BadBody("a value does not suit its criterion")
+            if answers.get(criterion["id"], text) != text:
+                before[criterion["prompt"]], after[criterion["prompt"]] = answers[criterion["id"]], text
             answers[criterion["id"]] = text
             sql = (
                 "INSERT INTO rubric_answer (company_id, criterion_id, value, points, source, answered_by)"
@@ -1251,8 +1346,9 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
         return failed(request, "read_answers", e)
 
     try:
-        # The answers and the scores they give are stored in one transaction.
-        await database.batch(statements + score_writes(request, company, scores))
+        # A changed or cleared answer is recorded first. The answers and their scores are one transaction.
+        record = audit(request, "Answers", company_id, before, after) if after else []
+        await database.batch(record + statements + score_writes(request, company, scores))
     except Exception as e:
         return failed(request, "store_answers", e)
     return JSONResponse(scores_body(scores, services))
@@ -1272,22 +1368,39 @@ def fact_fields(entry: object) -> Values:
     return clean(fact, FACT_FIELDS)
 
 
-def audit(request: Request, what: str, company_id: str, before: Row, after: Values | None) -> Any:
-    """Record an edit (after is the new values) or a delete (after is None) before it is carried out.
-
-    Writes a line to the Worker log now, and returns the statement that adds a permanent SYSTEM entry,
-    holding the old values, to the company's timeline. The caller puts that statement first in the
-    same transaction as the change, so the change cannot happen without its record.
-    """
-    body = describe_change(what, before, after)
+def log_change(request: Request, change: str, company_id: str | None) -> None:
+    """Write a change to the Worker log. Called before the change, and its timeline entry, are sent to the database."""
     record = {
         "event": "carmen_audit",
-        "change": body,
+        "change": change,
         "company_id": company_id,
         "by": request.state.identity["id"],
         "request_id": request.state.request_id,
     }
     logger.info(json.dumps(record))
+
+
+def held(row: Row, fields: dict[str, type]) -> Row:
+    """What a record holds, for the record of its deletion: its writable columns that have a value."""
+    return {column: row[column] for column in fields if row.get(column) is not None}
+
+
+def audit(request: Request, what: str, company_id: str | None, before: Row, after: Values | None) -> list[Any]:
+    """Record an edit (after is the new values) or a delete (after is None) before it is carried out.
+
+    The order is fixed: first a line in the Worker log, written here and now; then the timeline entry
+    and the change itself, sent together. This returns the statement that adds the permanent SYSTEM
+    entry, holding the old values, to the company's timeline. The caller puts that statement first in
+    the same transaction as the change, so the change cannot happen without its record.
+
+    The result is a list of statements. It is empty when there is no company (a service, a rubric
+    question, a task with no company): the timeline belongs to a company, so the Worker log is the
+    only record of such a change.
+    """
+    body = describe_change(what, before, after)
+    log_change(request, body, company_id)
+    if company_id is None:
+        return []
     entry = {
         "id": str(uuid.uuid4()),
         "company_id": company_id,
@@ -1295,7 +1408,7 @@ def audit(request: Request, what: str, company_id: str, before: Row, after: Valu
         "body": body,
         "created_by": request.state.identity["id"],
     }
-    return insert(db(request), "activity", entry)
+    return [insert(db(request), "activity", entry)]
 
 
 @app.get("/api/v1/facts/keys")
@@ -1412,7 +1525,7 @@ async def update_fact(request: Request, fact_id: str, body: dict[str, Any]) -> J
     try:
         # The record of the old values is written first, in the same transaction as the edit.
         statements = [
-            audit(request, f"Fact {current['key']}", current["company_id"], current, changed),
+            *audit(request, f"Fact {current['key']}", current["company_id"], current, changed),
             update(db(request), "enrichment_fact", changed, fact_id, stamp=False),
         ]
         results = await db(request).batch(statements)
@@ -1435,9 +1548,9 @@ async def delete_fact(request: Request, fact_id: str) -> Response:
 
     try:
         # The record of what is deleted is written first, in the same transaction as the delete.
-        held = {column: value for column, value in current.items() if column not in ("company_id", "key")}
+        kept = {column: value for column, value in current.items() if column not in ("company_id", "key")}
         statements = [
-            audit(request, f"Fact {current['key']}", current["company_id"], held, None),
+            *audit(request, f"Fact {current['key']}", current["company_id"], kept, None),
             db(request).prepare("DELETE FROM enrichment_fact WHERE id = ?").bind(fact_id),
         ]
         await db(request).batch(statements)
@@ -1520,3 +1633,214 @@ async def today(request: Request, limit: int = Query(50, ge=1, le=200)) -> JSONR
         return failed(request, "load_today", e)
     lists = {name: result["results"] for name, result in zip(names, results, strict=True)}
     return JSONResponse({"date": date, "time_zone": zone, **lists})
+
+
+# ---- Deals ---------------------------------------------------------------------------------------
+
+DEAL_SELECT = (
+    "SELECT d.*, c.name AS company_name,"
+    " (SELECT group_concat(service_id) FROM deal_service ds WHERE ds.deal_id = d.id) AS service_ids"
+    " FROM deal d JOIN company c ON c.id = d.company_id"
+)
+OPEN_DEALS_OF = f"{DEAL_SELECT} WHERE d.company_id = ? AND d.stage NOT IN ('WON', 'LOST') ORDER BY d.created_at DESC, d.id"
+
+
+def deal_out(row: Row) -> Row:
+    """A deal as returned to a caller: the services it covers are a list."""
+    return {**row, "service_ids": sorted(row["service_ids"].split(",")) if row["service_ids"] else []}
+
+
+def deal_services(database: Any, deal_id: str, service_ids: list[str]) -> list[Any]:
+    sql = "INSERT INTO deal_service (deal_id, service_id) VALUES (?, ?)"
+    return [database.prepare(sql).bind(deal_id, service_id) for service_id in service_ids]
+
+
+async def contact_outside(database: Any, values: Values, company_id: str) -> bool:
+    """True when the deal's primary contact is not a contact of the deal's company."""
+    if values.get("primary_contact_id") is None:
+        return False
+    sql = "SELECT 1 AS found FROM contact WHERE id = ? AND company_id = ?"
+    return not await database.prepare(sql).bind(values["primary_contact_id"], company_id).first()
+
+
+@app.get("/api/v1/deals")
+@action(READ)
+async def list_deals(
+    request: Request,
+    stage: str | None = None,
+    company_id: str | None = None,
+    owner_id: str | None = None,
+    open: bool = False,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: int = Query(0, ge=0),
+) -> JSONResponse:
+    where = ["d.stage NOT IN ('WON', 'LOST')" if open else "1 = 1"]
+    params: list[Any] = []
+    for condition, value in {"d.stage = ?": stage, "d.company_id = ?": company_id, "d.owner_id = ?": owner_id}.items():
+        if value is not None:
+            where.append(condition)
+            params.append(value)
+    sql = f"{DEAL_SELECT} WHERE {' AND '.join(where)} ORDER BY d.created_at DESC, d.id LIMIT ? OFFSET ?"
+    try:
+        result = await db(request).prepare(sql).bind(*params, limit + 1, cursor).all()
+    except Exception as e:
+        return failed(request, "list_deals", e)
+    result["results"] = [deal_out(row) for row in result["results"]]
+    return page(result, limit, cursor)
+
+
+@app.post("/api/v1/deals")
+@action(WRITE)
+async def create_deal(request: Request, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, DEAL_FIELDS)
+        services = id_list(body, "service_ids") or []
+        if not values.get("company_id"):
+            raise BadBody("company_id is required")
+    except BadBody as e:
+        return failed(request, "read_deal", e)
+    company_id = values["company_id"]
+
+    database = db(request)
+    try:
+        sql = "SELECT id, name, domain, stage FROM company WHERE id = ?"
+        company = await database.prepare(sql).bind(company_id).first()
+        column = await unknown_code(database, values, DEAL_CODES)
+        outside = await contact_outside(database, values, company_id)
+    except Exception as e:
+        return failed(request, "check_deal", e)
+    if not company or column or outside:
+        return error(request, 400)
+
+    values["id"] = str(uuid.uuid4())
+    values["name"] = values.get("name") or f"{company['name'] or company['domain'] or 'New'} deal"
+    values.setdefault("owner_id", request.state.identity["id"])  # the creator owns it unless the body says otherwise
+    statements = [insert(database, "deal", values), *deal_services(database, values["id"], services)]
+    if company["stage"] == "LEAD":
+        # The first deal means the company is in conversation. The change is on the timeline.
+        sql = f"UPDATE company SET stage = 'PROSPECT', updated_at = {NOW} WHERE id = ? AND stage = 'LEAD'"
+        statements.append(database.prepare(sql).bind(company_id))
+        moved = "Stage changed from LEAD to PROSPECT: a deal was created"
+        log_change(request, moved, company_id)
+        entry = {
+            "id": str(uuid.uuid4()),
+            "company_id": company_id,
+            "deal_id": values["id"],
+            "kind": "STAGE_CHANGE",
+            "body": moved,
+            "created_by": request.state.identity["id"],
+        }
+        statements.append(insert(database, "activity", entry))
+    try:
+        await database.batch(statements)
+        # Read back: the database sets closed_at for a deal created as WON or LOST.
+        row = await database.prepare(f"{DEAL_SELECT} WHERE d.id = ?").bind(values["id"]).first()
+    except Exception as e:
+        return failed(request, "insert_deal", e)
+    return JSONResponse(deal_out(row), status_code=201)
+
+
+@app.get("/api/v1/deals/{deal_id}")
+@action(READ)
+async def get_deal(request: Request, deal_id: str) -> JSONResponse:
+    try:
+        row = await db(request).prepare(f"{DEAL_SELECT} WHERE d.id = ?").bind(deal_id).first()
+    except Exception as e:
+        return failed(request, "load_deal", e)
+    return JSONResponse(deal_out(row)) if row else error(request, 404)
+
+
+@app.patch("/api/v1/deals/{deal_id}")
+@action(WRITE)
+async def update_deal(request: Request, deal_id: str, body: dict[str, Any]) -> JSONResponse:
+    try:
+        values = clean(body, DEAL_FIELDS)
+        services = id_list(body, "service_ids")
+    except BadBody as e:
+        return failed(request, "read_deal", e)
+    values.pop("company_id", None)  # a deal stays with its company
+
+    database = db(request)
+    try:
+        found = await database.prepare(f"{DEAL_SELECT} WHERE d.id = ?").bind(deal_id).first()
+    except Exception as e:
+        return failed(request, "load_deal", e)
+    if not found:
+        return error(request, 404)
+    current = deal_out(found)
+
+    changed = {column: value for column, value in values.items() if value != current[column]}
+    if services is not None and services == current["service_ids"]:
+        services = None
+    if not changed and services is None:
+        return JSONResponse(current)
+    try:
+        column = await unknown_code(database, changed, DEAL_CODES)
+        outside = await contact_outside(database, changed, current["company_id"])
+    except Exception as e:
+        return failed(request, "check_deal", e)
+    if column or outside:
+        return error(request, 400)
+
+    statements: list[Any] = []
+    edits: Values = {column: value for column, value in changed.items() if column != "stage"}
+    if services is not None:
+        edits["service_ids"] = services
+    try:
+        if edits:
+            # The record of the old values comes first, in the same transaction as the edit.
+            statements += audit(request, f"Deal {current['name']}", current["company_id"], current, edits)
+        if "stage" in changed:
+            moved = f"Deal {current['name']}: stage changed from {current['stage']} to {changed['stage']}"
+            log_change(request, moved, current["company_id"])  # the Worker log first, then the timeline
+            entry = {
+                "id": str(uuid.uuid4()),
+                "company_id": current["company_id"],
+                "deal_id": deal_id,
+                "kind": "STAGE_CHANGE",
+                "body": moved,
+                "created_by": request.state.identity["id"],
+            }
+            statements.append(insert(database, "activity", entry))
+        if changed:
+            statements.append(update(database, "deal", changed, deal_id))
+        if services is not None:
+            statements.append(database.prepare(f"UPDATE deal SET updated_at = {NOW} WHERE id = ?").bind(deal_id))
+            statements.append(database.prepare("DELETE FROM deal_service WHERE deal_id = ?").bind(deal_id))
+            statements += deal_services(database, deal_id, services)
+        await database.batch(statements)
+        # Read back: the database sets closed_at when a deal closes and clears it when it reopens.
+        row = await database.prepare(f"{DEAL_SELECT} WHERE d.id = ?").bind(deal_id).first()
+    except Exception as e:
+        return failed(request, "update_deal", e)
+    return JSONResponse(deal_out(row))
+
+
+# WRITE, not DELETE: a MEMBER may delete a deal they own. may_delete decides.
+@app.delete("/api/v1/deals/{deal_id}")
+@action(WRITE)
+async def delete_deal(request: Request, deal_id: str) -> Response:
+    database = db(request)
+    try:
+        found = await database.prepare(f"{DEAL_SELECT} WHERE d.id = ?").bind(deal_id).first()
+    except Exception as e:
+        return failed(request, "load_deal", e)
+    if not found:
+        return error(request, 404)
+    if not may_delete(request, found["owner_id"]):
+        return error(request, 403)
+
+    current = deal_out(found)
+    kept = ("stage", "engagement_model", "one_time_value_cents", "monthly_value_cents", "currency")
+    kept += ("expected_close_date", "closed_at", "lost_reason", "notes", "owner_id", "service_ids")
+    was = {column: current[column] for column in kept if current[column] not in (None, [])}
+    try:
+        # The record of what is deleted comes first, in the same transaction as the delete.
+        statements = [
+            *audit(request, f"Deal {current['name']}", current["company_id"], was, None),
+            database.prepare("DELETE FROM deal WHERE id = ?").bind(deal_id),
+        ]
+        await database.batch(statements)
+    except Exception as e:
+        return failed(request, "delete_deal", e)
+    return Response(status_code=204)

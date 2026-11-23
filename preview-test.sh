@@ -77,7 +77,13 @@ expect 201 '"domain":"smoke-test.invalid"' -X POST "${JSON[@]}" \
 ID=$(jq -r '.id' "${BODY}")
 # A second company with the same domain is refused, and the answer names the first.
 expect 409 "\"company_id\":\"${ID}\"" -X POST "${JSON[@]}" -d '{"website":"smoke-test.invalid"}' "${BASE}/companies"
-expect 200 '"stage":"PROSPECT"' -X PATCH "${JSON[@]}" -d '{"stage":"PROSPECT"}' "${BASE}/companies/${ID}"
+# Deals (specs/007-deals/spec.md). The first deal moves the lead to PROSPECT by itself.
+expect 201 '"name":"Smoke Test deal"' -X POST "${JSON[@]}" \
+    -d "{\"company_id\":\"${ID}\",\"service_ids\":[\"web-development\"]}" "${BASE}/deals"
+DEAL=$(jq -r '.id' "${BODY}")
+expect 200 '"stage":"PROSPECT"' "${BASE}/companies/${ID}"
+# A stage can always be set by hand.
+expect 200 '"stage":"CUSTOMER"' -X PATCH "${JSON[@]}" -d '{"stage":"CUSTOMER"}' "${BASE}/companies/${ID}"
 expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"stage":"NO_SUCH_STAGE"}' "${BASE}/companies/${ID}"
 # The database enforces foreign keys with no PRAGMA: an owner that does not exist is refused.
 expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"owner_id":"no-such-user"}' "${BASE}/companies/${ID}"
@@ -139,6 +145,21 @@ expect 200 "Fact smoke_fact edited: value 'old' to 'older'" "${BASE}/companies/$
 expect 204 '' -X DELETE "${BASE}/facts/${FACT}"
 expect 200 "Fact smoke_fact deleted. It held: value 'older'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
 expect 404 '"error":"NOT_FOUND"' -X DELETE "${BASE}/facts/${FACT}"
+
+# Deals again: closing one, and the records that an edit and a delete leave on the timeline.
+expect 200 '"closed_at":"2' -X PATCH "${JSON[@]}" -d '{"stage":"WON","monthly_value_cents":50000}' "${BASE}/deals/${DEAL}"
+expect 200 'Deal Smoke Test deal: stage changed from QUALIFYING to WON' "${BASE}/companies/${ID}/activities?kind=STAGE_CHANGE"
+expect 200 'Deal Smoke Test deal edited: monthly_value_cents None to 50000' "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+expect 200 '"items":\[\]' "${BASE}/deals?company_id=${ID}&open=true"
+expect 200 '"service_ids":\["web-development"\]' "${BASE}/deals/${DEAL}"
+expect 204 '' -X DELETE "${BASE}/deals/${DEAL}"
+expect 200 'Deal Smoke Test deal deleted' "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+
+# The change log (specs/018-change-log/spec.md): an edit of any record leaves the old value on the timeline.
+expect 200 '"city":"Atlanta"' -X PATCH "${JSON[@]}" -d '{"city":"Atlanta"}' "${BASE}/companies/${ID}"
+expect 200 "Company Smoke Test edited: city None to 'Atlanta'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+expect 200 '"title":"Smoke task 2"' -X PATCH "${JSON[@]}" -d '{"title":"Smoke task 2"}' "${BASE}/tasks/${TASK}"
+expect 200 "Task Smoke task edited: title 'Smoke task' to 'Smoke task 2'" "${BASE}/companies/${ID}/activities?kind=SYSTEM&limit=200"
 
 # The Today view (specs/006-today/spec.md). The overdue task goes with the test company.
 expect 201 '"due_date":"2020-01-01"' -X POST "${JSON[@]}" \
