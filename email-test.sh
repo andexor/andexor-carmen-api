@@ -6,7 +6,7 @@
 #
 # The preview normally sends nothing (EMAIL_PROVIDER is STUB), and neither does the pipeline's
 # smoke test (preview-test.sh). This script is the real test: it sends today's digest of the
-# preview's data, and an alert for each agreement that is due one, to the setting digest.recipient
+# preview's data, whatever the day and also when there is nothing to report, and an alert for each agreement that is due one, to the setting digest.recipient
 # of the preview database. Run it when a template or the sending has changed.
 #
 # Usage:
