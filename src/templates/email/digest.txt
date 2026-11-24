@@ -1,4 +1,2 @@
 Carmen digest for {{date}}
-Good morning. This is the Carmen digest for {{date}}.
-
 {{sections}}

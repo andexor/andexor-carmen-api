@@ -25,7 +25,7 @@ DEFAULT_HOUR = 7  # used only when the setting digest.hour_local is missing or i
 DAY_NAMES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 DEFAULT_DAYS = frozenset(DAY_NAMES[:5])  # used only when the setting digest.days is missing or names no day
 # What a digest says on a day with nothing to report. It is still sent: silence would not say that Carmen looked.
-NOTHING = "Nothing needs you today: no task is due or overdue, no agreement is in its renewal window, and no lead is waiting for a score."
+NOTHING = "Nothing to report"
 
 # The lists of a digest, in the order they are shown, each with its heading.
 SECTIONS = (
