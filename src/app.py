@@ -3458,10 +3458,12 @@ async def renewal_alerts(env: Any, provider: notify.Provider, date: str, notice_
 async def daily_digest(
     env: Any, provider: notify.Provider, settings: dict[str, str], date: str, notice_days: int, recipient: str, now: bool
 ) -> str:
-    """Send today's digest when its hour has come and none was made today. Says what was done.
-    With now, the hour and an earlier digest do not matter: a person asked for it."""
+    """Send today's digest when its day and hour have come and none was made today. Says what was done.
+    With now, the day, the hour, and an earlier digest do not matter: a person asked for it."""
     database = env.DB
-    due, began = notify.digest_window(settings.get("digest.time_zone"), settings.get("digest.hour_local"))
+    due, began = notify.digest_window(
+        settings.get("digest.time_zone"), settings.get("digest.hour_local"), settings.get("digest.days")
+    )
     if not now:
         if not due:
             return "NOT_DUE"
@@ -3477,9 +3479,9 @@ async def daily_digest(
             database.prepare(TODAY_UNSCORED).bind(DIGEST_ROWS),
         ]
     )
+    # A day with nothing to report still gets its digest, which says so (specs/023-weekday-digest/spec.md).
     sections = notify.digest_sections({name: result["results"] for name, result in zip(names, results, strict=True)})
-    if not sections:
-        return "EMPTY"
+    sections = sections or notify.NOTHING
     subject, body = notify.render("digest", date=date, sections=sections)
     stored = await (await notification(env, provider, "DAILY_DIGEST", recipient, subject, body)).first()
     return str(stored["status"])

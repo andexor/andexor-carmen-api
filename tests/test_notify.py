@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import notify  # noqa: E402
 
 ZONE = "America/New_York"
+DAYS = "MON,TUE,WED,THU,FRI"
 
 
 class DigestWindow(unittest.TestCase):
@@ -23,23 +24,45 @@ class DigestWindow(unittest.TestCase):
         before = datetime(2026, 11, 24, 11, 59, tzinfo=UTC)  # 06:59 local
         at = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)  # 07:00 local
         late = datetime(2026, 11, 25, 4, 30, tzinfo=UTC)  # 23:30 local, still the 24th
-        self.assertEqual(notify.digest_window(ZONE, "7", before), (False, "2026-11-24T05:00:00Z"))
-        self.assertEqual(notify.digest_window(ZONE, "7", at), (True, "2026-11-24T05:00:00Z"))
-        self.assertEqual(notify.digest_window(ZONE, "7", late), (True, "2026-11-24T05:00:00Z"))
+        self.assertEqual(notify.digest_window(ZONE, "7", DAYS, before), (False, "2026-11-24T05:00:00Z"))
+        self.assertEqual(notify.digest_window(ZONE, "7", DAYS, at), (True, "2026-11-24T05:00:00Z"))
+        self.assertEqual(notify.digest_window(ZONE, "7", DAYS, late), (True, "2026-11-24T05:00:00Z"))
 
     def test_the_day_begins_at_local_midnight_in_daylight_time_too(self):
         summer = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)  # 08:00 local, four hours behind
-        self.assertEqual(notify.digest_window(ZONE, "9", summer), (False, "2026-07-01T04:00:00Z"))
+        self.assertEqual(notify.digest_window(ZONE, "9", DAYS, summer), (False, "2026-07-01T04:00:00Z"))
+
+    def test_the_digest_is_due_only_on_the_days_of_the_setting(self):
+        # 2026-11-24 is a Tuesday. Noon UTC is 07:00 in New York.
+        due = {day: notify.digest_window(ZONE, "7", DAYS, datetime(2026, 11, day, 12, 0, tzinfo=UTC))[0] for day in range(23, 30)}
+        self.assertEqual(due, {23: True, 24: True, 25: True, 26: True, 27: True, 28: False, 29: False})
+        saturday = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
+        self.assertTrue(notify.digest_window(ZONE, "7", " sat , Sun", saturday)[0])
+        self.assertFalse(notify.digest_window(ZONE, "7", "SAT", datetime(2026, 11, 27, 12, 0, tzinfo=UTC))[0])
+
+    def test_the_day_is_the_local_day_not_the_day_in_utc(self):
+        # Saturday 02:00 UTC is still Friday evening in New York.
+        self.assertTrue(notify.digest_window(ZONE, "7", DAYS, datetime(2026, 11, 28, 2, 0, tzinfo=UTC))[0])
+
+    def test_missing_or_unreadable_days_mean_monday_to_friday(self):
+        for days in (None, "", "no days here", ","):
+            self.assertTrue(notify.digest_window(ZONE, "7", days, datetime(2026, 11, 24, 12, 0, tzinfo=UTC))[0], days)
+            self.assertFalse(notify.digest_window(ZONE, "7", days, datetime(2026, 11, 28, 12, 0, tzinfo=UTC))[0], days)
 
     def test_a_missing_zone_or_hour_falls_back(self):
         noon = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
-        self.assertEqual(notify.digest_window(None, None, noon), (True, "2026-11-24T00:00:00Z"))
-        self.assertEqual(notify.digest_window("No/Such_Zone", "not an hour", noon), (True, "2026-11-24T00:00:00Z"))
-        self.assertEqual(notify.digest_window("UTC", "99", noon)[0], True)  # 99 is no hour: the default is used
+        self.assertEqual(notify.digest_window(None, None, DAYS, noon), (True, "2026-11-24T00:00:00Z"))
+        self.assertEqual(notify.digest_window("No/Such_Zone", "not an hour", DAYS, noon), (True, "2026-11-24T00:00:00Z"))
+        self.assertEqual(notify.digest_window("UTC", "99", DAYS, noon)[0], True)  # 99 is no hour: the default is used
 
 
 class Messages(unittest.TestCase):
-    def test_no_digest_when_every_list_is_empty(self):
+    def test_a_digest_with_nothing_to_report_says_so(self):
+        subject, body = notify.render("digest", date="2026-11-24", sections=notify.digest_sections({}) or notify.NOTHING)
+        self.assertEqual(subject, "Carmen digest for 2026-11-24")
+        self.assertIn("Nothing needs you today", body)
+
+    def test_the_lists_are_empty_text_when_every_list_is_empty(self):
         self.assertEqual(notify.digest_sections({}), "")
         self.assertEqual(notify.digest_sections({"tasks_due": [], "leads_unscored": []}), "")
 

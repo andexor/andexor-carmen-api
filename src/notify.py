@@ -22,6 +22,10 @@ logger = logging.getLogger("carmen")
 
 TEMPLATES = pathlib.Path(__file__).parent / "templates" / "email"
 DEFAULT_HOUR = 7  # used only when the setting digest.hour_local is missing or is not an hour
+DAY_NAMES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+DEFAULT_DAYS = frozenset(DAY_NAMES[:5])  # used only when the setting digest.days is missing or names no day
+# What a digest says on a day with nothing to report. It is still sent: silence would not say that Carmen looked.
+NOTHING = "Nothing needs you today: no task is due or overdue, no agreement is in its renewal window, and no lead is waiting for a score."
 
 # The lists of a digest, in the order they are shown, each with its heading.
 SECTIONS = (
@@ -36,11 +40,12 @@ class NotifyError(Exception):
     """A message could not be written. The text is safe to log."""
 
 
-def digest_window(zone: str | None, hour: str | None, now: datetime | None = None) -> tuple[bool, str]:
-    """Whether the digest hour has come today in the time zone, and the moment today began, in UTC.
+def digest_window(zone: str | None, hour: str | None, days: str | None, now: datetime | None = None) -> tuple[bool, str]:
+    """Whether the digest is due now in the time zone, and the moment today began, in UTC.
 
-    The digest is due at its hour or any later hour of the day, so a missed run is made up by the
-    next one. A missing or unknown zone falls back to UTC. now is the current moment unless a test gives one.
+    The digest is due on a day named in days (such as "MON,TUE,WED,THU,FRI"), at its hour or any
+    later hour of that day, so a missed run is made up by the next one. A missing or unknown zone
+    falls back to UTC. now is the current moment unless a test gives one.
     """
     local = (now or datetime.now(UTC)).astimezone(UTC)
     try:
@@ -50,7 +55,8 @@ def digest_window(zone: str | None, hour: str | None, now: datetime | None = Non
         pass
     at = int(hour) if hour and hour.isdigit() and int(hour) < 24 else DEFAULT_HOUR
     began = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
-    return local.hour >= at, began.strftime("%Y-%m-%dT%H:%M:%SZ")
+    on = {name.strip().upper() for name in (days or "").split(",")} & set(DAY_NAMES) or DEFAULT_DAYS
+    return DAY_NAMES[local.weekday()] in on and local.hour >= at, began.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def render(name: str, **values: str) -> tuple[str, str]:
@@ -77,7 +83,7 @@ def _line(name: str, row: dict[str, Any]) -> str:
 
 
 def digest_sections(lists: dict[str, list[dict[str, Any]]]) -> str:
-    """The lists of a digest as text. Empty when every list is empty: then no digest is sent."""
+    """The lists of a digest as text. Empty when every list is empty: the digest then says NOTHING."""
     parts: list[str] = []
     for name, heading in SECTIONS:
         rows = lists.get(name) or []
