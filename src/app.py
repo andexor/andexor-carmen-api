@@ -15,6 +15,7 @@ Deals: specs/007-deals/spec.md.
 Agreements and documents: specs/008-agreements-and-documents/spec.md.
 AI models and runs: specs/009-ai-runs/spec.md.
 CSV import: specs/013-csv-import/spec.md.
+Machine methods: specs/014-machine-methods/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -74,7 +75,7 @@ from records import (
     local_date,
     slug,
 )
-from roles import ADMIN, DELETE, MANAGE, PUBLIC, READ, WRITE, action, allowed
+from roles import ADMIN, DELETE, MACHINE, MACHINE_CALLER, MANAGE, PUBLIC, READ, WRITE, action, allowed
 from scoring import Row, from_fact, measured, notable, points, score, valid_config
 
 logging.basicConfig(level=logging.INFO)
@@ -177,19 +178,21 @@ async def resolve_identity(request: Request) -> tuple[Identity | None, JSONRespo
 
         email = claims.get("email")
         if not email:
-            # A service token: a machine caller. It never gets an app_user row.
+            # A service token: a machine caller. It never gets an app_user row. In every environment it
+            # may call the machine methods and nothing else. The preview's test token is the one
+            # exception: it acts as ADMIN, so that the smoke test can call every endpoint.
+            if not claims.get("common_name"):
+                return None, error(request, 403)
             try:
-                is_admin = bool(claims.get("common_name")) and env_var(env, "SERVICE_TOKENS_ARE_ADMIN") == "true"
+                is_admin = env_var(env, "SERVICE_TOKENS_ARE_ADMIN") == "true"
             except Exception as e:
                 log_error(request, "read_service_token_rule", e)
                 return None, error(request, 500)
-            if not is_admin:
-                return None, error(request, 403)
             return {
                 "id": None,
                 "email": None,
                 "display_name": None,
-                "role": ADMIN,
+                "role": ADMIN if is_admin else MACHINE_CALLER,
                 "active": 1,
                 "created_at": None,
                 "machine": True,
@@ -1470,34 +1473,40 @@ async def list_facts(
     return page(result, limit, cursor)
 
 
+def fact_inserts(database: Any, company_id: str, given: object, source: str, types: dict[str, str]) -> list[Any]:
+    """One INSERT for each fact of a request. types holds the value type of each well-known key.
+    Raises BadBody for anything but a list of facts that each have a key and a value."""
+    if not isinstance(given, list) or not given:
+        raise BadBody("facts must be a list with at least one fact")
+    statements: list[Any] = []
+    for entry in cast(list[Any], given):
+        values = fact_fields(entry)
+        values["key"] = fact_key(values.get("key") or "")
+        if not values["key"] or not values.get("value"):
+            raise BadBody("a fact needs a key and a value")
+        values["value"] = fact_value(values["value"], types.get(values["key"]))
+        values.update(id=str(uuid.uuid4()), company_id=company_id, source=source)
+        statements.append(insert(database, "enrichment_fact", values))
+    return statements
+
+
 @app.post("/api/v1/companies/{company_id}/facts")
 @action(WRITE)
 async def create_facts(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
-    given: Any = body.get("facts", [body])  # many facts under "facts", or the body is one fact
-    if not isinstance(given, list) or not given:
-        return error(request, 400)
-
     try:
         company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
         known = await db(request).prepare("SELECT key, value_type FROM enrichment_key").all()
     except Exception as e:
         return failed(request, "load_fact_keys", e)
-    if not company:
-        return error(request, 404)
     types: dict[str, str] = {row["key"]: row["value_type"] for row in known["results"]}
 
-    statements: list[Any] = []
     try:
-        for entry in cast(list[Any], given):
-            values = fact_fields(entry)
-            values["key"] = fact_key(values.get("key") or "")
-            if not values["key"] or not values.get("value"):
-                raise BadBody("a fact needs a key and a value")
-            values["value"] = fact_value(values["value"], types.get(values["key"]))
-            values.update(id=str(uuid.uuid4()), company_id=company_id, source="MANUAL")
-            statements.append(insert(db(request), "enrichment_fact", values))
+        # Many facts under "facts", or the body is one fact.
+        statements = fact_inserts(db(request), company_id, body.get("facts", [body]), "MANUAL", types)
     except BadBody as e:
         return failed(request, "read_facts", e)
+    if not company:
+        return error(request, 404)
 
     try:
         # All of them or none: one transaction.
@@ -3167,3 +3176,190 @@ async def undo_import(request: Request, import_id: str) -> JSONResponse:
     except Exception as e:
         return failed(request, "undo_import", e)
     return JSONResponse({"deleted": len(rows), "kept": kept})
+
+
+# ---- Machine methods -----------------------------------------------------------------------------
+# specs/014-machine-methods/spec.md. Another Andexor service sends a lead, or facts about a company.
+# create_lead and add_facts are written once, here, with no request. Each has two doors onto it: a
+# method on the Worker entry point (src/worker.py) for a Worker that calls over a Service Binding,
+# and an endpoint for a caller with a Cloudflare Access service token.
+
+LEAD_FIELDS: dict[str, type] = dict.fromkeys(("source", "name", "website", "source_ref", "note"), str)
+LEAD_CONTACT_FIELDS: dict[str, type] = {field: kind for field, kind in CONTACT_FIELDS.items() if field != "is_primary"}
+
+
+class StepFailed(Exception):
+    """A database step of a machine method failed. The door that was used logs it and answers."""
+
+    def __init__(self, step: str, cause: Exception) -> None:
+        super().__init__(step)
+        self.step, self.cause = step, cause
+
+
+async def fact_types(database: Any, source: str) -> tuple[dict[str, str], str]:
+    """The value type of each well-known fact key, and the fact source for a lead source: the same
+    code when facts may carry it, and API otherwise."""
+    try:
+        known = await database.prepare("SELECT key, value_type FROM enrichment_key").all()
+        sql = "SELECT 1 AS found FROM srt WHERE domain = 'ENRICHMENT_SOURCE' AND code = ? AND active = 1"
+        same = await database.prepare(sql).bind(source).first()
+    except Exception as e:
+        raise StepFailed("load_fact_keys", e) from e
+    return {row["key"]: row["value_type"] for row in known["results"]}, source if same else "API"
+
+
+async def find_lead(database: Any, domain: str | None, source: str, source_ref: str | None) -> Row | None:
+    """The company a lead belongs to: the unarchived one with its domain, or else the one this source sent before."""
+    try:
+        company: Row | None = None
+        if domain:
+            sql = "SELECT id FROM company WHERE domain = ? AND archived_at IS NULL"
+            company = await database.prepare(sql).bind(domain).first()
+        if not company and source_ref:
+            sql = "SELECT id FROM company WHERE source = ? AND source_ref = ? ORDER BY archived_at IS NOT NULL, created_at LIMIT 1"
+            company = await database.prepare(sql).bind(source, source_ref).first()
+    except Exception as e:
+        raise StepFailed("find_lead", e) from e
+    return company or None
+
+
+async def create_lead(database: Any, body: Row) -> Row:
+    """Create a company from a lead, or add the lead's contact, note, and facts to the company it matches.
+    Raises BadBody for a lead that cannot be read, and StepFailed when the database fails."""
+    lead = clean(body, LEAD_FIELDS)
+    given: object = body.get("contact")
+    if given is not None and not isinstance(given, dict):
+        raise BadBody("contact must be an object")
+    contact = clean(cast(Row, given or {}), LEAD_CONTACT_FIELDS)
+    source: str | None = lead.get("source")
+    if not source:
+        raise BadBody("source is required")
+    if contact and not (contact.get("name") or contact.get("email")):
+        raise BadBody("a contact needs a name or an email")
+    # A form may give only a person. Then the company is named after them until someone learns more.
+    name: str | None = lead.get("name") or (None if lead.get("website") else contact.get("name") or contact.get("email"))
+    if not (name or lead.get("website")):
+        raise BadBody("a lead needs a name, a website, or a contact")
+    domain = derive_domain(lead.get("website"))
+    types, fact_source = await fact_types(database, source)
+
+    for attempt in (1, 2):
+        company = await find_lead(database, domain, source, lead.get("source_ref"))
+        company_id: str = company["id"] if company else str(uuid.uuid4())
+        statements: list[Any] = []
+        known: list[Row] = []
+        if company:
+            try:
+                found = await database.prepare("SELECT name, email, is_primary FROM contact WHERE company_id = ?").bind(company_id).all()
+                known = found["results"]
+            except Exception as e:
+                raise StepFailed("load_contacts", e) from e
+        else:
+            values = {"id": company_id, "name": name, "website": lead.get("website"), "domain": domain}
+            statements.append(insert(database, "company", {**values, "source": source, "source_ref": lead.get("source_ref")}))
+
+        # The same person is not added twice: matched on the email, or on the name when there is no email.
+        who = "email" if contact.get("email") else "name"
+        contact_id: str | None = None
+        if contact and not any((row[who] or "").lower() == contact[who].lower() for row in known):
+            contact_id = str(uuid.uuid4())
+            primary = 0 if any(row["is_primary"] for row in known) else 1
+            statements.append(insert(database, "contact", {**contact, "id": contact_id, "company_id": company_id, "is_primary": primary}))
+        if lead.get("note"):
+            entry = {"id": str(uuid.uuid4()), "company_id": company_id, "contact_id": contact_id, "kind": "NOTE", "body": lead["note"]}
+            statements.append(insert(database, "activity", entry))
+        if body.get("facts"):
+            statements += fact_inserts(database, company_id, body["facts"], fact_source, types)
+
+        try:
+            if statements:
+                await database.batch(statements)  # all of it or none: one transaction
+            return {"company_id": company_id, "created": not company}
+        except Exception as e:
+            if not company and attempt == 1 and db_status(e) == 409:
+                continue  # another call made the company with this domain first: match it, and add to it
+            raise StepFailed("store_lead", e) from e
+    raise StepFailed("store_lead", RuntimeError("the lead matched no company and could not be created"))
+
+
+async def add_facts(database: Any, body: Row) -> Row:
+    """Add facts to the company with an id, or to the unarchived company with a domain.
+    Raises BadBody, LookupError for no such company, and StepFailed when the database fails."""
+    wanted = clean(body, dict.fromkeys(("company_id", "domain", "source"), str))
+    if not wanted.get("source"):
+        raise BadBody("source is required")
+    try:
+        if wanted.get("company_id"):
+            company = await database.prepare("SELECT id FROM company WHERE id = ?").bind(wanted["company_id"]).first()
+        elif derive_domain(wanted.get("domain")):
+            sql = "SELECT id FROM company WHERE domain = ? AND archived_at IS NULL"
+            company = await database.prepare(sql).bind(derive_domain(wanted["domain"])).first()
+        else:
+            raise BadBody("company_id or domain is required")
+    except BadBody:
+        raise
+    except Exception as e:
+        raise StepFailed("find_company", e) from e
+    if not company:
+        raise LookupError("no such company")
+    types, _ = await fact_types(database, wanted["source"])
+    statements = fact_inserts(database, company["id"], body.get("facts"), wanted["source"], types)
+    try:
+        await database.batch(statements)
+    except Exception as e:
+        raise StepFailed("store_facts", e) from e
+    return {"added": len(statements)}
+
+
+MachineMethod = Callable[[Any, Row], Awaitable[Row]]
+
+
+async def machine_call(env: Any, method: MachineMethod, given: Any) -> Row:
+    """The Service Binding door. It never raises: an error that crosses a Service Binding arrives with a
+    whole traceback (measured 2026-11-24), so a refusal is an answer instead: ok false, an error code
+    as on the endpoints, and a message that is safe to show."""
+
+    def refused(code: str, message: str) -> Row:
+        return {"ok": False, "error": code, "message": message}
+
+    try:
+        body: Any = given.to_py() if hasattr(given, "to_py") else given  # a JavaScript object, or already a dict
+        if not isinstance(body, dict):
+            return refused("BAD_REQUEST", "The argument must be an object")
+        return {"ok": True, **(await method(env.DB, cast(Row, body)))}
+    except BadBody as e:
+        return refused("BAD_REQUEST", str(e))
+    except LookupError:
+        return refused("NOT_FOUND", "No such company")
+    except Exception as e:
+        cause = e.cause if isinstance(e, StepFailed) else e
+        step = e.step if isinstance(e, StepFailed) else "machine_call"
+        logger.error(json.dumps({"event": "carmen_error", "step": step, "error": type(cause).__name__, "description": str(cause)}))
+        if db_status(cause) == 400:
+            return refused("BAD_REQUEST", "The database refused a value, such as a code it does not know")
+        return refused("INTERNAL", "Carmen could not store it")
+
+
+async def machine_answer(request: Request, method: MachineMethod, body: Row) -> JSONResponse:
+    """The endpoint door."""
+    try:
+        result = await method(db(request), body)
+    except BadBody as e:
+        return failed(request, "read_machine_call", e)
+    except LookupError:
+        return error(request, 404)
+    except StepFailed as e:
+        return failed(request, e.step, e.cause)
+    return JSONResponse(result, status_code=201 if result.get("created") else 200)
+
+
+@app.post("/api/v1/machine/leads")
+@action(MACHINE)
+async def machine_lead(request: Request, body: dict[str, Any]) -> JSONResponse:
+    return await machine_answer(request, create_lead, body)
+
+
+@app.post("/api/v1/machine/facts")
+@action(MACHINE)
+async def machine_facts(request: Request, body: dict[str, Any]) -> JSONResponse:
+    return await machine_answer(request, add_facts, body)

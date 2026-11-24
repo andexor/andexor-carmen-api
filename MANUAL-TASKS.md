@@ -56,3 +56,13 @@ No billing account should be needed for this API. If the console asks for one, s
 - [X] Apply the four migrations (`0006` to `0009`) to production. Applied on 2026-11-24; the preview and production are both at schema version 9. Production held no companies and no answers at the time.
 - [X] Recompute the stored scores in production. Not needed: production held no companies and no answers when the Need direction changed (checked on 2026-11-24).
 - [ ] After feature 015 (scheduler and notifications): send one real digest from the running Worker and confirm it reaches the inbox. That closes master question Q5.
+
+## A service token for production (for later)
+
+Not needed now. The Contact Us service is a Worker and calls Carmen over a Service Binding, which needs no token. Do this when a caller that is not a Worker, such as Andexor Grass Spider, has to reach production (`specs/014-machine-methods/spec.md`).
+
+- [ ] In Cloudflare Zero Trust, under Access, Service credentials, create a service token named for the caller.
+- [ ] In the production Access application for Carmen, add a policy with the action Service Auth that includes only that token.
+- [ ] Give the token's client id and client secret to the caller as secrets. Never commit them.
+- [ ] Do not set `SERVICE_TOKENS_ARE_ADMIN` for production. Without it the token may call `POST /api/v1/machine/leads` and `POST /api/v1/machine/facts` and nothing else.
+

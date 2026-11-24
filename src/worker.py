@@ -9,11 +9,20 @@ from typing import Any
 
 from workers import asgi
 
-from app import app, process_import, process_run
+from app import add_facts, app, create_lead, machine_call, process_import, process_run
 
 
 class Default(asgi.entrypoint(app)):
     """Requests go to the FastAPI application. A message on the RUNS queue carries one AI run or one CSV import."""
+
+    # The machine methods, for another Worker that calls over a Service Binding: await env.CARMEN.create_lead({...}).
+    # See specs/014-machine-methods/spec.md. Only a Worker of this account that binds this one can call them.
+
+    async def create_lead(self, lead: Any) -> dict[str, Any]:
+        return await machine_call(getattr(self, "env"), create_lead, lead)
+
+    async def add_facts(self, facts: Any) -> dict[str, Any]:
+        return await machine_call(getattr(self, "env"), add_facts, facts)
 
     async def queue(self, batch: Any, *_: Any) -> None:
         env: Any = getattr(self, "env")
