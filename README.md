@@ -19,6 +19,7 @@ src/scoring.py       the scoring engine: points, Fit, Need, confidence, recommen
 src/ai.py            AI adapters (stub, Claude), and the cleaning of what a model returns
 src/prompts/         the prompts a model is given, as files with {{name}} placeholders
 src/pages.py         reads a company's own website for a model that cannot search
+src/imports.py       the rules of a CSV import: reading the file, the column mapping, one row
 src/access.py        Cloudflare Access token verification
 src/roles.py         who may do what
 tests/               unit tests, run by unit-test.sh
@@ -37,8 +38,8 @@ reports/             license and vulnerability reports, written by setup.sh
 | Worker | `andexor-carmen-api` | `andexor-carmen-api-preview` |
 | Route | `carmen.andexor.net/api/*` | `carmen-preview.andexor.net/api/*` |
 | D1 database | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
-| R2 bucket for documents (`DOCS`) | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
-| Queue for AI runs (`RUNS`) | `andexor-carmen-api-runs-prod` | `andexor-carmen-api-runs-prev` |
+| R2 bucket for documents and import files (`DOCS`) | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
+| Queue for AI runs and CSV imports (`RUNS`) | `andexor-carmen-api-runs-prod` | `andexor-carmen-api-runs-prev` |
 
 Nothing is served from `workers.dev`.
 

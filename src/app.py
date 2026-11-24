@@ -14,6 +14,7 @@ The Today view: specs/006-today/spec.md.
 Deals: specs/007-deals/spec.md.
 Agreements and documents: specs/008-agreements-and-documents/spec.md.
 AI models and runs: specs/009-ai-runs/spec.md.
+CSV import: specs/013-csv-import/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -36,6 +37,7 @@ from starlette.exceptions import HTTPException
 
 import access
 import ai
+import imports
 from records import (
     ACTIVITY_CODES,
     ACTIVITY_FIELDS,
@@ -2898,3 +2900,270 @@ async def apply_run(request: Request, run_id: str) -> JSONResponse:
     except Exception as e:
         return failed(request, "apply_run", e)
     return JSONResponse(scores_body(scores, services))
+
+
+# ---- CSV import ----------------------------------------------------------------------------------
+# specs/013-csv-import/spec.md. import_batch holds only the counts, so the file with its mapping and
+# the result (which rows were duplicates, which failed) are objects in the bucket, under imports/<id>/.
+# The result object is also the sign that the import is finished.
+
+IMPORT_CHUNK = 50  # rows stored in one transaction
+DEFAULT_MAX_ROWS = 2000  # used only when the setting import.max_rows is missing
+PREVIEW_ROWS = 10
+# A company the import created that nobody has worked on since: undo may delete it.
+UNTOUCHED = "import_batch_id = ?1 AND stage = 'LEAD' AND archived_at IS NULL AND updated_at = created_at" + "".join(
+    f" AND NOT EXISTS (SELECT 1 FROM {table} WHERE company_id = company.id)"
+    for table in ("activity", "task", "deal", "agreement", "document", "ai_run", "rubric_answer")
+)
+
+CsvRows = list[tuple[int, list[str]]]
+
+
+def import_key(import_id: str, name: str) -> str:
+    return f"imports/{import_id}/{name}.json"
+
+
+def import_log(import_id: str, step: str, detail: str) -> None:
+    logger.info(json.dumps({"event": "carmen_import", "import_id": import_id, "step": step, "detail": detail}))
+
+
+async def put_json(store: Any, key: str, value: object) -> None:
+    from pyodide.ffi import to_js
+
+    # An ArrayBuffer, as for a document: bytes would be walked one at a time by the Workers Python layer.
+    await store.put(key, to_js(json.dumps(value).encode()).buffer)
+
+
+async def get_json(store: Any, key: str) -> Any:
+    stored = await store.get(key)
+    return json.loads(str(await stored.text())) if stored else None
+
+
+async def read_csv(request: Request, body: dict[str, Any]) -> tuple[str, list[str], CsvRows] | JSONResponse:
+    """The CSV text of a request with its headers and rows, or the response that refuses it."""
+    text: object = body.get("csv")
+    try:
+        if not isinstance(text, str):
+            raise BadBody("csv must be the text of the file")
+        headers, rows = imports.parse(text)
+    except BadBody as e:
+        return failed(request, "read_csv", e)
+    try:
+        limit = await db(request).prepare("SELECT value FROM setting WHERE key = 'import.max_rows'").first()
+    except Exception as e:
+        return failed(request, "load_import_limit", e)
+    most = int(limit["value"]) if limit and str(limit["value"]).isdigit() else DEFAULT_MAX_ROWS
+    if len(rows) > most:
+        return error(request, 413)
+    return text, headers, rows
+
+
+@app.post("/api/v1/imports/preview")
+@action(WRITE)
+async def preview_import(request: Request, body: dict[str, Any]) -> JSONResponse:
+    read = await read_csv(request, body)
+    if isinstance(read, JSONResponse):
+        return read
+    _, headers, rows = read
+    return JSONResponse(
+        {
+            "headers": headers,
+            "mapping": imports.suggest(headers),
+            "targets": list(imports.TARGETS),
+            "row_count": len(rows),
+            "rows": [cells for _, cells in rows[:PREVIEW_ROWS]],
+        }
+    )
+
+
+@app.post("/api/v1/imports")
+@action(WRITE)
+async def create_import(request: Request, body: dict[str, Any]) -> JSONResponse:
+    read = await read_csv(request, body)
+    if isinstance(read, JSONResponse):
+        return read
+    text, headers, rows = read
+    file_name: object = body.get("file_name")
+    try:
+        mapping = imports.check_mapping(headers, body.get("mapping"))
+        if file_name is not None and not isinstance(file_name, str):
+            raise BadBody("file_name must be text")
+    except BadBody as e:
+        return failed(request, "read_mapping", e)
+
+    import_id = str(uuid.uuid4())
+    batch: Row = {
+        "id": import_id,
+        "source": "CSV",
+        "file_name": file_name_of(file_name),
+        "row_count": len(rows),
+        "created_by": request.state.identity["id"],
+    }
+    store, key = bucket(request), import_key(import_id, "input")
+    try:
+        # The object first, then the row, as for a document.
+        await put_json(store, key, {"csv": text, "mapping": mapping})
+    except Exception as e:
+        return failed(request, "store_import", e)
+    try:
+        await insert(db(request), "import_batch", batch).run()
+    except Exception as e:
+        log_error(request, "insert_import", e)
+        try:
+            await store.delete(key)
+        except Exception as cleanup:
+            log_error(request, "remove_orphan_import", cleanup)
+        return error(request, db_status(e))
+
+    try:
+        await request.scope["env"].RUNS.send({"import_id": import_id})
+    except Exception as e:
+        log_error(request, "queue_import", e)
+        try:
+            # An import that never reached the queue would look as if it were running forever.
+            failure: Row = {"status": "FAILED", "message": "The import could not be queued", "duplicates": [], "errors": []}
+            await put_json(store, import_key(import_id, "result"), failure)
+        except Exception as inner:
+            log_error(request, "fail_unqueued_import", inner)
+        return error(request, 500)
+    return JSONResponse({"id": import_id}, status_code=202)
+
+
+async def import_rows(database: Any, batch: Row, given: Row, result: Row) -> None:
+    """Create the companies of one import, and put its duplicates and errors in result."""
+    import_id: str = batch["id"]
+    headers, rows = imports.parse(given["csv"])
+    mapping: dict[str, str] = given["mapping"]
+    known = await database.prepare("SELECT key, value_type FROM enrichment_key").all()
+    types: dict[str, str] = {row["key"]: row["value_type"] for row in known["results"]}
+    # A domain is taken by an unarchived company, as for a company made by hand, or by an earlier row.
+    existing = await database.prepare("SELECT domain, id FROM company WHERE domain IS NOT NULL AND archived_at IS NULL").all()
+    taken: dict[str, Row] = {row["domain"]: {"company_id": row["id"]} for row in existing["results"]}
+    duplicates: list[Row] = result["duplicates"]
+    errors: list[Row] = result["errors"]
+
+    ready: list[tuple[int, str | None, list[Any]]] = []
+    for number, cells in rows:
+        try:
+            company, contact, facts = imports.row_values(headers, cells, mapping, types)
+        except BadBody as e:
+            errors.append({"row": number, "error": str(e)})
+            continue
+        domain: str | None = company["domain"]
+        if domain and domain in taken:
+            duplicates.append({"row": number, "domain": domain, **taken[domain]})
+            continue
+        if domain:
+            taken[domain] = {"of_row": number}
+        company.update(id=str(uuid.uuid4()), source="CSV", import_batch_id=import_id)
+        statements = [insert(database, "company", company)]
+        if contact:
+            contact.update(id=str(uuid.uuid4()), company_id=company["id"], is_primary=1)
+            statements.append(insert(database, "contact", contact))
+        for key, value in facts:
+            fact = {"id": str(uuid.uuid4()), "company_id": company["id"], "key": key, "value": value}
+            fact.update(source="CSV", source_detail=batch["file_name"])
+            statements.append(insert(database, "enrichment_fact", fact))
+        ready.append((number, domain, statements))
+
+    created = 0
+    counts = "UPDATE import_batch SET created_count = ?, duplicate_count = ?, error_count = ? WHERE id = ?"
+    for start in range(0, len(ready), IMPORT_CHUNK):
+        chunk = ready[start : start + IMPORT_CHUNK]
+        try:
+            await database.batch([statement for _, _, statements in chunk for statement in statements])
+            created += len(chunk)
+        except Exception as e:
+            import_log(import_id, "chunk_refused", f"{type(e).__name__}: {e}")
+            # shortcut: a refused chunk is stored one row at a time, and an invocation may make 1,000 queries; halve refused chunks instead if imports grow past a few thousand rows
+            for number, domain, statements in chunk:
+                try:
+                    await database.batch(statements)
+                    created += 1
+                except Exception as inner:
+                    import_log(import_id, "row_refused", f"row {number}: {type(inner).__name__}: {inner}")
+                    if db_status(inner) == 409:  # someone added the company while the import ran
+                        duplicates.append({"row": number, "domain": domain})
+                    else:
+                        errors.append({"row": number, "error": "The database refused the row"})
+        # After every chunk, so that the counts show progress while the import runs.
+        await database.prepare(counts).bind(created, len(duplicates), len(errors), import_id).run()
+    if not ready:
+        await database.prepare(counts).bind(0, len(duplicates), len(errors), import_id).run()
+    duplicates.sort(key=lambda entry: entry["row"])
+    errors.sort(key=lambda entry: entry["row"])
+    import_log(import_id, "finished", f"created {created}, duplicates {len(duplicates)}, errors {len(errors)}")
+
+
+async def process_import(env: Any, import_id: str) -> None:
+    """Carry out one queued import. Never raises: a failure is recorded in the result."""
+    database, store = env.DB, env.DOCS
+    result: Row = {"status": "DONE", "message": None, "duplicates": [], "errors": []}
+    try:
+        batch = await database.prepare("SELECT * FROM import_batch WHERE id = ?").bind(import_id).first()
+        if not batch or await get_json(store, import_key(import_id, "result")):
+            return import_log(import_id, "skipped", "no such import, or it is finished")
+        begun = await database.prepare("SELECT COUNT(*) AS n FROM company WHERE import_batch_id = ?").bind(import_id).first()
+        if begun["n"]:
+            # Delivered a second time: the first attempt was cut off. Its companies stay, and undo removes them.
+            result.update(status="FAILED", message="The import was interrupted and did not finish")
+        else:
+            await import_rows(database, batch, await get_json(store, import_key(import_id, "input")), result)
+    except Exception as e:
+        import_log(import_id, "failed", f"{type(e).__name__}: {e}")
+        result.update(status="FAILED", message="The import failed before it finished")
+    try:
+        await put_json(store, import_key(import_id, "result"), result)
+    except Exception as e:
+        import_log(import_id, "result_not_stored", f"{type(e).__name__}: {e}")
+
+
+@app.get("/api/v1/imports/{import_id}")
+@action(READ)
+async def get_import(request: Request, import_id: str) -> JSONResponse:
+    try:
+        batch = await db(request).prepare("SELECT * FROM import_batch WHERE id = ?").bind(import_id).first()
+    except Exception as e:
+        return failed(request, "load_import", e)
+    if not batch:
+        return error(request, 404)
+    try:
+        result = await get_json(bucket(request), import_key(import_id, "result"))
+    except Exception as e:
+        return failed(request, "load_import_result", e)
+    return JSONResponse({**batch, **(result or {"status": "RUNNING", "message": None, "duplicates": [], "errors": []})})
+
+
+# WRITE, not DELETE: a MEMBER may undo an import they made. may_delete decides.
+@app.delete("/api/v1/imports/{import_id}")
+@action(WRITE)
+async def undo_import(request: Request, import_id: str) -> JSONResponse:
+    database = db(request)
+    try:
+        batch = await database.prepare("SELECT * FROM import_batch WHERE id = ?").bind(import_id).first()
+        finished = batch and await get_json(bucket(request), import_key(import_id, "result"))
+    except Exception as e:
+        return failed(request, "load_import", e)
+    if not batch:
+        return error(request, 404)
+    if not may_delete(request, batch["created_by"]):
+        return error(request, 403)
+    if not finished:
+        return error(request, 409)  # still running
+
+    try:
+        found = await database.prepare(f"SELECT * FROM company WHERE {UNTOUCHED}").bind(import_id).all()
+        rows: list[Row] = found["results"]
+        for row in rows:
+            # The timeline is deleted with the company, so the Worker log is the only record of this delete.
+            log_change(request, describe_change(company_label(row), held(row, COMPANY_FIELDS), None), row["id"])
+        outcome = await database.batch(
+            [
+                database.prepare(f"DELETE FROM company WHERE {UNTOUCHED}").bind(import_id),
+                database.prepare("SELECT COUNT(*) AS n FROM company WHERE import_batch_id = ?").bind(import_id),
+            ]
+        )
+        kept = outcome[1]["results"][0]["n"]
+    except Exception as e:
+        return failed(request, "undo_import", e)
+    return JSONResponse({"deleted": len(rows), "kept": kept})

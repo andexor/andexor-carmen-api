@@ -286,3 +286,33 @@ expect 200 '"role":"ADMIN"' -H "Origin: https://not-allowed.invalid" "${BASE}/me
 header no "^access-control-allow-origin"
 # A preflight (OPTIONS) is not checked here: Cloudflare Access answers it with 403 before the API
 # sees it, even with the service token, until the setting in MANUAL-TASKS.md is turned on.
+
+# CSV import (specs/013-csv-import/spec.md): three rows, of which one repeats a website and one has no company.
+TAG="imp${RANDOM}${RANDOM}"
+CSV=$(printf 'Company,Website,First Name,Last Name,Email,Founded\nImport One,https://www.%s.example,Ann,Lee,ann@%s.example,1999\nImport Two,%s.example,,,,\n,,Bob,,,\n' "${TAG}" "${TAG}" "${TAG}")
+expect 200 '"First Name":"contact.name"' -X POST -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg csv "${CSV}" '{csv: $csv}')" "${BASE}/imports/preview"
+expect 400 '"error":"BAD_REQUEST"' -X POST -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg csv "${CSV}" '{csv: $csv, mapping: {Email: "contact.email"}}')" "${BASE}/imports"
+MAPPING='{"Company":"company.name","Website":"company.website","First Name":"contact.name","Last Name":"contact.name","Email":"contact.email","Founded":"fact"}'
+expect 202 '"id"' -X POST -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg csv "${CSV}" --argjson mapping "${MAPPING}" '{csv: $csv, file_name: "smoke.csv", mapping: $mapping}')" "${BASE}/imports"
+IMPORT=$(jq -r '.id' "${BODY}")
+for _ in $(seq 30); do
+    expect 200 '"row_count":3' "${BASE}/imports/${IMPORT}" > /dev/null
+    [[ "$(jq -r '.status' "${BODY}")" != "RUNNING" ]] && break
+    sleep 2
+done
+expect 200 '"status":"DONE"' "${BASE}/imports/${IMPORT}"
+if [[ "$(jq -c '[.created_count, .duplicate_count, .error_count, .duplicates[0].row, .duplicates[0].of_row, .errors[0].row]' "${BODY}")" != "[1,1,1,3,2,4]" ]]; then
+    echo "FAILED: the import counted $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: the import created 1 company, and reported row 3 as a duplicate and row 4 as an error"
+expect 200 '"source":"CSV"' "${BASE}/companies?q=${TAG}"
+IMPORTED=$(jq -r --arg d "${TAG}.example" '.items[] | select(.domain == $d) | .id' "${BODY}")
+expect 200 '"name":"Ann Lee"' "${BASE}/companies/${IMPORTED}/contacts"
+expect 200 '"key":"founded"' "${BASE}/companies/${IMPORTED}/facts"
+expect 200 '"deleted":1,"kept":0' -X DELETE "${BASE}/imports/${IMPORT}"
+expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${IMPORTED}"
+expect 404 '"error":"NOT_FOUND"' "${BASE}/imports/00000000-0000-4000-8000-00000000dead"
