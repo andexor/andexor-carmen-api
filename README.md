@@ -12,7 +12,7 @@ Work follows Spec Kit. The feature backlog is section 13 of the PRD.
 ```
 PRD.md               what this app must do (frozen)
 specs/               Spec Kit specifications; 000-repo-setup records what changed since the PRD
-src/worker.py        the Worker entry point: requests, the queue, and the machine methods over a Service Binding
+src/worker.py        the Worker entry point: requests, the queue, the hourly scheduler, and the machine methods over a Service Binding
 src/app.py           the FastAPI application: identity, role check, endpoints
 src/records.py       what a caller may write to each kind of record, the date rule, and the domain rule
 src/scoring.py       the scoring engine: points, Fit, Need, confidence, recommendation
@@ -21,6 +21,8 @@ src/prompts/         the prompts a model is given, as files with {{name}} placeh
 src/pages.py         reads a company's own website for a model that cannot search
 src/imports.py       the rules of a CSV import: reading the file, the column mapping, one row
 src/access.py        Cloudflare Access token verification
+src/notify.py        notifications: when the digest is due, what a message says, the email providers
+src/templates/email/ the text of each email: the first line is the subject
 src/roles.py         who may do what
 tests/               unit tests, run by unit-test.sh
 .github/workflows/   the pipeline: preview and smoke test, then production
@@ -52,6 +54,7 @@ Nothing is served from `workers.dev`.
 | `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
 | `preview-create.sh` | Finds or creates the preview database, bucket, and queue, and applies the migrations. Safe to run again |
 | `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |
+| `email-test.sh` | Runs the scheduler on the preview now with real email, on demand: today's digest and any alert that is due. Not part of the pipeline |
 | `ai-test.sh` | Tries a real AI model on the preview, on demand: list, enable, or disable models, or run one (Claude, Workers AI, or Jev with `--research`). `run` costs money. Not part of the pipeline |
 | `preview-delete.sh` | Deletes the preview Worker, the preview database, and the preview bucket if it is empty. Never touches production |
 | `health.sh` | Health check through Cloudflare Access: `./health.sh [preview\|production] [tries]` |

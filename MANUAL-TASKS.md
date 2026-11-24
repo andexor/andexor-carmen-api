@@ -55,7 +55,8 @@ No billing account should be needed for this API. If the console asks for one, s
 - [X] Merge the migration pull requests in `andexor-carmen-main`: #27, #29, #31, and #33. Merged on 2026-11-24.
 - [X] Apply the four migrations (`0006` to `0009`) to production. Applied on 2026-11-24; the preview and production are both at schema version 9. Production held no companies and no answers at the time.
 - [X] Recompute the stored scores in production. Not needed: production held no companies and no answers when the Need direction changed (checked on 2026-11-24).
-- [ ] After feature 015 (scheduler and notifications): send one real digest from the running Worker and confirm it reaches the inbox. That closes master question Q5.
+- [ ] Feature 015 (scheduler and notifications): confirm that the test alert sent from the preview on 2026-11-24, "Renewal: Test agreement from the Carmen preview", reached the inbox.
+- [ ] After the first morning in production with something to report, confirm that the digest reached the inbox. That closes master question Q5.
 
 ## A service token for production (for later)
 

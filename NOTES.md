@@ -195,3 +195,4 @@ What Jev based level 4 on: the dossier described the site as "marketing-heavy" w
 - **`andexor-net-website-ping` is not for uptime (Ed, 2026-11-24).** I had asked whether it could be used to monitor prospects. The answer is no. That project monitors clicks from the Andexor Network website. Its purpose, eventually, is to compare those clicks with other monitoring data such as Grafana metrics, to tell a bot that scrapes a page or the whole site from a human who clicks on what they want to see.
 
 **Order of work (Ed, 2026-11-24):** finish the backlog and ship what we have first. Then go through everything under "Decisions to revisit" and "Ideas parked for later".
+- **Branded HTML email (asked for on 2026-11-24, for later).** Ed wants the digest and the alerts sent as HTML in a branded template. Not now. Today every message is plain text from a file in `src/templates/email/` (feature 015), and the `send_email` binding already takes an `html` field beside `text`.
