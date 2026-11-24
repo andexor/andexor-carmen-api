@@ -132,47 +132,57 @@ def as_text(pages: list[tuple[str, str]]) -> str:
     return "\n\n".join(f"PAGE {url}\n{text}" for url, text in pages)
 
 
-def _skipped(url: str, why: str) -> None:
-    """A page that is left out is named in the Worker log, so that a run with no pages can be explained."""
-    logger.warning(json.dumps({"event": "carmen_page_skipped", "url": url[:300], "why": why}))
+def _skipped(url: str, shown: str, detail: str = "") -> str:
+    """Record a page that is left out. The Worker log gets the detail; the caller gets a short line
+    that is safe to show to a user, so that a run with missing pages can be explained."""
+    logger.warning(json.dumps({"event": "carmen_page_skipped", "url": url[:300], "why": detail or shown}))
+    return f"{url[:200]}: {shown}"
 
 
-async def fetch_page(url: str) -> tuple[str, str] | None:
-    """(the address after redirects, the HTML), or None when the page cannot be read."""
+async def fetch_page(url: str) -> tuple[str, str] | str:
+    """(the address after redirects, the HTML), or a short reason why the page cannot be read."""
     # Loaded by name: the module exists only inside a Worker.
     workers: Any = importlib.import_module("workers")
     try:
         response: Any = await workers.fetch(url, headers=FETCH_HEADERS, signal=js_module().AbortSignal.timeout(FETCH_MS))
+        status = int(response.status)
         kind = str(response.headers.get("content-type") or "").lower()
-        if int(response.status) != 200 or ("html" not in kind and "text/plain" not in kind):
-            _skipped(url, f"status {int(response.status)}, content type {kind[:60] or 'none'}")
-            return None
+        if status != 200:
+            return _skipped(url, f"the site answered {status}", f"status {status}, content type {kind[:60] or 'none'}")
+        if "html" not in kind and "text/plain" not in kind:
+            return _skipped(url, "not a web page", f"status 200, content type {kind[:60] or 'none'}")
         return str(response.url or url), str(await response.text())[:MAX_HTML]
     except Exception as e:
-        _skipped(url, f"{type(e).__name__}: {str(e)[:200]}")
-        return None
+        name = type(e).__name__
+        shown = f"no answer in {FETCH_MS // 1000} seconds" if "Timeout" in name or "Abort" in name else f"could not be fetched ({name})"
+        return _skipped(url, shown, f"{name}: {str(e)[:200]}")
 
 
-async def read_site(website: object, max_pages: int, fetch: Any = fetch_page) -> list[tuple[str, str]]:
-    """The home page and the pages it links to that are worth reading, as (address, text).
-    A page that cannot be fetched is left out. Empty when there is no site or nothing could be read."""
+async def read_site(website: object, max_pages: int, fetch: Any = fetch_page) -> tuple[list[tuple[str, str]], list[str]]:
+    """The home page and the pages it links to that are worth reading, as (address, text), and a
+    line for each page that was left out, saying why. A page that cannot be read never fails the
+    site: the caller decides what to do with none."""
     start = site_url(website)
     if start is None:
-        return []
+        return [], ["the company has no website address that can be fetched"]
     home = await fetch(start)
-    if home is None:
-        return []
+    if isinstance(home, str):
+        return [], [home]
     if site_url(home[0]) is None:
         # A redirect led to something that is not a public web address. Nothing of it is used.
-        _skipped(start, "redirected to an address that is not allowed")
-        return []
+        return [], [_skipped(start, "redirected to an address that is not allowed")]
     text, links = read(home[1])
     pages = [(home[0], text)] if text else []
+    skipped = [] if text else [_skipped(home[0], "no text could be read from the page")]
     for url in pick_links(home[0], links, max_pages - 1):
-        # A redirect can lead off the site, so the final address is checked again.
         got = await fetch(url)
-        if got is not None and _host(got[0]) == _host(home[0]):
-            more = read(got[1])[0]
-            if more:
-                pages.append((got[0], more))
-    return pages
+        if isinstance(got, str):
+            skipped.append(got)
+        elif _host(got[0]) != _host(home[0]):
+            # A redirect can lead off the site, so the final address is checked again.
+            skipped.append(_skipped(url, "redirected to another site"))
+        elif more := read(got[1])[0]:
+            pages.append((got[0], more))
+        else:
+            skipped.append(_skipped(got[0], "no text could be read from the page"))
+    return pages, skipped

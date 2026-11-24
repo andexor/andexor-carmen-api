@@ -385,10 +385,10 @@ class FakeSite:
         self.found = found
         self.asked: list[str] = []
 
-    async def __call__(self, url: str) -> tuple[str, str] | None:
+    async def __call__(self, url: str) -> tuple[str, str] | str:
         self.asked.append(url)
         page = self.found.get(url)
-        return None if page is None else cast(tuple[str, str], page) if isinstance(page, tuple) else (url, str(page))
+        return f"{url}: the site answered 404" if page is None else cast(tuple[str, str], page) if isinstance(page, tuple) else (url, str(page))
 
 
 class Pages(unittest.TestCase):
@@ -432,19 +432,32 @@ class Pages(unittest.TestCase):
                 "https://www.acme.com/contact/": ("https://elsewhere.example/", "<p>Not this site</p>"),
             }
         )
-        read = asyncio.run(pages.read_site("acme.com", 8, web))
+        with self.assertLogs("carmen", level="WARNING"):
+            read, skipped = asyncio.run(pages.read_site("acme.com", 8, web))
         self.assertEqual([url for url, _ in read], ["https://acme.com/", "https://acme.com/about"])
+        # Every page that was left out is named with a short reason.
+        self.assertEqual(
+            skipped,
+            [
+                "https://acme.com/services.html: the site answered 404",
+                "https://www.acme.com/contact/: redirected to another site",
+                "https://acme.com/blog/2024/about-pipes: the site answered 404",
+            ],
+        )
         self.assertEqual(len(web.asked), 5)
         self.assertEqual(len(FakeSite({}).asked), 0)
         limited = FakeSite({"https://acme.com": ("https://acme.com/", HOME)})
         asyncio.run(pages.read_site("acme.com", 2, limited))
         self.assertEqual(limited.asked, ["https://acme.com", "https://acme.com/about"])
-        self.assertEqual(asyncio.run(pages.read_site("acme.com", 8, FakeSite({}))), [])
-        self.assertEqual(asyncio.run(pages.read_site("localhost", 8, web)), [])
+        self.assertEqual(asyncio.run(pages.read_site("acme.com", 8, FakeSite({}))), ([], ["https://acme.com: the site answered 404"]))
+        self.assertEqual(asyncio.run(pages.read_site("localhost", 8, web)), ([], ["the company has no website address that can be fetched"]))
+        with self.assertLogs("carmen", level="WARNING"):
+            empty = asyncio.run(pages.read_site("acme.com", 8, FakeSite({"https://acme.com": "<script>only()</script>"})))
+        self.assertEqual(empty, ([], ["https://acme.com: no text could be read from the page"]))
         # A home page that redirects to an address literal is not used.
         inside = FakeSite({"https://acme.com": ("http://169.254.169.254/latest/", HOME)})
         with self.assertLogs("carmen", level="WARNING"):
-            self.assertEqual(asyncio.run(pages.read_site("acme.com", 8, inside)), [])
+            self.assertEqual(asyncio.run(pages.read_site("acme.com", 8, inside)), ([], ["https://acme.com: redirected to an address that is not allowed"]))
         self.assertEqual(len(inside.asked), 1)
 
 
@@ -463,6 +476,12 @@ class WorkersAIAdapter(unittest.TestCase):
         result = asyncio.run(ai.WorkersAI(model, FakeSite(self.WEB)).run_research(None, self.LLAMA, COMPANY, "Web Hosting", KEYS, 8))
         self.assertEqual((result["dossier"], result["facts"]), ("The dossier.", facts["facts"]))
         self.assertEqual((result["input_tokens"], result["output_tokens"]), (200, 60))
+        # The pages that could not be read go with the result, for the timeline.
+        self.assertEqual(len(result["skipped_pages"]), 3)
+        self.assertIn("; 3 pages could not be read: https://acme.com/services.html: the site answered 404; ", ai.skipped_note(result))
+        self.assertEqual(ai.skipped_note({"skipped_pages": ["a: x"]}), "; 1 page could not be read: a: x")
+        self.assertTrue(ai.skipped_note({"skipped_pages": ["p"] * 7}).endswith("; and 2 more"))
+        self.assertEqual((ai.skipped_note({}), ai.skipped_note({"skipped_pages": "bad"}), ai.skipped_note(ai.stub_research({}))), ("", "", ""))
         first, second = model.calls[0][1], model.calls[1][1]
         prompt = first["messages"][0]["content"]
         self.assertIn("PAGE https://acme.com/\nAcme Plumbing", prompt)
@@ -477,8 +496,8 @@ class WorkersAIAdapter(unittest.TestCase):
 
     def test_no_readable_page_fails_the_run_before_any_model_is_called(self):
         model = FakeModel()
-        for company in ({"name": "Acme"}, COMPANY):
-            with self.assertRaisesRegex(ai.RunError, "No page"):
+        for company, why in (({"name": "Acme"}, "no website address"), (COMPANY, r"https://acme\.com: the site answered 404\)\. This model")):
+            with self.assertRaisesRegex(ai.RunError, f"No page.*{why}"):
                 asyncio.run(ai.WorkersAI(model, FakeSite({})).run_research(None, "m", company, "s", KEYS, 8))
         self.assertEqual(model.calls, [])
 

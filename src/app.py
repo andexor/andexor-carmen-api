@@ -2554,7 +2554,7 @@ async def research_statements(env: Any, run: Row, model: Row) -> tuple[list[Any]
     statements = [
         insert(database, "ai_run_fact", {"id": str(uuid.uuid4()), "ai_run_id": run["id"], **fact}) for fact in facts
     ]
-    return statements, {**output, "dossier": dossier}, f"{len(facts)} facts proposed"
+    return statements, {**output, "dossier": dossier}, f"{len(facts)} facts proposed{ai.skipped_note(output)}"
 
 
 async def scoring_statements(env: Any, run: Row, model: Row) -> tuple[list[Any], Row, str]:

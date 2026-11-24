@@ -108,3 +108,4 @@ I did not try changing the User-Agent, which is the one thing on our side that c
 - The 403 was not caused by `robots.txt`. A server does not enforce that file, the page reader does not read it, and that site's file allows the home page.
 - Sites tried from the Worker: `www.cloudflare.com` and `www.mozilla.org` were read; `www.python.org` answered 403 on its home page. Three sites are too few to say how often a real prospect's site will refuse.
 - Open choice, not built: have the page reader obey `robots.txt`.
+- Built afterward (issue #35, `specs/020-page-fetch-reasons/spec.md`): the run's failure message now names the page and the reason, such as that the site answered 403, and a run that read only some pages says so on the company's timeline.
