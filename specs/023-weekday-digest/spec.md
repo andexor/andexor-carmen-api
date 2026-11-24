@@ -29,7 +29,7 @@ Every working morning one email arrives. On a quiet day it says that nothing nee
    **Then** one digest is sent.
 2. **Given** no task is due or overdue, no agreement is in its renewal window, and no lead waits for a score,\
    **When** the digest is made,\
-   **Then** it is sent, and its body says that nothing needs attention today.
+   **Then** it is sent, and its body is "Nothing to report".
 3. **Given** today is not a day named in `digest.days`,\
    **When** the scheduler runs,\
    **Then** no digest is made, and the answer is `NOT_DUE`.
@@ -51,7 +51,8 @@ Every working morning one email arrives. On a quiet day it says that nothing nee
 
 - **FR-001**: A digest is made when today is a day named in the setting `digest.days`, the local hour is at or after `digest.hour_local`, and no digest was made since local midnight.
 - **FR-002**: `digest.days` holds day names from `MON`, `TUE`, `WED`, `THU`, `FRI`, `SAT`, `SUN`. Its value is `MON,TUE,WED,THU,FRI`. Code holds the same list as the fallback for a missing or unreadable setting.
-- **FR-003**: A digest is sent also when all four lists are empty. Its body then says: "Nothing needs you today: no task is due or overdue, no agreement is in its renewal window, and no lead is waiting for a score."
+- **FR-003**: A digest is sent also when all four lists are empty. Its body is then "Nothing to report".
+- **FR-006**: The body of a digest holds only its lists, or "Nothing to report". It has no greeting and no opening line (issue #49, 2026-11-24). The subject is "Carmen digest for <date>".
 - **FR-004**: The answer `digest` of a run is `NOT_DUE`, `ALREADY_MADE`, or the status of the digest that was made. `EMPTY` is no longer an answer.
 - **FR-005**: The provider is unchanged: `CLOUDFLARE` in production, and `STUB` in the preview, where a real email is sent only on demand with `./email-test.sh`.
 

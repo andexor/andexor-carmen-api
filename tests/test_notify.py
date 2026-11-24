@@ -60,7 +60,7 @@ class Messages(unittest.TestCase):
     def test_a_digest_with_nothing_to_report_says_so(self):
         subject, body = notify.render("digest", date="2026-11-24", sections=notify.digest_sections({}) or notify.NOTHING)
         self.assertEqual(subject, "Carmen digest for 2026-11-24")
-        self.assertIn("Nothing needs you today", body)
+        self.assertEqual(body, "Nothing to report\n")
 
     def test_the_lists_are_empty_text_when_every_list_is_empty(self):
         self.assertEqual(notify.digest_sections({}), "")
@@ -84,8 +84,7 @@ class Messages(unittest.TestCase):
     def test_the_first_line_of_a_template_is_the_subject(self):
         subject, body = notify.render("digest", date="2026-11-24", sections="Tasks due today (1)\n- Call")
         self.assertEqual(subject, "Carmen digest for 2026-11-24")
-        self.assertIn("Tasks due today (1)\n- Call", body)
-        self.assertNotIn("{{", body)
+        self.assertEqual(body, "Tasks due today (1)\n- Call\n")  # no greeting: the body starts with the first list
 
     def test_a_template_with_a_missing_value_or_no_file_is_an_error(self):
         with self.assertRaises(notify.NotifyError):
