@@ -531,5 +531,95 @@ class WorkersAIAdapter(unittest.TestCase):
         self.assertIsInstance(ai.ADAPTERS["WORKERS_AI"], ai.WorkersAI)
 
 
+def judged(**answers: Any) -> tuple[int, Row]:
+    """A canned TypeSafe reply. A number is a noul; anything else is the answer as given."""
+    shaped = {name.replace("_answerable", ".answerable"): {"type": "noul", "noul": value} if isinstance(value, float) else value for name, value in answers.items()}
+    return 200, {"model": "jev-1.14.0", "answers": shaped, "usage": {"input_tokens": 900, "output_tokens": 12}}
+
+
+def levels(top: int, chance: float = 0.6) -> Row:
+    rest = (1 - chance) / 5
+    return {"type": "score", "score": float(top), "confidence": 0.5, "probabilities": {str(level): chance if level == top else rest for level in range(6)}}
+
+
+class TypeSafeAdapter(unittest.TestCase):
+    ASKED = [CRITERIA[0], CRITERIA[1], {**CRITERIA[2], "enrichment_key": "employee_count"}, CRITERIA[3]]
+    MATERIAL = ai.material({"name": "Acme", "website": "https://acme.com"}, [{"key": "employee_count", "value": "12"}], "They fix pipes.\n\nFACTS are few.")
+    JEV = {"model_id": "jev-latest"}
+
+    def test_the_material_is_sent_as_named_parts(self):
+        parts = ai.material_parts(self.MATERIAL)
+        self.assertEqual(parts["company"], {"name": "Acme", "website": "https://acme.com"})
+        self.assertEqual(parts["dossier"], "They fix pipes.\n\nFACTS are few.")
+        self.assertEqual(parts["facts"], {"employee_count": "12"})
+        # A part with nothing in it is left out, and text of another shape is sent whole.
+        self.assertEqual(set(ai.material_parts(ai.material({"name": "Acme"}, []))), {"company"})
+        self.assertEqual(ai.material_parts("just text"), {"material": "just text"})
+
+    def test_each_criterion_is_one_typed_question(self):
+        asked = ai.typesafe_questions([{**CRITERIA[0], "help": "Look at the address."}, *self.ASKED[1:], criterion("empty", "CHOICE")])
+        self.assertEqual(asked["c1"], {"type": "noul", "instructions": "Question c1? (Look at the address.)"})
+        self.assertEqual((asked["c2"]["type"], len(asked["c2"]["criteria"])), ("score", 6))
+        self.assertEqual(asked["c4"], {"type": "choice", "instructions": "Question c4?", "criteria": {"A": "A", "B": "B"}})
+        # Every question gets a companion question; a number and a choice with no options are not asked.
+        self.assertEqual(set(asked), {"c1", "c1.answerable", "c2", "c2.answerable", "c4", "c4.answerable"})
+        self.assertEqual(asked["c2.answerable"]["type"], "noul")
+        self.assertIn("Question c2?", asked["c2.answerable"]["instructions"])
+
+    def test_a_settled_judgment_becomes_an_answer_and_an_unsettled_one_is_left_unknown(self):
+        parts = ai.material_parts(self.MATERIAL)
+        choice = {"type": "choice", "choice": "B", "confidence": 0.7, "probabilities": {"A": 0.2, "B": 0.8}}
+        _, reply = judged(c1=0.9, c1_answerable=0.35, c2=levels(4), c2_answerable=0.8, c4=choice, c4_answerable=0.95)
+        got = {answer["criterion_id"]: answer for answer in ai.typesafe_answers(self.ASKED, reply["answers"], parts)}
+        self.assertEqual((got["c1"]["value"], got["c1"]["probability"]), ("YES", 0.9))
+        self.assertEqual((got["c2"]["value"], got["c2"]["probability"]), ("4", 0.6))
+        self.assertEqual((got["c4"]["value"], got["c4"]["probability"]), ("B", 0.8))
+        # A number is taken from the facts, not from the model.
+        self.assertEqual((got["c3"]["value"], got["c3"]["probability"], got["c3"]["rationale"]), ("12", None, "Taken from the fact employee_count."))
+        # Jev writes no reason, so the rationale holds its numbers. A sure answer on thin material is marked.
+        self.assertEqual(got["c1"]["rationale"], "Jev: yes 0.90. Enough information to answer: 0.35 (weak evidence).")
+        self.assertEqual(got["c2"]["rationale"], "Jev: level 4 at 0.60. Enough information to answer: 0.80.")
+        self.assertEqual(got["c4"]["rationale"], "Jev: B at 0.80. Enough information to answer: 0.95.")
+        kept, dropped = ai.clean_answers(list(got.values()), CRITERIA)
+        self.assertEqual((len(kept), dropped), (4, 0))
+
+        _, no = judged(c1=0.1)
+        self.assertEqual([(a["value"], a["probability"], a["rationale"]) for a in ai.typesafe_answers(self.ASKED[:1], no["answers"], {})], [("NO", 0.9, "Jev: no 0.90.")])
+        # Between the thresholds, a companion that is not sure, a missing answer, a damaged one, and a number with no fact.
+        _, unsure = judged(c1=0.5, c2=levels(4), c2_answerable=0.4, c4=choice)
+        self.assertEqual(ai.typesafe_answers(self.ASKED, unsure["answers"], {}), [])
+        _, damaged = judged(c1={"type": "noul", "noul": "high"}, c2={"type": "score", "probabilities": {}}, c2_answerable=0.9, c4="B", c4_answerable=0.9)
+        self.assertEqual(ai.typesafe_answers(self.ASKED, damaged["answers"], {}), [])
+
+    def test_scoring_is_one_request_with_the_material_and_every_question(self):
+        fake = FakeClaude(judged(c1=0.9))
+        result = asyncio.run(ai.TypeSafe(fake).score(None, self.JEV, self.ASKED, self.MATERIAL))
+        body = fake.bodies[0]
+        self.assertEqual((body["model"], body["state"]), ("jev-latest", ai.material_parts(self.MATERIAL)))
+        self.assertEqual(body["questions"], ai.typesafe_questions(self.ASKED))
+        self.assertEqual({answer["criterion_id"] for answer in result["answers"]}, {"c1", "c3"})
+        self.assertEqual((result["input_tokens"], result["output_tokens"], result["model_id_used"]), (900, 12, "jev-1.14.0"))
+
+    def test_only_number_criteria_need_no_request(self):
+        fake = FakeClaude()
+        result = asyncio.run(ai.TypeSafe(fake).score(None, self.JEV, self.ASKED[2:3], self.MATERIAL))
+        self.assertEqual((fake.bodies, len(result["answers"]), result["input_tokens"]), ([], 1, 0))
+
+    def test_a_failed_call_is_an_error_and_never_an_answer(self):
+        failure = {"detail": "state is too long: " + "x" * 50}
+        with self.assertLogs("carmen", level="ERROR"), self.assertRaises(ai.RunError) as caught:
+            asyncio.run(ai.TypeSafe(FakeClaude((400, failure))).score(None, self.JEV, self.ASKED, self.MATERIAL))
+        self.assertEqual(str(caught.exception), "The TypeSafe API answered 400")
+        with self.assertLogs("carmen", level="ERROR"), self.assertRaisesRegex(ai.RunError, "429.*too many requests"):
+            asyncio.run(ai.TypeSafe(FakeClaude((429, {}))).score(None, self.JEV, self.ASKED, self.MATERIAL))
+        with self.assertRaises(ai.BadOutput):
+            asyncio.run(ai.TypeSafe(FakeClaude((200, {"answers": "none"}))).score(None, self.JEV, self.ASKED, self.MATERIAL))
+
+    def test_the_model_cannot_research_and_is_registered(self):
+        with self.assertRaisesRegex(ai.RunError, "cannot research"):
+            asyncio.run(ai.TypeSafe().research(None, self.JEV, COMPANY))
+        self.assertIsInstance(ai.ADAPTERS["TYPESAFE"], ai.TypeSafe)
+
+
 if __name__ == "__main__":
     unittest.main()

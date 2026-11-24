@@ -399,8 +399,8 @@ class Config(unittest.TestCase):
             self.assertEqual(environment["d1_databases"][0]["binding"], "DB")
             self.assertEqual(environment["r2_buckets"][0]["binding"], "DOCS")
             self.assertEqual(environment["queues"]["producers"][0]["binding"], "RUNS")
-            # The Claude key is bound in both, so that the adapter can be tried on the preview first.
-            self.assertEqual(environment["secrets_store_secrets"][0]["binding"], "CLAUDE_API_KEY")
+            # The provider keys are bound in both, so that an adapter can be tried on the preview first.
+            self.assertEqual([secret["binding"] for secret in environment["secrets_store_secrets"]], ["CLAUDE_API_KEY", "TYPESAFE_API_KEY"])
             # Workers AI is an account-wide service: the binding is the same in both.
             self.assertEqual(environment["ai"], {"binding": "AI"})
             # The prompt files are packaged with the Worker.

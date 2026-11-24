@@ -58,6 +58,11 @@ def valid_config(answer_type: str, text: str | None) -> bool:
         return False
     if not isinstance(config, dict):
         return False
+    # A measured yes-or-no criterion: see measured().
+    if "yes_at" in config and (answer_type != "YES_NO" or _number(cast(Row, config)["yes_at"]) is None):
+        return False
+    if "measured" in config and (answer_type != "YES_NO" or not isinstance(cast(Row, config)["measured"], bool)):
+        return False
     rows = cast(Row, config).get({"NUMBER": "bands", "CHOICE": "choices"}.get(answer_type, ""), [])
     if not isinstance(rows, list):
         return False
@@ -110,6 +115,39 @@ def points(criterion: Row, value: object) -> float | None:
     return min(1.0, max(0.0, earned))
 
 
+def measured(criterion: Row) -> bool:
+    """True when the criterion is measured, not judged: a yes-or-no question that names the fact
+    that holds the measurement, and whose configuration has "yes_at" or "measured": true. No model
+    is asked such a question. With "yes_at" the number decides. With only "measured": true there is
+    no rule yet, so the criterion stays unknown until a person answers it: this is for a question,
+    such as whether a site is reliably up, that reading a website cannot answer.
+    See specs/021-measured-criteria/spec.md."""
+    config = _config(criterion)
+    return (
+        criterion.get("answer_type") == "YES_NO"
+        and bool(criterion.get("enrichment_key"))
+        and (_number(config.get("yes_at")) is not None or config.get("measured") is True)
+    )
+
+
+def from_fact(criterion: Row, facts: dict[str, Any]) -> Row | None:
+    """The answer to a measured criterion, from the fact it names: YES when the number is at or above
+    "yes_at", NO when it is below. None when there is no such fact or it is not a number, and then
+    the criterion is unknown."""
+    if not measured(criterion):
+        return None
+    key = str(criterion["enrichment_key"])
+    number, limit = _number(facts.get(key)), _number(_config(criterion).get("yes_at"))
+    if number is None or limit is None:
+        return None
+    return {
+        "criterion_id": criterion["id"],
+        "value": "YES" if number >= limit else "NO",
+        "probability": None,
+        "rationale": f"Measured, not judged: the fact {key} is {number:g}, and {limit:g} or more is YES.",
+    }
+
+
 def _percent(part: float, whole: float) -> int:
     return int(100 * part / whole + 0.5)  # halves round up
 
@@ -133,7 +171,8 @@ def score(criteria: list[Row], answers: dict[str, Any], services: list[Row], thr
 
     criteria are rubric_criterion rows, answers map a criterion id to its answer value, services are
     service rows, and thresholds are the score.* settings. Retired criteria and services are ignored.
-    Unknown never lowers a score; it lowers confidence.
+    Unknown never lowers a score; it lowers confidence. Fit is the share of points earned. Need is
+    the share of points not earned: a good answer to a Need question means little need.
     """
     active = [criterion for criterion in criteria if criterion.get("active", 1)]
     fit_earned, fit_answered, fit_total = _tally([c for c in active if c["section"] == "FIT"], answers)
@@ -148,7 +187,12 @@ def score(criteria: list[Row], answers: dict[str, Any], services: list[Row], thr
         own = [c for c in active if c["section"] == "NEED" and c["service_id"] == service["id"]]
         earned, done, total = _tally(own, answers)
         if done:
-            service_need = _percent(earned, done)
+            # Every question is worded so that yes, or a high value, is the good outcome, and points
+            # say how good an answer is. A need is where an answer is false or low. That translation
+            # is made here, once, for every Need question: Need is the share of the points that were
+            # NOT earned. No question carries a setting for it, and nobody has to flip anything in
+            # their head (constitution, Principle VII; specs/022-need-direction/spec.md).
+            service_need = _percent(done - earned, done)
             per_service[service["id"]] = {"need_score": service_need, "confidence": _percent(done, total)}
         # A service that is not offered is recorded but never counts toward Need or confidence.
         # A service with no answer yet is not in play: looking into one need never requires the others.

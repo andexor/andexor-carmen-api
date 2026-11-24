@@ -94,6 +94,11 @@
                     "binding": "CLAUDE_API_KEY",
                     "store_id": "9981f1115d4747dc92397cb729164810",
                     "secret_name": "carmen-claude-api-key"
+                },
+                {
+                    "binding": "TYPESAFE_API_KEY",
+                    "store_id": "9981f1115d4747dc92397cb729164810",
+                    "secret_name": "carmen-typesafe-api-key"
                 }
             ],
             "rules": [
@@ -137,6 +142,11 @@
             "binding": "CLAUDE_API_KEY",
             "store_id": "9981f1115d4747dc92397cb729164810",
             "secret_name": "carmen-claude-api-key"
+        },
+        {
+            "binding": "TYPESAFE_API_KEY",
+            "store_id": "9981f1115d4747dc92397cb729164810",
+            "secret_name": "carmen-typesafe-api-key"
         }
     ],
     "rules": [
