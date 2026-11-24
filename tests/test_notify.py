@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andexor Network, Inc.
+# Author: Ed Jenkins
+
+"""Unit tests for the rules of notifications. See specs/015-scheduler-and-notifications/spec.md."""
+
+import pathlib
+import sys
+import unittest
+from datetime import UTC, datetime
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+import notify  # noqa: E402
+
+ZONE = "America/New_York"
+
+
+class DigestWindow(unittest.TestCase):
+    def test_the_digest_is_due_at_its_hour_and_later_in_the_local_day(self):
+        # 2026-11-24 is in standard time: New York is five hours behind UTC.
+        before = datetime(2026, 11, 24, 11, 59, tzinfo=UTC)  # 06:59 local
+        at = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)  # 07:00 local
+        late = datetime(2026, 11, 25, 4, 30, tzinfo=UTC)  # 23:30 local, still the 24th
+        self.assertEqual(notify.digest_window(ZONE, "7", before), (False, "2026-11-24T05:00:00Z"))
+        self.assertEqual(notify.digest_window(ZONE, "7", at), (True, "2026-11-24T05:00:00Z"))
+        self.assertEqual(notify.digest_window(ZONE, "7", late), (True, "2026-11-24T05:00:00Z"))
+
+    def test_the_day_begins_at_local_midnight_in_daylight_time_too(self):
+        summer = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)  # 08:00 local, four hours behind
+        self.assertEqual(notify.digest_window(ZONE, "9", summer), (False, "2026-07-01T04:00:00Z"))
+
+    def test_a_missing_zone_or_hour_falls_back(self):
+        noon = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
+        self.assertEqual(notify.digest_window(None, None, noon), (True, "2026-11-24T00:00:00Z"))
+        self.assertEqual(notify.digest_window("No/Such_Zone", "not an hour", noon), (True, "2026-11-24T00:00:00Z"))
+        self.assertEqual(notify.digest_window("UTC", "99", noon)[0], True)  # 99 is no hour: the default is used
+
+
+class Messages(unittest.TestCase):
+    def test_no_digest_when_every_list_is_empty(self):
+        self.assertEqual(notify.digest_sections({}), "")
+        self.assertEqual(notify.digest_sections({"tasks_due": [], "leads_unscored": []}), "")
+
+    def test_a_digest_shows_only_the_lists_that_hold_something(self):
+        text = notify.digest_sections(
+            {
+                "tasks_overdue": [{"title": "Call back", "company_name": "Acme", "due_date": "2026-11-20"}],
+                "agreements_renewing": [{"title": None, "type": "MSA", "company_name": "Acme", "end_date": "2026-12-01"}],
+                "leads_unscored": [{"name": None, "domain": "new.example"}],
+            }
+        )
+        self.assertEqual(
+            text,
+            "Tasks overdue (1)\n- Call back (Acme), due 2026-11-20\n\n"
+            "Agreements in their renewal window (1)\n- MSA (Acme), ends 2026-12-01\n\n"
+            "Leads waiting for a score (1)\n- new.example",
+        )
+
+    def test_the_first_line_of_a_template_is_the_subject(self):
+        subject, body = notify.render("digest", date="2026-11-24", sections="Tasks due today (1)\n- Call")
+        self.assertEqual(subject, "Carmen digest for 2026-11-24")
+        self.assertIn("Tasks due today (1)\n- Call", body)
+        self.assertNotIn("{{", body)
+
+    def test_a_template_with_a_missing_value_or_no_file_is_an_error(self):
+        with self.assertRaises(notify.NotifyError):
+            notify.render("renewal", title="MSA")
+        with self.assertRaises(notify.NotifyError):
+            notify.render("no-such-template")
+
+    def test_the_renewal_alert_names_the_agreement_and_its_dates(self):
+        subject, body = notify.render(
+            "renewal", title="MSA", company="Acme", end_date="2026-12-24", notice_date="2026-11-24", renews="It renews automatically."
+        )
+        self.assertEqual(subject, "Renewal: MSA ends 2026-12-24")
+        self.assertIn("with Acme ends on 2026-12-24. It renews automatically.", body)
+
+
+class Providers(unittest.TestCase):
+    def test_only_a_named_provider_sends_and_anything_else_is_the_stub(self):
+        self.assertEqual(notify.provider("CLOUDFLARE").status, "SENT")
+        for name in ("STUB", "", None, "undefined", "cloudflare"):
+            self.assertEqual(notify.provider(name).status, "STUBBED", name)
+
+
+if __name__ == "__main__":
+    unittest.main()

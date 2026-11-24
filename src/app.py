@@ -16,6 +16,7 @@ Agreements and documents: specs/008-agreements-and-documents/spec.md.
 AI models and runs: specs/009-ai-runs/spec.md.
 CSV import: specs/013-csv-import/spec.md.
 Machine methods: specs/014-machine-methods/spec.md.
+The scheduler and notifications: specs/015-scheduler-and-notifications/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -39,6 +40,7 @@ from starlette.exceptions import HTTPException
 import access
 import ai
 import imports
+import notify
 from records import (
     ACTIVITY_CODES,
     ACTIVITY_FIELDS,
@@ -1593,6 +1595,13 @@ TODAY_TASKS = (
     " WHERE t.status = 'OPEN' AND t.due_date {} ? ORDER BY t.due_date, t.created_at, t.id LIMIT ?"
 )
 TODAY_LEADS = "SELECT * FROM company WHERE stage = 'LEAD' AND archived_at IS NULL AND {} LIMIT ?"
+TODAY_UNSCORED = TODAY_LEADS.format("fit_score IS NULL AND need_score IS NULL ORDER BY created_at DESC, id")
+# Binds: the default notice days twice, today's date, and the limit.
+TODAY_RENEWING = (
+    f"SELECT a.*, c.name AS company_name, {NOTICE_DATE} AS notice_date FROM agreement a"
+    " JOIN company c ON c.id = a.company_id WHERE a.status = 'ACTIVE' AND a.end_date IS NOT NULL"
+    f" AND {NOTICE_DATE} <= ? ORDER BY a.end_date, a.id LIMIT ?"
+)
 
 
 @app.get("/api/v1/today")
@@ -1615,9 +1624,7 @@ async def today(request: Request, limit: int = Query(50, ge=1, le=200)) -> JSONR
         database.prepare(TODAY_TASKS.format("<")).bind(date, limit),
         database.prepare(TODAY_TASKS.format("=")).bind(date, limit),
         # Leads waiting for a first score, newest first.
-        database.prepare(
-            TODAY_LEADS.format("fit_score IS NULL AND need_score IS NULL ORDER BY created_at DESC, id")
-        ).bind(limit),
+        database.prepare(TODAY_UNSCORED).bind(limit),
         # Reach out before Maybe, then the highest scores.
         database.prepare(
             TODAY_LEADS.format(
@@ -1631,11 +1638,7 @@ async def today(request: Request, limit: int = Query(50, ge=1, le=200)) -> JSONR
             " WHERE d.stage NOT IN ('WON', 'LOST') AND NOT EXISTS"
             " (SELECT 1 FROM task t WHERE t.deal_id = d.id AND t.status = 'OPEN') ORDER BY d.updated_at, d.id LIMIT ?"
         ).bind(limit),
-        database.prepare(
-            f"SELECT a.*, c.name AS company_name, {NOTICE_DATE} AS notice_date FROM agreement a"
-            " JOIN company c ON c.id = a.company_id WHERE a.status = 'ACTIVE' AND a.end_date IS NOT NULL"
-            f" AND {NOTICE_DATE} <= ? ORDER BY a.end_date, a.id LIMIT ?"
-        ).bind(notice_days, notice_days, date, limit),
+        database.prepare(TODAY_RENEWING).bind(notice_days, notice_days, date, limit),
         # The dossier is left out: it can be long.
         database.prepare(
             "SELECT r.id, r.company_id, c.name AS company_name, r.kind, r.ai_model_id, r.status, r.created_at,"
@@ -3363,3 +3366,195 @@ async def machine_lead(request: Request, body: dict[str, Any]) -> JSONResponse:
 @action(MACHINE)
 async def machine_facts(request: Request, body: dict[str, Any]) -> JSONResponse:
     return await machine_answer(request, add_facts, body)
+
+
+# ---- Scheduler and notifications -----------------------------------------------------------------
+# Run every hour by the Cron Trigger (src/worker.py), with no request and no caller: env is used
+# directly, and nothing here may raise. See specs/015-scheduler-and-notifications/spec.md.
+
+DIGEST_ROWS = 50  # the most rows of one list in a digest, and the most alerts of one run
+# An alert made up to a day before the notice date counts: the stored moment is UTC, the date is local.
+ALERTS_DUE = (
+    f"SELECT a.*, c.name AS company_name, {NOTICE_DATE} AS notice_date FROM agreement a"
+    " JOIN company c ON c.id = a.company_id WHERE a.status = 'ACTIVE' AND a.end_date >= ?"
+    f" AND {NOTICE_DATE} <= ? AND NOT EXISTS (SELECT 1 FROM notification n WHERE n.kind = 'RENEWAL_ALERT'"
+    f" AND n.agreement_id = a.id AND n.created_at >= date({NOTICE_DATE}, '-1 day'))"
+    " ORDER BY a.end_date, a.id LIMIT ?"
+)
+
+
+def scheduler_log(event: str, detail: str) -> None:
+    logger.info(json.dumps({"event": f"carmen_scheduler_{event}", "detail": detail[:300]}))
+
+
+async def notification(
+    env: Any, provider: notify.Provider, kind: str, recipient: str, subject: str, body: str, agreement_id: str | None = None
+) -> Any:
+    """Send one message and return the statement that stores it. A message that could not be sent is
+    stored as FAILED with the reason, and is not tried again: the row says what happened."""
+    values: Values = {
+        "id": str(uuid.uuid4()),
+        "kind": kind,
+        "recipient": recipient,
+        "subject": subject,
+        "body": body,
+        "agreement_id": agreement_id,
+        "status": provider.status,
+    }
+    try:
+        values["provider_ref"] = await provider.send(env, recipient, subject, body)
+        if provider.status == "SENT":
+            values["sent_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception as e:
+        scheduler_log("send_failed", f"{kind}: {type(e).__name__}: {e}")
+        values.update(status="FAILED", error=f"{type(e).__name__}: {e}"[:300])
+    return insert(env.DB, "notification", values)
+
+
+async def expire_agreements(database: Any, date: str) -> int:
+    """An active agreement past its end date that does not renew by itself becomes EXPIRED."""
+    sql = "SELECT * FROM agreement WHERE status = 'ACTIVE' AND auto_renews = 0 AND end_date < ? LIMIT ?"
+    found = await database.prepare(sql).bind(date, DIGEST_ROWS).all()
+    statements: list[Any] = []
+    for agreement in found["results"]:
+        change = describe_change(agreement_label(agreement), {"status": "ACTIVE"}, {"status": "EXPIRED"})
+        change = f"{change}. It ended on {agreement['end_date']}"
+        # The record of the change: the Worker log first, then the timeline, in one transaction with the change.
+        record = {"event": "carmen_audit", "change": change, "company_id": agreement["company_id"], "by": "scheduler"}
+        logger.info(json.dumps(record))
+        entry = {"id": str(uuid.uuid4()), "company_id": agreement["company_id"], "kind": "SYSTEM", "body": change}
+        statements += [insert(database, "activity", entry), update(database, "agreement", {"status": "EXPIRED"}, agreement["id"])]
+    if statements:
+        await database.batch(statements)
+    return len(found["results"])
+
+
+async def renewal_alerts(env: Any, provider: notify.Provider, date: str, notice_days: int, recipient: str) -> int:
+    """One alert and one task for each active agreement that has reached its notice date."""
+    found = await env.DB.prepare(ALERTS_DUE).bind(notice_days, date, notice_days, date, notice_days, DIGEST_ROWS).all()
+    for agreement in found["results"]:
+        title = str(agreement["title"] or agreement["type"])
+        subject, body = notify.render(
+            "renewal",
+            title=title,
+            company=str(agreement["company_name"]),
+            end_date=str(agreement["end_date"]),
+            notice_date=str(agreement["notice_date"]),
+            renews="It renews automatically." if agreement["auto_renews"] else "It does not renew automatically.",
+        )
+        task = {
+            "id": str(uuid.uuid4()),
+            "title": f"Renewal: {title}",
+            "company_id": agreement["company_id"],
+            "agreement_id": agreement["id"],
+            "due_date": agreement["notice_date"],
+            "owner_id": agreement["owner_id"],
+        }
+        stored = await notification(env, provider, "RENEWAL_ALERT", recipient, subject, body, agreement["id"])
+        await env.DB.batch([stored, insert(env.DB, "task", task)])
+    return len(found["results"])
+
+
+async def daily_digest(
+    env: Any, provider: notify.Provider, settings: dict[str, str], date: str, notice_days: int, recipient: str, now: bool
+) -> str:
+    """Send today's digest when its hour has come and none was made today. Says what was done.
+    With now, the hour and an earlier digest do not matter: a person asked for it."""
+    database = env.DB
+    due, began = notify.digest_window(settings.get("digest.time_zone"), settings.get("digest.hour_local"))
+    if not now:
+        if not due:
+            return "NOT_DUE"
+        sql = "SELECT 1 AS found FROM notification WHERE kind = 'DAILY_DIGEST' AND created_at >= ?"
+        if await database.prepare(sql).bind(began).first():
+            return "ALREADY_MADE"
+    names = ("tasks_due", "tasks_overdue", "agreements_renewing", "leads_unscored")
+    results = await database.batch(
+        [
+            database.prepare(TODAY_TASKS.format("=")).bind(date, DIGEST_ROWS),
+            database.prepare(TODAY_TASKS.format("<")).bind(date, DIGEST_ROWS),
+            database.prepare(TODAY_RENEWING).bind(notice_days, notice_days, date, DIGEST_ROWS),
+            database.prepare(TODAY_UNSCORED).bind(DIGEST_ROWS),
+        ]
+    )
+    sections = notify.digest_sections({name: result["results"] for name, result in zip(names, results, strict=True)})
+    if not sections:
+        return "EMPTY"
+    subject, body = notify.render("digest", date=date, sections=sections)
+    stored = await (await notification(env, provider, "DAILY_DIGEST", recipient, subject, body)).first()
+    return str(stored["status"])
+
+
+async def run_scheduler(env: Any, email: bool = False) -> Row:
+    """One run of the scheduler. Never raises: a step that fails is logged and named in the answer,
+    and the other steps still run.
+
+    email is for a person who wants to see the messages: this run sends real email whatever the
+    variable EMAIL_PROVIDER says, and makes the digest now. The Cron Trigger never sets it.
+    """
+    provider = notify.PROVIDERS["CLOUDFLARE"] if email else notify.provider(getattr(env, "EMAIL_PROVIDER", None))
+    summary: Row = {"expired": 0, "alerts": 0, "digest": None, "failed": []}
+    sql = "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key = 'renewal.default_notice_days'"
+    try:
+        found = await env.DB.prepare(sql).all()
+        settings: dict[str, str] = {row["key"]: row["value"] for row in found["results"]}
+    except Exception as e:
+        scheduler_log("failed", f"load_settings: {type(e).__name__}: {e}")
+        return {**summary, "failed": ["load_settings"]}
+    notice = settings.get("renewal.default_notice_days", "")
+    notice_days = int(notice) if notice.isdigit() else 30
+    date, _ = local_date(settings.get("digest.time_zone"))
+    recipient = settings.get("digest.recipient", "")
+
+    try:
+        summary["expired"] = await expire_agreements(env.DB, date)
+    except Exception as e:
+        scheduler_log("failed", f"expire_agreements: {type(e).__name__}: {e}")
+        summary["failed"].append("expire_agreements")
+    if not recipient:
+        scheduler_log("failed", "the setting digest.recipient is missing, so nothing is sent")
+        summary["failed"].append("recipient")
+        return summary
+    try:
+        summary["alerts"] = await renewal_alerts(env, provider, date, notice_days, recipient)
+    except Exception as e:
+        scheduler_log("failed", f"renewal_alerts: {type(e).__name__}: {e}")
+        summary["failed"].append("renewal_alerts")
+    try:
+        summary["digest"] = await daily_digest(env, provider, settings, date, notice_days, recipient, email)
+    except Exception as e:
+        scheduler_log("failed", f"daily_digest: {type(e).__name__}: {e}")
+        summary["failed"].append("daily_digest")
+    scheduler_log("finished", json.dumps(summary))
+    return summary
+
+
+# For an administrator, and for the smoke test: the same run the Cron Trigger makes, now.
+# With email=true the run sends real email in any environment, and makes the digest now. The smoke test never sets it.
+@app.post("/api/v1/scheduler/run")
+@action(MANAGE)
+async def run_scheduler_now(request: Request, email: bool = False) -> JSONResponse:
+    return JSONResponse(await run_scheduler(request.scope["env"], email))
+
+
+@app.get("/api/v1/notifications")
+@action(READ)
+async def list_notifications(
+    request: Request,
+    kind: str | None = None,
+    agreement_id: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: int = Query(0, ge=0),
+) -> JSONResponse:
+    where = ["1 = 1"]
+    params: list[Any] = []
+    for condition, value in {"kind = ?": kind, "agreement_id = ?": agreement_id}.items():
+        if value is not None:
+            where.append(condition)
+            params.append(value)
+    sql = f"SELECT * FROM notification WHERE {' AND '.join(where)} ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
+    try:
+        result = await db(request).prepare(sql).bind(*params, limit + 1, cursor).all()
+    except Exception as e:
+        return failed(request, "list_notifications", e)
+    return page(result, limit, cursor)

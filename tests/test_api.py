@@ -146,6 +146,15 @@ class Routes(unittest.TestCase):
         for route in routes:
             self.assertIn(getattr(route.endpoint, "action", None), roles.ACTIONS, f"{route.path} declares no action")
 
+    def test_the_scheduler_is_run_by_an_administrator_only(self):
+        routes = {r.path: r for r in api.app.routes if isinstance(r, APIRoute)}
+        self.assertEqual(getattr(routes["/api/v1/scheduler/run"].endpoint, "action"), MANAGE)
+        self.assertEqual(getattr(routes["/api/v1/notifications"].endpoint, "action"), READ)
+
+    def test_a_scheduler_run_with_no_database_fails_as_an_answer(self):
+        answer = asyncio.run(api.run_scheduler(SimpleNamespace(DB=None)))
+        self.assertEqual(answer, {"expired": 0, "alerts": 0, "digest": None, "failed": ["load_settings"]})
+
     def test_only_health_is_public(self):
         routes = [r for r in api.app.routes if isinstance(r, APIRoute)]
         public = [r.path for r in routes if getattr(r.endpoint, "action", None) == PUBLIC]

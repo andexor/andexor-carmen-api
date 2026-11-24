@@ -350,3 +350,41 @@ SOLO_ID=$(jq -r '.company_id' "${BODY}")
 expect 200 "\"name\":\"Solo ${MTAG}\"" "${BASE}/companies/${SOLO_ID}"
 expect 204 '' -X DELETE "${BASE}/companies/${SOLO_ID}"
 expect 204 '' -X DELETE "${BASE}/companies/${LEAD_ID}"
+
+# The scheduler and notifications (specs/015-scheduler-and-notifications/spec.md). The preview's
+# provider is the stub, so no email is sent. The dates leave a margin of days, so the time zone
+# of the machine that runs this does not matter.
+STAG="sched${RANDOM}${RANDOM}"
+expect 201 '"stage":"LEAD"' "${JSON[@]}" -d "{\"name\":\"Scheduler ${STAG}\"}" "${BASE}/companies"
+SCO=$(jq -r '.id' "${BODY}")
+expect 201 '"status":"ACTIVE"' "${JSON[@]}" \
+    -d "{\"company_id\":\"${SCO}\",\"type\":\"MSA\",\"title\":\"Renewing ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '+10 days' +%F)\",\"renewal_notice_days\":30}" "${BASE}/agreements"
+RENEWING=$(jq -r '.id' "${BODY}")
+expect 201 '"status":"ACTIVE"' "${JSON[@]}" \
+    -d "{\"company_id\":\"${SCO}\",\"type\":\"MSA\",\"title\":\"Ended ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '-3 days' +%F)\"}" "${BASE}/agreements"
+ENDED=$(jq -r '.id' "${BODY}")
+expect 200 '"failed":\[\]' -X POST "${BASE}/scheduler/run"
+if [[ "$(jq -c '[.expired >= 1, .alerts >= 1]' "${BODY}")" != "[true,true]" ]]; then
+    echo "FAILED: the run should expire one agreement and alert for another: $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: the run expired an agreement and made an alert"
+expect 200 '"status":"EXPIRED"' "${BASE}/agreements/${ENDED}"
+expect 200 "It ended on" "${BASE}/companies/${SCO}/activities?kind=SYSTEM"
+expect 200 "\"subject\":\"Renewal: Renewing ${STAG} ends" "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
+expect 200 '"status":"STUBBED"' "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
+expect 200 "\"title\":\"Renewal: Renewing ${STAG}\"" "${BASE}/tasks?company_id=${SCO}"
+# A second run makes no second alert and no second task.
+expect 200 '"failed":\[\]' -X POST "${BASE}/scheduler/run"
+expect 200 '"next_cursor":null' "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
+if [[ "$(jq -c '.items | length' "${BODY}")" != "1" ]]; then
+    echo "FAILED: one alert was expected: $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: the second run made no second alert"
+# Only a draft can be deleted.
+for agreement in "${RENEWING}" "${ENDED}"; do
+    expect 200 '"status":"DRAFT"' -X PATCH -H 'Content-Type: application/json' -d '{"status":"DRAFT"}' "${BASE}/agreements/${agreement}"
+    expect 204 '' -X DELETE "${BASE}/agreements/${agreement}"
+done
+expect 204 '' -X DELETE "${BASE}/companies/${SCO}"

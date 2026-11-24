@@ -1,0 +1,4 @@
+Renewal: {{title}} ends {{end_date}}
+The agreement {{title}} with {{company}} ends on {{end_date}}. {{renews}}
+
+A task "Renewal: {{title}}" is on your list, due {{notice_date}}.

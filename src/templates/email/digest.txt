@@ -1,0 +1,4 @@
+Carmen digest for {{date}}
+Here is what needs you today, {{date}}.
+
+{{sections}}
