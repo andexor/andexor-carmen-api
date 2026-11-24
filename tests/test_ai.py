@@ -14,6 +14,7 @@ from typing import Any, cast
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
 import ai  # noqa: E402
+import pages  # noqa: E402
 
 Row = dict[str, Any]
 CHOICES = json.dumps({"choices": [{"code": "A", "points": 1}, {"code": "B", "points": 0.5}]})
@@ -92,6 +93,10 @@ class CleanFacts(unittest.TestCase):
         self.assertEqual(ai.clean_facts(raw, {"domain_expires": "DATE"}), [])
         for not_a_list in (None, "facts", {"key": "k", "value": "v"}, 5):
             self.assertEqual(ai.clean_facts(not_a_list, {}), [])
+
+    def test_a_value_that_only_says_nothing_was_found_is_dropped(self):
+        raw = [{"key": "cms", "value": "Not provided."}, {"key": "city", "value": "N/A"}, {"key": "note", "value": "Unknown to most people"}]
+        self.assertEqual([fact["key"] for fact in ai.clean_facts(raw, {})], ["note"])
 
     def test_long_text_is_cut(self):
         fact = ai.clean_facts([{"key": "k", "value": "x" * 5000}], {})[0]
@@ -172,8 +177,6 @@ class Compare(unittest.TestCase):
         self.assertEqual(rows["c3"]["runs"], {"r1": {"value": "12"}, "r2": None})
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 def reply(text: str | None = None, stop: str = "end_turn", content: list[Row] | None = None, searches: int = 0) -> Row:
@@ -235,6 +238,11 @@ class ClaudeRequests(unittest.TestCase):
         self.assertIn("- has_website (YES_NO): Do they have a site?", ai.render("facts", dossier="d", keys=ai.keys_text(KEYS)))
         with self.assertRaises(ai.RunError):
             ai.render("scoring", criteria="c")  # material has no value
+
+    def test_a_prompt_file_that_cannot_be_read_fails_the_run_and_is_logged(self):
+        with self.assertLogs("carmen", level="ERROR") as logs, self.assertRaisesRegex(ai.RunError, "could not be read"):
+            ai.render("no-such-prompt")
+        self.assertIn("carmen_prompt_error", logs.output[0])
 
     def test_criteria_are_given_as_data(self):
         lines = [json.loads(line) for line in ai.criteria_text([CRITERIA[0], CRITERIA[3]]).splitlines()]
@@ -342,3 +350,162 @@ class ClaudeAdapter(unittest.TestCase):
 
     def test_claude_is_registered(self):
         self.assertIsInstance(ai.ADAPTERS["CLAUDE"], ai.Claude)
+
+
+HOME = """<html><head><title>Acme Plumbing</title><style>p {color: red}</style><script>var hidden = 1;</script></head>
+<body><h1>We fix pipes</h1><p>Serving   Springfield
+since 1990.</p>
+<a href="/about">About us</a> <a href="/blog/2024/about-pipes">A post</a> <a href="services.html#top">What we do</a>
+<a href="https://www.acme.com/contact/">Contact</a> <a href="/">Home</a> <a href="/brochure-about.pdf">Brochure</a>
+<a href="https://other.example/about">Partner</a> <a href="mailto:x@acme.com">Mail about</a> <a href="/careers">Jobs</a>
+<a href="/about#team">Team</a></body></html>"""
+
+
+def chat(text: str | None, finish: str = "stop", refusal: str | None = None) -> Row:
+    message = {"role": "assistant", "content": text, "refusal": refusal, "reasoning": "thinking that is not the answer"}
+    return {"choices": [{"message": message, "finish_reason": finish}], "usage": {"prompt_tokens": 100, "completion_tokens": 30}}
+
+
+class FakeModel:
+    """Stands in for the AI binding: returns canned replies in order and records each request."""
+
+    def __init__(self, *replies: Row) -> None:
+        self.replies = list(replies)
+        self.calls: list[tuple[str, Row]] = []
+
+    async def __call__(self, env: Any, model_id: str, body: Row) -> Row:
+        self.calls.append((model_id, body))
+        return self.replies.pop(0)
+
+
+class FakeSite:
+    """Stands in for the web: a page is its HTML, or (the address it redirects to, its HTML)."""
+
+    def __init__(self, found: dict[str, Any]) -> None:
+        self.found = found
+        self.asked: list[str] = []
+
+    async def __call__(self, url: str) -> tuple[str, str] | None:
+        self.asked.append(url)
+        page = self.found.get(url)
+        return None if page is None else cast(tuple[str, str], page) if isinstance(page, tuple) else (url, str(page))
+
+
+class Pages(unittest.TestCase):
+    def test_a_page_is_stripped_to_its_visible_text(self):
+        text, links = pages.read(HOME)
+        self.assertEqual(text.split("\n")[:3], ["Acme Plumbing", "We fix pipes", "Serving Springfield since 1990."])
+        self.assertNotIn("hidden", text)
+        self.assertNotIn("color", text)
+        self.assertIn(("/about", "About us"), links)
+
+    def test_damaged_html_does_not_fail(self):
+        self.assertEqual(pages.read("<p>Open <b>tags <a href='x'>and <script>never closed")[0], "Open tags and")
+        self.assertEqual(pages.read(""), ("", []))
+
+    def test_only_pages_of_the_same_site_that_look_useful_are_followed(self):
+        picked = pages.pick_links("https://acme.com/", pages.read(HOME)[1], 8)
+        self.assertEqual(
+            picked,
+            ["https://acme.com/about", "https://acme.com/services.html", "https://www.acme.com/contact/", "https://acme.com/blog/2024/about-pipes"],
+        )
+        self.assertEqual(pages.pick_links("https://acme.com/", pages.read(HOME)[1], 2), picked[:2])
+        self.assertEqual(pages.pick_links("https://acme.com/", pages.read(HOME)[1], 0), [])
+
+    def test_only_a_public_web_address_is_fetched(self):
+        self.assertEqual(pages.site_url("acme.com"), "https://acme.com")
+        self.assertEqual(pages.site_url(" http://acme.com/x "), "http://acme.com/x")
+        for bad in (None, "", "localhost", "http://localhost:8787", "http://127.0.0.1/", "http://[::1]/", "ftp://acme.com", "file:///etc/passwd", "javascript:alert(1)"):
+            self.assertIsNone(pages.site_url(bad), bad)
+
+    def test_pages_are_cut_to_fit_and_a_short_page_leaves_room_for_the_next(self):
+        cut = pages.trim([("a", "x" * 10), ("b", "y" * 500), ("c", "z" * 500)], 210)
+        self.assertEqual([len(text) for _, text in cut], [10, 100, 100])
+        self.assertEqual(pages.trim([("a", "text")], 0), [])
+        self.assertEqual(pages.as_text([("https://acme.com", "Hello")]), "PAGE https://acme.com\nHello")
+
+    def test_a_site_is_read_from_its_home_page_and_a_failed_page_is_left_out(self):
+        web = FakeSite(
+            {
+                "https://acme.com": ("https://acme.com/", HOME),
+                "https://acme.com/about": "<p>About Acme</p>",
+                "https://www.acme.com/contact/": ("https://elsewhere.example/", "<p>Not this site</p>"),
+            }
+        )
+        read = asyncio.run(pages.read_site("acme.com", 8, web))
+        self.assertEqual([url for url, _ in read], ["https://acme.com/", "https://acme.com/about"])
+        self.assertEqual(len(web.asked), 5)
+        self.assertEqual(len(FakeSite({}).asked), 0)
+        limited = FakeSite({"https://acme.com": ("https://acme.com/", HOME)})
+        asyncio.run(pages.read_site("acme.com", 2, limited))
+        self.assertEqual(limited.asked, ["https://acme.com", "https://acme.com/about"])
+        self.assertEqual(asyncio.run(pages.read_site("acme.com", 8, FakeSite({}))), [])
+        self.assertEqual(asyncio.run(pages.read_site("localhost", 8, web)), [])
+
+
+class WorkersAIAdapter(unittest.TestCase):
+    LLAMA = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    WEB = {"https://acme.com": ("https://acme.com/", HOME), "https://acme.com/about": "<p>" + "About Acme. " * 20000 + "</p>"}
+
+    def test_the_pages_are_sized_to_the_model(self):
+        self.assertEqual(ai.workers_ai_limits(self.LLAMA), (6000, 16500 * 3))
+        self.assertEqual(ai.workers_ai_limits("@cf/unknown/model"), ai.workers_ai_limits(self.LLAMA))
+        self.assertEqual(ai.workers_ai_limits("@cf/zai-org/glm-5.3"), (16000, 40000 * 3))
+
+    def test_research_reads_the_site_then_asks_for_a_dossier_and_its_facts(self):
+        facts = {"facts": [{"key": "has_website", "value": "YES", "source_url": "https://acme.com/", "notes": None}]}
+        model = FakeModel(chat("The dossier."), chat(json.dumps(facts)))
+        result = asyncio.run(ai.WorkersAI(model, FakeSite(self.WEB)).run_research(None, self.LLAMA, COMPANY, "Web Hosting", KEYS, 8))
+        self.assertEqual((result["dossier"], result["facts"]), ("The dossier.", facts["facts"]))
+        self.assertEqual((result["input_tokens"], result["output_tokens"]), (200, 60))
+        first, second = model.calls[0][1], model.calls[1][1]
+        prompt = first["messages"][0]["content"]
+        self.assertIn("PAGE https://acme.com/\nAcme Plumbing", prompt)
+        self.assertIn("PAGE https://acme.com/about\nAbout Acme.", prompt)
+        self.assertIn("Web Hosting", prompt)
+        self.assertNotIn("555", prompt)
+        self.assertLess(len(prompt), 16500 * 3 + 3000)
+        self.assertEqual(first["max_tokens"], 6000)
+        self.assertNotIn("response_format", first)
+        self.assertEqual(second["response_format"]["json_schema"]["schema"], ai.FACTS_SCHEMA)
+        self.assertIn("The dossier.", second["messages"][0]["content"])
+
+    def test_no_readable_page_fails_the_run_before_any_model_is_called(self):
+        model = FakeModel()
+        for company in ({"name": "Acme"}, COMPANY):
+            with self.assertRaisesRegex(ai.RunError, "No page"):
+                asyncio.run(ai.WorkersAI(model, FakeSite({})).run_research(None, "m", company, "s", KEYS, 8))
+        self.assertEqual(model.calls, [])
+
+    def test_unreadable_facts_are_asked_for_once_more_without_fetching_again(self):
+        web = FakeSite(self.WEB)
+        model = FakeModel(chat("Dossier"), chat("not json"), chat('{"facts": []}'))
+        self.assertEqual(asyncio.run(ai.WorkersAI(model, web).run_research(None, "m", COMPANY, "s", KEYS, 8))["facts"], [])
+        self.assertEqual((len(model.calls), len(web.asked)), (3, 5))
+        with self.assertRaisesRegex(ai.RunError, "twice"):
+            twice = FakeModel(chat("Dossier"), chat("no"), chat("no"))
+            asyncio.run(ai.WorkersAI(twice, FakeSite(self.WEB)).run_research(None, "m", COMPANY, "s", KEYS, 8))
+
+    def test_a_refusal_a_cut_off_and_an_empty_dossier_fail_the_run(self):
+        for canned, message in ((chat("x", refusal="No."), "declined"), (chat("x", finish="length"), "cut off"), (chat(None), "no dossier"), ({}, "no dossier")):
+            with self.assertRaisesRegex(ai.RunError, message):
+                asyncio.run(ai.WorkersAI(FakeModel(canned), FakeSite(self.WEB)).run_research(None, "m", COMPANY, "s", KEYS, 8))
+
+    def test_scoring_is_one_request_with_a_fixed_shape(self):
+        answers = {"answers": [{"criterion_id": "c1", "value": "YES", "probability": 0.8, "rationale": "It says so."}]}
+        model = FakeModel(chat(json.dumps(answers)))
+        result = asyncio.run(ai.WorkersAI(model).score(None, {"model_id": self.LLAMA}, CRITERIA[:1], "MATERIAL TEXT"))
+        self.assertEqual((result["answers"], result["input_tokens"]), (answers["answers"], 100))
+        model_id, body = model.calls[0]
+        self.assertEqual(model_id, self.LLAMA)
+        self.assertIn("MATERIAL TEXT", body["messages"][0]["content"])
+        self.assertEqual(body["response_format"]["json_schema"]["schema"], ai.ANSWERS_SCHEMA)
+        with self.assertRaises(ai.BadOutput):
+            asyncio.run(ai.WorkersAI(FakeModel(chat("nope"))).score(None, {"model_id": "m"}, CRITERIA[:1], "x"))
+
+    def test_workers_ai_is_registered(self):
+        self.assertIsInstance(ai.ADAPTERS["WORKERS_AI"], ai.WorkersAI)
+
+
+if __name__ == "__main__":
+    unittest.main()

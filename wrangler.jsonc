@@ -104,7 +104,10 @@
                     ],
                     "fallthrough": true
                 }
-            ]
+            ],
+            "ai": {
+                "binding": "AI"
+            }
         }
     },
     "r2_buckets": [
@@ -144,5 +147,8 @@
             ],
             "fallthrough": true
         }
-    ]
+    ],
+    "ai": {
+        "binding": "AI"
+    }
 }
