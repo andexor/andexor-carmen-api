@@ -95,10 +95,17 @@ class Messages(unittest.TestCase):
 
     def test_the_renewal_alert_names_the_agreement_and_its_dates(self):
         subject, body = notify.render(
-            "renewal", title="MSA", company="Acme", end_date="2026-12-24", notice_date="2026-11-24", renews="It renews automatically."
+            "renewal",
+            heading="Ending",
+            title="MSA",
+            company="Acme",
+            end_date="2026-12-24",
+            notice_date="2026-11-24",
+            what_happens="It is marked completed.",
         )
-        self.assertEqual(subject, "Renewal: MSA ends 2026-12-24")
-        self.assertIn("with Acme ends on 2026-12-24. It renews automatically.", body)
+        self.assertEqual(subject, "Ending: MSA ends 2026-12-24")
+        self.assertIn("with Acme ends on 2026-12-24. It is marked completed.", body)
+        self.assertIn('A task "Ending: MSA" is on your list, due 2026-11-24.', body)
 
 
 class Providers(unittest.TestCase):

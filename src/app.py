@@ -17,6 +17,7 @@ AI models and runs: specs/009-ai-runs/spec.md.
 CSV import: specs/013-csv-import/spec.md.
 Machine methods: specs/014-machine-methods/spec.md.
 The scheduler and notifications: specs/015-scheduler-and-notifications/spec.md.
+The renewal policy of an agreement: specs/024-renewal-policy/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
 Error handling rule (constitution, Principle VIII): every step that can raise is inside its own
@@ -65,6 +66,7 @@ from records import (
     TASK_FIELDS,
     BadBody,
     Values,
+    add_months,
     clean,
     derive_domain,
     describe_change,
@@ -75,6 +77,7 @@ from records import (
     id_list,
     iso_date,
     local_date,
+    renewal_problem,
     slug,
 )
 from roles import ADMIN, DELETE, MACHINE, MACHINE_CALLER, MANAGE, PUBLIC, READ, WRITE, action, allowed
@@ -1971,6 +1974,8 @@ async def create_agreement(request: Request, body: dict[str, Any]) -> JSONRespon
         services = id_list(body, "service_ids") or []
         if not values.get("company_id") or not values.get("type"):
             raise BadBody("company_id and type are required")
+        if problem := renewal_problem(values):
+            raise BadBody(problem)
     except BadBody as e:
         return failed(request, "read_agreement", e)
     company_id = values["company_id"]
@@ -2053,6 +2058,8 @@ async def update_agreement(request: Request, agreement_id: str, body: dict[str, 
         changed["terminated_at"] = utc_now() if changed["status"] == "TERMINATED" else None
         if changed["terminated_at"] == current["terminated_at"]:
             del changed["terminated_at"]
+    if problem := renewal_problem({**current, **changed}):
+        return failed(request, "check_renewal_policy", BadBody(problem))
     try:
         column = await unknown_code(database, changed, AGREEMENT_CODES)
         column = column or await link_outside(database, changed, company_id)
@@ -2087,6 +2094,50 @@ async def update_agreement(request: Request, agreement_id: str, body: dict[str, 
         row = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(agreement_id).first()
     except Exception as e:
         return failed(request, "update_agreement", e)
+    return JSONResponse(agreement_out(row))
+
+
+# Approving a renewal is its own action, not an edit of the end date: the end moves forward by the
+# agreement's term, and the timeline says who approved it. See specs/024-renewal-policy/spec.md.
+@app.post("/api/v1/agreements/{agreement_id}/renewal")
+@action(WRITE)
+async def approve_renewal(request: Request, agreement_id: str) -> JSONResponse:
+    database = db(request)
+    try:
+        found = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(agreement_id).first()
+    except Exception as e:
+        return failed(request, "load_agreement", e)
+    if not found:
+        return error(request, 404)
+    renewable = found["status"] == "ACTIVE" and found["renewal_policy"] == "APPROVAL"
+    if not (renewable and found["end_date"] and found["term_months"]):
+        return error(request, 409)  # only an active agreement that renews on approval, with its end and its term
+
+    try:
+        end_date = add_months(str(found["end_date"]), int(found["term_months"]))
+        change = f"{agreement_label(found)}: renewal approved for {found['term_months']} months."
+        change = f"{change} end_date {found['end_date']!r} to {end_date!r}"
+        log_change(request, change, found["company_id"])
+        entry = {
+            "id": str(uuid.uuid4()),
+            "company_id": found["company_id"],
+            "kind": "SYSTEM",
+            "body": change,
+            "created_by": request.state.identity["id"],
+        }
+        statements = [
+            insert(database, "activity", entry),
+            update(database, "agreement", {"end_date": end_date}, agreement_id),
+            # The task that the alert made is done: the renewal it asked for was decided.
+            database.prepare(
+                f"UPDATE task SET status = 'DONE', completed_at = {NOW} WHERE agreement_id = ? AND status = 'OPEN'"
+                " AND title LIKE 'Renewal:%'"
+            ).bind(agreement_id),
+        ]
+        await database.batch(statements)
+        row = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(agreement_id).first()
+    except Exception as e:
+        return failed(request, "approve_renewal", e)
     return JSONResponse(agreement_out(row))
 
 
@@ -3411,40 +3462,57 @@ async def notification(
     return insert(env.DB, "notification", values)
 
 
-async def expire_agreements(database: Any, date: str) -> int:
-    """An active agreement past its end date that does not renew by itself becomes EXPIRED."""
-    sql = "SELECT * FROM agreement WHERE status = 'ACTIVE' AND auto_renews = 0 AND end_date < ? LIMIT ?"
+# What an active agreement becomes after its end date, by its renewal policy. One that renews
+# automatically has no end date, so it is not here.
+ENDED_STATUS = {"ONE_TIME": "COMPLETED", "APPROVAL": "EXPIRED"}
+# In an alert and its task: what the alert is about, and what will happen at the end date.
+ALERT_WORDS = {
+    "ONE_TIME": ("Ending", "It is a one-time agreement: after that date it is marked completed."),
+    "APPROVAL": ("Renewal", "Its renewal needs approval: without it, the agreement expires after that date."),
+}
+
+
+async def end_agreements(database: Any, date: str) -> dict[str, int]:
+    """An active agreement past its end date becomes what its renewal policy says: COMPLETED or EXPIRED.
+    Returns how many of each."""
+    sql = "SELECT * FROM agreement WHERE status = 'ACTIVE' AND end_date < ? AND renewal_policy IN ('ONE_TIME', 'APPROVAL') LIMIT ?"
     found = await database.prepare(sql).bind(date, DIGEST_ROWS).all()
     statements: list[Any] = []
+    counts = {"COMPLETED": 0, "EXPIRED": 0}
     for agreement in found["results"]:
-        change = describe_change(agreement_label(agreement), {"status": "ACTIVE"}, {"status": "EXPIRED"})
+        status = ENDED_STATUS[agreement["renewal_policy"]]
+        counts[status] += 1
+        change = describe_change(agreement_label(agreement), {"status": "ACTIVE"}, {"status": status})
         change = f"{change}. It ended on {agreement['end_date']}"
         # The record of the change: the Worker log first, then the timeline, in one transaction with the change.
         record = {"event": "carmen_audit", "change": change, "company_id": agreement["company_id"], "by": "scheduler"}
         logger.info(json.dumps(record))
         entry = {"id": str(uuid.uuid4()), "company_id": agreement["company_id"], "kind": "SYSTEM", "body": change}
-        statements += [insert(database, "activity", entry), update(database, "agreement", {"status": "EXPIRED"}, agreement["id"])]
+        statements += [insert(database, "activity", entry), update(database, "agreement", {"status": status}, agreement["id"])]
     if statements:
         await database.batch(statements)
-    return len(found["results"])
+    return counts
 
 
 async def renewal_alerts(env: Any, provider: notify.Provider, date: str, notice_days: int, recipient: str) -> int:
-    """One alert and one task for each active agreement that has reached its notice date."""
+    """One alert and one task for each active agreement that has reached its notice date. An agreement
+    that renews automatically has no end date, so it gets none."""
     found = await env.DB.prepare(ALERTS_DUE).bind(notice_days, date, notice_days, date, notice_days, DIGEST_ROWS).all()
     for agreement in found["results"]:
         title = str(agreement["title"] or agreement["type"])
+        heading, what_happens = ALERT_WORDS.get(agreement["renewal_policy"], ALERT_WORDS["APPROVAL"])
         subject, body = notify.render(
             "renewal",
+            heading=heading,
             title=title,
             company=str(agreement["company_name"]),
             end_date=str(agreement["end_date"]),
             notice_date=str(agreement["notice_date"]),
-            renews="It renews automatically." if agreement["auto_renews"] else "It does not renew automatically.",
+            what_happens=what_happens,
         )
         task = {
             "id": str(uuid.uuid4()),
-            "title": f"Renewal: {title}",
+            "title": f"{heading}: {title}",
             "company_id": agreement["company_id"],
             "agreement_id": agreement["id"],
             "due_date": agreement["notice_date"],
@@ -3495,7 +3563,7 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     variable EMAIL_PROVIDER says, and makes the digest now. The Cron Trigger never sets it.
     """
     provider = notify.PROVIDERS["CLOUDFLARE"] if email else notify.provider(getattr(env, "EMAIL_PROVIDER", None))
-    summary: Row = {"expired": 0, "alerts": 0, "digest": None, "failed": []}
+    summary: Row = {"completed": 0, "expired": 0, "alerts": 0, "digest": None, "failed": []}
     sql = "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key = 'renewal.default_notice_days'"
     try:
         found = await env.DB.prepare(sql).all()
@@ -3509,10 +3577,11 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     recipient = settings.get("digest.recipient", "")
 
     try:
-        summary["expired"] = await expire_agreements(env.DB, date)
+        ended = await end_agreements(env.DB, date)
+        summary.update(completed=ended["COMPLETED"], expired=ended["EXPIRED"])
     except Exception as e:
-        scheduler_log("failed", f"expire_agreements: {type(e).__name__}: {e}")
-        summary["failed"].append("expire_agreements")
+        scheduler_log("failed", f"end_agreements: {type(e).__name__}: {e}")
+        summary["failed"].append("end_agreements")
     if not recipient:
         scheduler_log("failed", "the setting digest.recipient is missing, so nothing is sent")
         summary["failed"].append("recipient")

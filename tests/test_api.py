@@ -139,6 +139,46 @@ class MachineCaller(unittest.TestCase):
         self.assertEqual(answer["error"], "INTERNAL")  # no database here: the failure is an answer too
 
 
+class RenewalPolicy(unittest.TestCase):
+    GOOD = {"status": "ACTIVE", "renewal_policy": "APPROVAL", "end_basis": "SIGNED_CONTRACT", "end_date": "2027-05-31", "term_months": 6}
+
+    def problem(self, **changes: Any) -> str | None:
+        return records.renewal_problem({**self.GOOD, **changes})
+
+    def test_a_draft_may_lack_everything(self):
+        self.assertIsNone(records.renewal_problem({"status": "DRAFT"}))
+        self.assertIsNone(records.renewal_problem({}))
+
+    def test_an_active_agreement_needs_a_policy_and_a_basis(self):
+        self.assertIsNone(self.problem())
+        self.assertIn("renewal policy", self.problem(renewal_policy=None) or "")
+        self.assertIn("end basis", self.problem(end_basis=None) or "")
+
+    def test_an_internal_decision_needs_a_reason(self):
+        self.assertIn("reason", self.problem(end_basis="INTERNAL_DECISION") or "")
+        self.assertIn("reason", self.problem(end_basis="INTERNAL_DECISION", end_basis_reason="  ") or "")
+        self.assertIsNone(self.problem(end_basis="INTERNAL_DECISION", end_basis_reason="Until the site is rebuilt"))
+
+    def test_each_policy_has_its_own_rule_for_the_end_date(self):
+        self.assertIn("no end date", self.problem(renewal_policy="AUTO_RENEW") or "")
+        self.assertIsNone(self.problem(renewal_policy="AUTO_RENEW", end_date=None, term_months=None))
+        self.assertIn("term in months", self.problem(term_months=None) or "")
+        self.assertIn("term in months", self.problem(end_date=None) or "")
+        self.assertIsNone(self.problem(renewal_policy="ONE_TIME", end_date=None, term_months=None))
+        self.assertIsNone(self.problem(renewal_policy="ONE_TIME"))
+
+    def test_a_term_is_added_in_whole_months(self):
+        self.assertEqual(records.add_months("2026-11-24", 6), "2027-05-24")
+        self.assertEqual(records.add_months("2026-12-15", 1), "2027-01-15")
+        self.assertEqual(records.add_months("2027-01-31", 1), "2027-02-28")  # February has no 31st
+        self.assertEqual(records.add_months("2024-02-29", 12), "2025-02-28")
+        self.assertEqual(records.add_months("2026-03-31", 12), "2027-03-31")
+
+    def test_approving_a_renewal_is_a_write(self):
+        routes = {r.path: r for r in api.app.routes if isinstance(r, APIRoute)}
+        self.assertEqual(getattr(routes["/api/v1/agreements/{agreement_id}/renewal"].endpoint, "action"), WRITE)
+
+
 class Routes(unittest.TestCase):
     def test_every_route_declares_a_known_action(self):
         routes = [r for r in api.app.routes if isinstance(r, APIRoute)]
@@ -153,7 +193,7 @@ class Routes(unittest.TestCase):
 
     def test_a_scheduler_run_with_no_database_fails_as_an_answer(self):
         answer = asyncio.run(api.run_scheduler(SimpleNamespace(DB=None)))
-        self.assertEqual(answer, {"expired": 0, "alerts": 0, "digest": None, "failed": ["load_settings"]})
+        self.assertEqual(answer, {"completed": 0, "expired": 0, "alerts": 0, "digest": None, "failed": ["load_settings"]})
 
     def test_only_health_is_public(self):
         routes = [r for r in api.app.routes if isinstance(r, APIRoute)]

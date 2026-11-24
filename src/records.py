@@ -7,9 +7,10 @@ without a Worker. See specs/002-companies-and-contacts/spec.md
 and specs/003-activities-and-tasks/spec.md.
 """
 
+import calendar
 import importlib
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, cast
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
@@ -100,11 +101,13 @@ AGREEMENT_FIELDS: dict[str, type] = {
             "terminated_at",
             "notes",
             "owner_id",
+            "renewal_policy",
+            "end_basis",
+            "end_basis_reason",
         ),
         str,
     ),
-    **dict.fromkeys(("amount_cents", "setup_fee_cents", "renewal_notice_days"), int),
-    "auto_renews": bool,
+    **dict.fromkeys(("amount_cents", "setup_fee_cents", "renewal_notice_days", "term_months"), int),
 }
 MODEL_FIELDS: dict[str, type] = {
     **dict.fromkeys(("provider", "model_id", "label", "notes"), str),
@@ -128,6 +131,8 @@ AGREEMENT_CODES = {
     "status": "AGREEMENT_STATUS",
     "engagement_model": "ENGAGEMENT_MODEL",
     "amount_period": "AMOUNT_PERIOD",
+    "renewal_policy": "RENEWAL_POLICY",
+    "end_basis": "END_BASIS",
 }
 MODEL_CODES = {"provider": "AI_PROVIDER"}
 CRITERION_CODES = {"section": "RUBRIC_SECTION", "answer_type": "ANSWER_TYPE"}
@@ -311,3 +316,32 @@ def derive_domain(website: str | None) -> str | None:
     except ValueError:
         return None
     return (host or "").removeprefix("www.") or None
+
+
+def renewal_problem(agreement: Values) -> str | None:
+    """Why the agreement may not be active as it stands, or None. See specs/024-renewal-policy/spec.md.
+
+    The policy and the basis have no default: a person chooses them before the agreement becomes
+    active. Any other status may lack them, so a draft can be written first.
+    """
+    if agreement.get("status") != "ACTIVE":
+        return None
+    policy = agreement.get("renewal_policy")
+    if not policy:
+        return "an active agreement needs a renewal policy"
+    if not agreement.get("end_basis"):
+        return "an active agreement needs an end basis"
+    if agreement["end_basis"] == "INTERNAL_DECISION" and not str(agreement.get("end_basis_reason") or "").strip():
+        return "an end that rests on an internal decision needs a reason"
+    if policy == "AUTO_RENEW" and agreement.get("end_date"):
+        return "an agreement that renews automatically has no end date"
+    if policy == "APPROVAL" and not (agreement.get("end_date") and agreement.get("term_months")):
+        return "an agreement that renews on approval needs an end date and a term in months"
+    return None
+
+
+def add_months(day: str, months: int) -> str:
+    """The date that many months later. A day the later month does not have becomes its last day."""
+    start = date.fromisoformat(day)
+    year, month = divmod(start.year * 12 + start.month - 1 + months, 12)
+    return start.replace(year=year, month=month + 1, day=min(start.day, calendar.monthrange(year, month + 1)[1])).isoformat()
