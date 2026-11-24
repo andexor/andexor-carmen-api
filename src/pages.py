@@ -11,6 +11,7 @@ A page is evidence about a company. Its text is passed to a model as data, never
 import importlib
 import json
 import logging
+import re
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urldefrag, urljoin, urlsplit
@@ -90,8 +91,9 @@ def site_url(website: object) -> str | None:
     url = text if "://" in text else f"https://{text}"
     parts = urlsplit(url)
     host = parts.hostname or ""
-    # A name with a dot, not a bare number: no localhost, no address literal.
-    if parts.scheme not in ("http", "https") or "." not in host or ":" in host or host.replace(".", "").isdigit():
+    # A name with a dot whose last label starts with a letter: no localhost, and no address literal
+    # in any spelling (decimal, octal, hexadecimal, or IPv6), since those end in a number.
+    if parts.scheme not in ("http", "https") or "." not in host or not re.fullmatch(r"[a-z][a-z0-9-]*", host.rsplit(".", 1)[-1]):
         return None
     return url
 
@@ -159,6 +161,10 @@ async def read_site(website: object, max_pages: int, fetch: Any = fetch_page) ->
         return []
     home = await fetch(start)
     if home is None:
+        return []
+    if site_url(home[0]) is None:
+        # A redirect led to something that is not a public web address. Nothing of it is used.
+        _skipped(start, "redirected to an address that is not allowed")
         return []
     text, links = read(home[1])
     pages = [(home[0], text)] if text else []

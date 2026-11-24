@@ -415,7 +415,7 @@ class Pages(unittest.TestCase):
     def test_only_a_public_web_address_is_fetched(self):
         self.assertEqual(pages.site_url("acme.com"), "https://acme.com")
         self.assertEqual(pages.site_url(" http://acme.com/x "), "http://acme.com/x")
-        for bad in (None, "", "localhost", "http://localhost:8787", "http://127.0.0.1/", "http://[::1]/", "ftp://acme.com", "file:///etc/passwd", "javascript:alert(1)"):
+        for bad in (None, "", "localhost", "http://localhost:8787", "http://127.0.0.1/", "http://[::1]/", "http://0x7f.0.0.1/", "http://127.1/", "http://2130706433/", "http://acme.com./", "ftp://acme.com", "file:///etc/passwd", "javascript:alert(1)"):
             self.assertIsNone(pages.site_url(bad), bad)
 
     def test_pages_are_cut_to_fit_and_a_short_page_leaves_room_for_the_next(self):
@@ -441,6 +441,11 @@ class Pages(unittest.TestCase):
         self.assertEqual(limited.asked, ["https://acme.com", "https://acme.com/about"])
         self.assertEqual(asyncio.run(pages.read_site("acme.com", 8, FakeSite({}))), [])
         self.assertEqual(asyncio.run(pages.read_site("localhost", 8, web)), [])
+        # A home page that redirects to an address literal is not used.
+        inside = FakeSite({"https://acme.com": ("http://169.254.169.254/latest/", HOME)})
+        with self.assertLogs("carmen", level="WARNING"):
+            self.assertEqual(asyncio.run(pages.read_site("acme.com", 8, inside)), [])
+        self.assertEqual(len(inside.asked), 1)
 
 
 class WorkersAIAdapter(unittest.TestCase):
