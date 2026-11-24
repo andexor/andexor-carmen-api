@@ -33,5 +33,7 @@ The first user in an empty database becomes the `ADMIN`. Only you are on the Clo
 
 ## Later, in the running app
 
+- [X] Apply the migration that sets `ai.research.max_pages` to 16 (`specs/019-research-max-pages/spec.md`). Applied to the preview and production on 2026-11-24.
+- [X] Merge the pull request for that migration in `andexor-carmen-main` (#23), unchanged: it is already applied.
 - [ ] After feature 012 (TypeSafe adapter): enable the Jev model in Settings.
 - [ ] After feature 015 (scheduler and notifications): send one real digest from the running Worker and confirm it reaches the inbox. That closes master question Q5.

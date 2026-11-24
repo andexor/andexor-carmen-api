@@ -401,6 +401,8 @@ class Config(unittest.TestCase):
             self.assertEqual(environment["queues"]["producers"][0]["binding"], "RUNS")
             # The Claude key is bound in both, so that the adapter can be tried on the preview first.
             self.assertEqual(environment["secrets_store_secrets"][0]["binding"], "CLAUDE_API_KEY")
+            # Workers AI is an account-wide service: the binding is the same in both.
+            self.assertEqual(environment["ai"], {"binding": "AI"})
             # The prompt files are packaged with the Worker.
             self.assertIn("prompts/*.md", environment["rules"][0]["globs"])
             # Each Worker consumes its own queue, one run at a time, with one more delivery after a crash.

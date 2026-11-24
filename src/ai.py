@@ -6,7 +6,8 @@
 
 One adapter per AI_PROVIDER code. An adapter has two methods, research and score, and makes plain
 HTTP requests: no provider's Software Development Kit (SDK) is used, because one may not load in a
-Python Worker. The stub is in specs/009-ai-runs/spec.md, Claude in specs/010-ai-adapter-claude/spec.md.
+Python Worker. The stub is in specs/009-ai-runs/spec.md, Claude in specs/010-ai-adapter-claude/spec.md,
+and Workers AI in specs/011-ai-adapter-workers-ai/spec.md.
 
 Everything a model returns is untrusted. It is cleaned here, by pure functions, before it is stored:
 nothing a model says is taken as an instruction, and nothing is applied to a company by a run.
@@ -19,6 +20,7 @@ import pathlib
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, cast
 
+import pages as site
 from records import BadBody, fact_key, fact_value
 from scoring import Row, points
 
@@ -115,7 +117,11 @@ PROMPTS = pathlib.Path(__file__).parent / "prompts"
 
 def render(name: str, **values: str) -> str:
     """The prompt file with its placeholders filled in. A placeholder with no value is an error."""
-    text = (PROMPTS / f"{name}.md").read_text()
+    try:
+        text = (PROMPTS / f"{name}.md").read_text()
+    except OSError as e:
+        logger.error(json.dumps({"event": "carmen_prompt_error", "prompt": name, "detail": f"{type(e).__name__}: {e}"[:300]}))
+        raise RunError(f"The prompt {name} could not be read") from e
     for key, value in values.items():
         text = text.replace("{{" + key + "}}", value)
     if "{{" in text:
@@ -270,16 +276,40 @@ def claude_usage(replies: list[Row]) -> Row:
     return {"input_tokens": tokens_in, "output_tokens": tokens_out, "search_count": searches}
 
 
-def claude_json(reply: Row, key: str) -> list[Any]:
-    """The list under the key in a reply that was asked for a fixed JSON shape. Raises BadOutput."""
+def json_list(text: str, key: str) -> list[Any]:
+    """The list under the key in an answer that was asked for a fixed JSON shape. Raises BadOutput."""
     try:
-        data: Any = json.loads(claude_text(reply))
+        data: Any = json.loads(text)
         found: Any = data[key]
     except (ValueError, KeyError, TypeError) as e:
         raise BadOutput(f"the reply is not the JSON that was asked for: {type(e).__name__}") from e
     if not isinstance(found, list):
         raise BadOutput(f"{key} is not a list")
     return cast(list[Any], found)
+
+
+def claude_json(reply: Row, key: str) -> list[Any]:
+    return json_list(claude_text(reply), key)
+
+
+async def research_inputs(env: Any, setting: str, default: int, most: int) -> tuple[str, list[Row], int]:
+    """What every research prompt needs: the services on offer, the well-known fact keys, and a
+    limit from the setting table, held between 1 and most."""
+    try:
+        found = await env.DB.batch(
+            [
+                env.DB.prepare("SELECT name FROM service WHERE active = 1 AND offered = 1 ORDER BY sort_order, name"),
+                env.DB.prepare("SELECT key, label, value_type, description FROM enrichment_key WHERE active = 1 ORDER BY sort_order, key"),
+                env.DB.prepare("SELECT value FROM setting WHERE key = ?").bind(setting),
+            ]
+        )
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_research_inputs_error", "setting": setting, "detail": f"{type(e).__name__}: {e}"[:300]}))
+        raise RunError("The services, fact keys, and settings for research could not be read") from e
+    stored = found[2]["results"]
+    wanted = str(stored[0]["value"]) if stored else ""
+    limit = min(most, max(1, int(wanted))) if wanted.isdigit() else default
+    return ", ".join(row["name"] for row in found[0]["results"]), found[1]["results"], limit
 
 
 async def claude_post(env: Any, body: Row) -> tuple[int, Row]:
@@ -292,9 +322,14 @@ async def claude_post(env: Any, body: Row) -> tuple[int, Row]:
         logger.error(json.dumps({"event": "carmen_claude_error", "detail": f"no API key: {type(e).__name__}"}))
         raise RunError("The Claude API key is not available to this Worker") from e
     headers = {"x-api-key": str(key), "anthropic-version": CLAUDE_VERSION, "content-type": "application/json"}
-    response: Any = await workers.fetch(CLAUDE_URL, method="POST", headers=headers, body=json.dumps(body))
-    data: Any = await response.json()
-    return int(response.status), cast(Row, data) if isinstance(data, dict) else {}
+    try:
+        response: Any = await workers.fetch(CLAUDE_URL, method="POST", headers=headers, body=json.dumps(body))
+        data: Any = await response.json()
+        return int(response.status), cast(Row, data) if isinstance(data, dict) else {}
+    except Exception as e:
+        # The request did not complete, or the reply was not JSON. The key is not part of the detail.
+        logger.error(json.dumps({"event": "carmen_claude_error", "detail": f"request failed: {type(e).__name__}"}))
+        raise RunError(f"The Claude API could not be reached ({type(e).__name__})") from e
 
 
 class Claude:
@@ -339,18 +374,8 @@ class Claude:
         return {"dossier": dossier, "facts": facts, **claude_usage(replies + more)}
 
     async def research(self, env: Any, model: Row, company: Row, pages: list[str] | None = None) -> Row:
-        found = await env.DB.batch(
-            [
-                env.DB.prepare("SELECT name FROM service WHERE active = 1 AND offered = 1 ORDER BY sort_order, name"),
-                env.DB.prepare("SELECT key, label, value_type, description FROM enrichment_key WHERE active = 1 ORDER BY sort_order, key"),
-                env.DB.prepare("SELECT value FROM setting WHERE key = 'ai.research.max_searches'"),
-            ]
-        )
-        services = ", ".join(row["name"] for row in found[0]["results"])
-        limit = found[2]["results"]
-        wanted = str(limit[0]["value"]) if limit else ""
-        max_searches = min(20, max(1, int(wanted))) if wanted.isdigit() else DEFAULT_MAX_SEARCHES
-        return await self.run_research(env, model["model_id"], company, services, found[1]["results"], max_searches)
+        services, keys, max_searches = await research_inputs(env, "ai.research.max_searches", DEFAULT_MAX_SEARCHES, 20)
+        return await self.run_research(env, model["model_id"], company, services, keys, max_searches)
 
     async def score(self, env: Any, model: Row, criteria: list[Row], material: str) -> Row:
         prompt = render("scoring", criteria=criteria_text(criteria), material=material)
@@ -358,8 +383,117 @@ class Claude:
         return {"answers": claude_json(replies[-1], "answers"), **claude_usage(replies)}
 
 
+# ---- The Workers AI adapter ----------------------------------------------------------------------
+# Open models on the Cloudflare account, through the AI binding. They cannot search the web, so the
+# API fetches pages from the company's own website and the model reads them. Research is two
+# requests, like Claude's: a dossier in prose, then its facts in a fixed JSON shape.
+
+# Tokens each launch model can hold, from the Workers AI catalog. An unknown model gets the smallest.
+WORKERS_AI_CONTEXT = {
+    "@cf/openai/gpt-oss-120b": 128_000,
+    "@cf/zai-org/glm-5.3": 1_048_576,
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast": 24_000,
+}
+SMALLEST_CONTEXT = 24_000
+PROMPT_TOKENS = 1_500  # room for the prompt around the pages
+MAX_PAGE_TOKENS = 40_000  # a large context is not filled: input tokens are billed
+CHARS_PER_TOKEN = 3  # shortcut: an estimate on the safe side, not a tokenizer; measure if a run is ever refused for length
+DEFAULT_MAX_PAGES = 8  # used only when the setting ai.research.max_pages is missing; the setting is the place to change it
+
+# run(env, model id, body) sends one request and returns the reply as a dict.
+Runner = Callable[[Any, str, Row], Awaitable[Row]]
+# fetch(url) returns (the address after redirects, the HTML), or None.
+Fetcher = Callable[[str], Awaitable[tuple[str, str] | None]]
+
+
+def workers_ai_limits(model_id: str) -> tuple[int, int]:
+    """(tokens kept for the answer, characters of page text that fit) for a model."""
+    context = WORKERS_AI_CONTEXT.get(model_id, SMALLEST_CONTEXT)
+    answer = min(CLAUDE_MAX_TOKENS, context // 4)  # a reasoning model's thinking counts as answer tokens
+    return answer, min(MAX_PAGE_TOKENS, context - answer - PROMPT_TOKENS) * CHARS_PER_TOKEN
+
+
+def workers_ai_body(model_id: str, prompt: str, name: str | None = None, schema: Row | None = None) -> Row:
+    body: Row = {"messages": [{"role": "user", "content": prompt}], "max_tokens": workers_ai_limits(model_id)[0]}
+    if name and schema:
+        body["response_format"] = {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}}
+    return body
+
+
+def workers_ai_text(reply: Row) -> str:
+    """The answer in a reply. Raises RunError when the model declined or was cut off."""
+    found: Any = reply.get("choices")
+    choices = cast(list[Any], found) if isinstance(found, list) else []
+    first: Row = cast(Row, choices[0]) if choices and isinstance(choices[0], dict) else {}
+    message: Any = first.get("message") if isinstance(first.get("message"), dict) else {}
+    if message.get("refusal"):
+        raise RunError("The model declined the request")
+    if first.get("finish_reason") == "length":
+        raise RunError("The model's answer was cut off at the token limit")
+    content = message.get("content")
+    return content.strip() if isinstance(content, str) else ""
+
+
+def workers_ai_usage(replies: list[Row]) -> Row:
+    tokens_in = tokens_out = 0
+    for reply in replies:
+        usage: Any = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
+        tokens_in += _count(usage.get("prompt_tokens")) or 0
+        tokens_out += _count(usage.get("completion_tokens")) or 0
+    return {"input_tokens": tokens_in, "output_tokens": tokens_out}
+
+
+async def workers_ai_run(env: Any, model_id: str, body: Row) -> Row:
+    """Send one request through the AI binding. The Workers runtime converts the body to a
+    JavaScript object and returns the reply as a Python dict, as it does for a D1 row."""
+    try:
+        reply: Any = await env.AI.run(model_id, body)
+    except Exception as e:
+        # The provider's own message stays in the log.
+        logger.error(json.dumps({"event": "carmen_workers_ai_error", "model": model_id, "detail": str(e)[:500]}))
+        raise RunError(f"Workers AI could not run the model ({type(e).__name__})") from e
+    return cast(Row, reply) if isinstance(reply, dict) else {}
+
+
+class WorkersAI:
+    def __init__(self, run: Runner = workers_ai_run, fetch: Fetcher = site.fetch_page) -> None:
+        self.run = run
+        self.fetch = fetch
+
+    async def run_research(self, env: Any, model_id: str, company: Row, services: str, keys: list[Row], max_pages: int) -> Row:
+        read = await site.read_site(company.get("website"), max_pages, self.fetch)
+        if not read:
+            raise RunError("No page of the company's website could be read, and this model cannot search the web")
+        text = site.as_text(site.trim(read, workers_ai_limits(model_id)[1]))
+        prompt = render("research-pages", services=services, company=company_text(company), pages=text)
+        replies = [await self.run(env, model_id, workers_ai_body(model_id, prompt))]
+        dossier = workers_ai_text(replies[0])
+        if not dossier:
+            raise RunError("The model returned no dossier")
+        # Unreadable facts are asked for once more. The pages are not fetched again for this.
+        body = workers_ai_body(model_id, render("facts", dossier=dossier, keys=keys_text(keys)), "facts", FACTS_SCHEMA)
+        for attempt in (1, 2):
+            replies.append(await self.run(env, model_id, body))
+            try:
+                facts = json_list(workers_ai_text(replies[-1]), "facts")
+                return {"dossier": dossier, "facts": facts, **workers_ai_usage(replies)}
+            except BadOutput:
+                if attempt == 2:
+                    raise RunError("The model's list of facts could not be read, twice") from None
+        return {}
+
+    async def research(self, env: Any, model: Row, company: Row, pages: list[str] | None = None) -> Row:
+        services, keys, max_pages = await research_inputs(env, "ai.research.max_pages", DEFAULT_MAX_PAGES, 20)
+        return await self.run_research(env, model["model_id"], company, services, keys, max_pages)
+
+    async def score(self, env: Any, model: Row, criteria: list[Row], material: str) -> Row:
+        prompt = render("scoring", criteria=criteria_text(criteria), material=material)
+        reply = await self.run(env, model["model_id"], workers_ai_body(model["model_id"], prompt, "answers", ANSWERS_SCHEMA))
+        return {"answers": json_list(workers_ai_text(reply), "answers"), **workers_ai_usage([reply])}
+
+
 # The providers that can run. A model of any other provider cannot start a run.
-ADAPTERS: dict[str, Adapter] = {"STUB": Stub(), "CLAUDE": Claude()}
+ADAPTERS: dict[str, Adapter] = {"STUB": Stub(), "CLAUDE": Claude(), "WORKERS_AI": WorkersAI()}
 
 
 # ---- Cleaning what a model returns ---------------------------------------------------------------
@@ -376,6 +510,9 @@ def _count(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+NO_VALUE = ("not provided", "not found", "not available", "not specified", "not stated", "not mentioned", "unknown", "n/a", "none", "null")
+
+
 def clean_facts(raw: object, key_types: dict[str, str]) -> list[Row]:
     """The facts a research run proposed, in the stored form. A fact with no key or value is dropped,
     and so is a date that is not understood. key_types maps a well-known key to its value type."""
@@ -386,7 +523,8 @@ def clean_facts(raw: object, key_types: dict[str, str]) -> list[Row]:
         fact = cast(Row, item)
         key = fact_key(_text(fact.get("key"), 100) or "")
         value = _text(fact.get("value"), 2000)
-        if not key or value is None:
+        # A model that has nothing to say sometimes says so in the value. That is not a fact.
+        if not key or value is None or value.lower().strip(" .") in NO_VALUE:
             continue
         try:
             value = fact_value(value, key_types.get(key))
