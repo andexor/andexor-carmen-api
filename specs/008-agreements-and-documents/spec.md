@@ -10,7 +10,7 @@ Author: Ed Jenkins <ed@andexor.net>
 
 **Created**: 2026-11-23
 
-**Status**: Implemented.
+**Status**: Implemented. Changed by `specs/024-renewal-policy/spec.md`: the field `auto_renews` is gone, and an active agreement needs a renewal policy and an end basis.
 
 **Input**: Issue #27. Backlog feature 008: agreements, the documents stored with them, the R2 buckets, and discovery task D7. The rules of the earlier specs for bodies, codes, errors, paging, dates, own records, and the change log (`specs/018-change-log/spec.md`) apply here unchanged. Where this spec and an earlier document differ, this spec governs.
 
