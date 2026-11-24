@@ -113,6 +113,32 @@ class OwnRecords(unittest.TestCase):
         self.assertTrue(self.may(ADMIN, None, None))  # a machine caller on the preview
 
 
+class MachineCaller(unittest.TestCase):
+    def test_a_service_token_may_call_the_machine_methods_and_nothing_else(self):
+        self.assertTrue(roles.allowed(roles.MACHINE_CALLER, roles.MACHINE))
+        for needed in (READ, WRITE, DELETE, MANAGE):
+            self.assertFalse(roles.allowed(roles.MACHINE_CALLER, needed), needed)
+
+    def test_of_the_people_a_member_and_an_admin_may_call_them(self):
+        for role in (MEMBER, ADMIN):
+            self.assertTrue(roles.allowed(role, roles.MACHINE), role)
+        self.assertFalse(roles.allowed(READER, roles.MACHINE))
+
+    def test_only_the_two_machine_endpoints_declare_the_action(self):
+        routes = [r for r in api.app.routes if isinstance(r, APIRoute)]
+        paths = sorted(r.path for r in routes if getattr(r.endpoint, "action", None) == roles.MACHINE)
+        self.assertEqual(paths, ["/api/v1/machine/facts", "/api/v1/machine/leads"])
+
+    def test_the_binding_door_answers_a_refusal_and_does_not_raise(self):
+        env = SimpleNamespace(DB=None)
+        answer = asyncio.run(api.machine_call(env, api.create_lead, {"name": "No source"}))
+        self.assertEqual(answer, {"ok": False, "error": "BAD_REQUEST", "message": "source is required"})
+        answer = asyncio.run(api.machine_call(env, api.create_lead, "not an object"))
+        self.assertEqual(answer["error"], "BAD_REQUEST")
+        answer = asyncio.run(api.machine_call(env, api.add_facts, {"source": "API", "company_id": "x", "facts": []}))
+        self.assertEqual(answer["error"], "INTERNAL")  # no database here: the failure is an answer too
+
+
 class Routes(unittest.TestCase):
     def test_every_route_declares_a_known_action(self):
         routes = [r for r in api.app.routes if isinstance(r, APIRoute)]

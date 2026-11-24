@@ -12,7 +12,7 @@ Work follows Spec Kit. The feature backlog is section 13 of the PRD.
 ```
 PRD.md               what this app must do (frozen)
 specs/               Spec Kit specifications; 000-repo-setup records what changed since the PRD
-src/worker.py        the Worker entry point
+src/worker.py        the Worker entry point: requests, the queue, and the machine methods over a Service Binding
 src/app.py           the FastAPI application: identity, role check, endpoints
 src/records.py       what a caller may write to each kind of record, the date rule, and the domain rule
 src/scoring.py       the scoring engine: points, Fit, Need, confidence, recommendation

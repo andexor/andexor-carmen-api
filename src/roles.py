@@ -18,17 +18,21 @@ READ = "READ"
 WRITE = "WRITE"  # create or update a record
 DELETE = "DELETE"
 MANAGE = "MANAGE"  # users, settings, the rubric, the service catalog, the AI model list
-ACTIONS = (PUBLIC, READ, WRITE, DELETE, MANAGE)
+MACHINE = "MACHINE"  # a machine method: another Andexor service sends a lead or facts
+ACTIONS = (PUBLIC, READ, WRITE, DELETE, MANAGE, MACHINE)
 
 # Roles, the USER_ROLE codes in the System Reference Table (SRT).
 READER = "READER"
 MEMBER = "MEMBER"
 ADMIN = "ADMIN"
+# Not a USER_ROLE code and never stored: the role of a service token. It may call the machine methods and nothing else.
+MACHINE_CALLER = "MACHINE"
 
 _ALLOWED: dict[str, frozenset[str]] = {
     READER: frozenset({READ}),
-    MEMBER: frozenset({READ, WRITE}),
-    ADMIN: frozenset({READ, WRITE, DELETE, MANAGE}),
+    MEMBER: frozenset({READ, WRITE, MACHINE}),
+    ADMIN: frozenset({READ, WRITE, DELETE, MANAGE, MACHINE}),
+    MACHINE_CALLER: frozenset({MACHINE}),
 }
 
 

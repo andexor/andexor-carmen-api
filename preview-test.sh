@@ -316,3 +316,37 @@ expect 200 '"key":"founded"' "${BASE}/companies/${IMPORTED}/facts"
 expect 200 '"deleted":1,"kept":0' -X DELETE "${BASE}/imports/${IMPORT}"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${IMPORTED}"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/imports/00000000-0000-4000-8000-00000000dead"
+
+# Machine methods (specs/014-machine-methods/spec.md), through the endpoint door. The Service Binding
+# door runs the same code; no outside caller can reach it, so it is not called here.
+JSON=(-X POST -H 'Content-Type: application/json')
+MTAG="lead${RANDOM}${RANDOM}"
+LEAD="{\"source\":\"CONTACT_US\",\"source_ref\":\"row-${MTAG}\",\"website\":\"https://www.${MTAG}.example\",\"contact\":{\"name\":\"Mia Lead\",\"email\":\"mia@${MTAG}.example\"},\"note\":\"Please call me\",\"facts\":[{\"key\":\"Has website\",\"value\":\"yes\"}]}"
+expect 201 '"created":true' "${JSON[@]}" -d "${LEAD}" "${BASE}/machine/leads"
+LEAD_ID=$(jq -r '.company_id' "${BODY}")
+# The same lead again matches on the domain: no second company, and the same person is not added twice.
+expect 200 "\"company_id\":\"${LEAD_ID}\",\"created\":false" "${JSON[@]}" -d "${LEAD}" "${BASE}/machine/leads"
+# No website this time: it matches on the source and its reference.
+expect 200 "\"company_id\":\"${LEAD_ID}\",\"created\":false" "${JSON[@]}" \
+    -d "{\"source\":\"CONTACT_US\",\"source_ref\":\"row-${MTAG}\",\"contact\":{\"name\":\"Ned Other\"}}" "${BASE}/machine/leads"
+expect 200 '"source":"CONTACT_US"' "${BASE}/companies/${LEAD_ID}"
+expect 200 '"name":"Ned Other"' "${BASE}/companies/${LEAD_ID}/contacts"
+if [[ "$(jq -c '[(.items | length), ([.items[] | select(.is_primary == 1)] | length)]' "${BODY}")" != "[2,1]" ]]; then
+    echo "FAILED: the lead should have two contacts, one of them primary: $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: the lead has two contacts, one of them primary"
+expect 200 '"body":"Please call me"' "${BASE}/companies/${LEAD_ID}/activities"
+expect 200 '"added":2' "${JSON[@]}" \
+    -d "{\"domain\":\"${MTAG}.example\",\"source\":\"GRASS_SPIDER\",\"facts\":[{\"key\":\"registrar\",\"value\":\"Example Registrar\"},{\"key\":\"mx\",\"value\":\"none\"}]}" "${BASE}/machine/facts"
+expect 200 '"source":"GRASS_SPIDER"' "${BASE}/companies/${LEAD_ID}/facts?key=registrar"
+expect 200 '"source":"CONTACT_US"' "${BASE}/companies/${LEAD_ID}/facts?key=has_website"
+expect 404 '"error":"NOT_FOUND"' "${JSON[@]}" -d '{"domain":"no-such-zz9.example","source":"API","facts":[{"key":"a","value":"b"}]}' "${BASE}/machine/facts"
+expect 400 '"error":"BAD_REQUEST"' "${JSON[@]}" -d '{"name":"No source"}' "${BASE}/machine/leads"
+expect 400 '"error":"BAD_REQUEST"' "${JSON[@]}" -d '{"source":"NO_SUCH_SOURCE","name":"Bad source"}' "${BASE}/machine/leads"
+# A person and nothing else: the company is named after them.
+expect 201 '"created":true' "${JSON[@]}" -d "{\"source\":\"CONTACT_US\",\"contact\":{\"name\":\"Solo ${MTAG}\"}}" "${BASE}/machine/leads"
+SOLO_ID=$(jq -r '.company_id' "${BODY}")
+expect 200 "\"name\":\"Solo ${MTAG}\"" "${BASE}/companies/${SOLO_ID}"
+expect 204 '' -X DELETE "${BASE}/companies/${SOLO_ID}"
+expect 204 '' -X DELETE "${BASE}/companies/${LEAD_ID}"
