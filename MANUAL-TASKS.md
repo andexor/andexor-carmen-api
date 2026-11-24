@@ -31,9 +31,28 @@ The first user in an empty database becomes the `ADMIN`. Only you are on the Clo
 - [X] After feature 001 is deployed, open `https://carmen.andexor.net/api/v1/me` and check that it shows your email and `"role": "ADMIN"`.
 - [X] Do the same at `https://carmen-preview.andexor.net/api/v1/me`.
 
+## Google PageSpeed Insights key (for later)
+
+A reminder, asked for on 2026-11-24. Do this when the PageSpeed Insights feature is taken up; nothing needs the key until then. The steps were written on 2026-11-24 from Google's page "Get Started with the PageSpeed Insights API" (`https://developers.google.com/speed/docs/insights/v5/get-started`). Google changes its console now and then, so read that page again first.
+
+Why a key: the API is free, but a call without a key shares one pool with everyone, and on 2026-11-24 that pool was used up (status 429). With a key the limit is the project's own, about 25,000 requests a day by third-party guides; the exact numbers are shown in the console once the API is enabled.
+
+- [ ] In the Google Cloud Console (`https://console.cloud.google.com`), pick a project or create one for Carmen.
+- [ ] Go to APIs & Services, then Library. Search for "PageSpeed Insights API" and choose Enable.
+- [ ] Go to APIs & Services, then Credentials. Choose Create credentials, then API key.
+- [ ] Edit the new key. Under API restrictions, choose Restrict key and select only "PageSpeed Insights API". Leave application restrictions at None: the calls come from a Cloudflare Worker, which has no fixed address.
+- [ ] Store the key in the Cloudflare Secrets Store, in the same store as the other two keys, under the name `carmen-pagespeed-api-key`. It sits beside `carmen-claude-api-key` and `carmen-typesafe-api-key`. Do not put it in a file, in GitHub, or in `wrangler.jsonc`.
+- [ ] Tell Claude that the key is stored. The feature then binds it as `PAGESPEED_API_KEY` in production and in the preview.
+
+No billing account should be needed for this API. If the console asks for one, stop and check before adding a card.
+
 ## Later, in the running app
 
 - [X] Apply the migration that sets `ai.research.max_pages` to 16 (`specs/019-research-max-pages/spec.md`). Applied to the preview and production on 2026-11-24.
 - [X] Merge the pull request for that migration in `andexor-carmen-main` (#23), unchanged: it is already applied.
-- [ ] After feature 012 (TypeSafe adapter): enable the Jev model in Settings.
+- [X] After feature 012 (TypeSafe adapter): enable the Jev model. Done by the migration `0005_enable_jev` in `andexor-carmen-main`, applied to the preview and production on 2026-11-24, so no manual step is needed.
+- [X] Merge the pull request for that migration in `andexor-carmen-main` (#25), unchanged: it is already applied. Merged on 2026-11-24.
+- [X] Merge the migration pull requests in `andexor-carmen-main`: #27, #29, #31, and #33. Merged on 2026-11-24.
+- [X] Apply the four migrations (`0006` to `0009`) to production. Applied on 2026-11-24; the preview and production are both at schema version 9. Production held no companies and no answers at the time.
+- [X] Recompute the stored scores in production. Not needed: production held no companies and no answers when the Need direction changed (checked on 2026-11-24).
 - [ ] After feature 015 (scheduler and notifications): send one real digest from the running Worker and confirm it reaches the inbox. That closes master question Q5.

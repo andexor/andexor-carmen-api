@@ -51,7 +51,7 @@ Nothing is served from `workers.dev`.
 | `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
 | `preview-create.sh` | Finds or creates the preview database, bucket, and queue, and applies the migrations. Safe to run again |
 | `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |
-| `ai-test.sh` | Tries a real AI model on the preview, on demand: list, enable, or disable models, or run one (Claude or Workers AI). `run` costs money. Not part of the pipeline |
+| `ai-test.sh` | Tries a real AI model on the preview, on demand: list, enable, or disable models, or run one (Claude, Workers AI, or Jev with `--research`). `run` costs money. Not part of the pipeline |
 | `preview-delete.sh` | Deletes the preview Worker, the preview database, and the preview bucket if it is empty. Never touches production |
 | `health.sh` | Health check through Cloudflare Access: `./health.sh [preview\|production] [tries]` |
 | `deploy.sh` | Production deploy by hand: runs `preview-test.sh` first, then migrates and deploys production |

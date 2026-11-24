@@ -14,12 +14,13 @@
 #   ./ai-test.sh models                 List the models on the preview: id, provider, enabled, runnable.
 #   ./ai-test.sh enable <model id>      Enable a model on the preview.
 #   ./ai-test.sh disable <model id>     Disable a model on the preview, so that nobody runs it by mistake.
-#   ./ai-test.sh run <model id> [website] [--keep]
+#   ./ai-test.sh run <model id> [website] [--keep] [--research <model id>]
 #                                       Research a company with the model, then score the dossier with
 #                                       the same model. Prints the dossier, the proposed facts, the
 #                                       scores, and what the run used. The test company is deleted
 #                                       afterward unless --keep is given. The default website is
-#                                       https://www.cloudflare.com.
+#                                       https://www.cloudflare.com. For a model that only scores,
+#                                       such as Jev, name the model that researches with --research.
 #
 # Requires: curl, jq, and the Cloudflare Access service token in .env (see .env.example).
 
@@ -63,11 +64,18 @@ case "${1:-}" in
         ;;
     run)
         MODEL=${2:-}
-        [[ -n "${MODEL}" ]] || { echo "usage: $0 run <model id> [website] [--keep]" >&2; exit 1; }
+        [[ -n "${MODEL}" ]] || { echo "usage: $0 run <model id> [website] [--keep] [--research <model id>]" >&2; exit 1; }
         WEBSITE=https://www.cloudflare.com
         KEEP=false
-        for argument in "${@:3}"; do
-            if [[ "${argument}" == "--keep" ]]; then KEEP=true; else WEBSITE=${argument}; fi
+        RESEARCHER=${MODEL}
+        shift 2
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --keep) KEEP=true ;;
+                --research) RESEARCHER=${2:?--research needs a model id}; shift ;;
+                *) WEBSITE=$1 ;;
+            esac
+            shift
         done
 
         echo "This calls a real model on the preview and costs money."
@@ -81,7 +89,7 @@ case "${1:-}" in
         }
         trap cleanup EXIT
 
-        IDS=$(call -X POST -d "{\"research_model_id\":\"${MODEL}\",\"scoring_model_ids\":[\"${MODEL}\"]}" "${BASE}/companies/${COMPANY}/runs/research-and-score")
+        IDS=$(call -X POST -d "{\"research_model_id\":\"${RESEARCHER}\",\"scoring_model_ids\":[\"${MODEL}\"]}" "${BASE}/companies/${COMPANY}/runs/research-and-score")
         RESEARCH=$(jq -r '.run_ids[0]' <<< "${IDS}")
         SCORING=$(jq -r '.run_ids[1]' <<< "${IDS}")
         echo "Research run ${RESEARCH}, then scoring run ${SCORING}. Waiting (up to 10 minutes)..."

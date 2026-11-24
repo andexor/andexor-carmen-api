@@ -233,6 +233,22 @@ expect 200 '"user_rating":5' -X PATCH "${JSON[@]}" -d '{"user_rating":5}' "${BAS
 expect 200 '"agreement_rate":1' "${BASE}/ai/models/stats"
 expect 200 '"kind":"RESEARCH"' "${BASE}/companies/${ID}/runs"
 
+# A measured criterion is answered by code from its fact, whatever the model says
+# (specs/021-measured-criteria/spec.md). "Is the site fast?" is YES at a PageSpeed score of 90 or more.
+expect 201 '"key":"pagespeed_mobile"' -X POST "${JSON[@]}" -d '{"key":"pagespeed_mobile","value":95}' "${BASE}/companies/${ID}/facts"
+expect 202 '"run_ids"' -X POST "${JSON[@]}" -d "{\"kind\":\"SCORING\",\"ai_model_ids\":[\"${STUB}\"]}" "${BASE}/companies/${ID}/runs"
+MEASURED=$(jq -r '.run_ids[0]' "${BODY}")
+for attempt in $(seq 1 60); do
+    expect 200 '"kind":"SCORING"' "${BASE}/runs/${MEASURED}" > /dev/null
+    STATUS=$(jq -r '.status' "${BODY}")
+    [[ "${STATUS}" == "SUCCEEDED" || "${STATUS}" == "FAILED" ]] && break
+    sleep 2
+done
+expect 200 'Measured, not judged: the fact pagespeed_mobile is 95, and 90 or more is YES.' "${BASE}/runs/${MEASURED}"
+# The stub is switched off again, as it is in production: the preview's settings must not drift away
+# from production's because a test ran.
+expect 200 '"active":0' -X PATCH "${JSON[@]}" -d '{"active":false}' "${BASE}/ai/models/${STUB}"
+
 # The Today view (specs/006-today/spec.md). The overdue task goes with the test company.
 expect 201 '"due_date":"2020-01-01"' -X POST "${JSON[@]}" \
     -d "{\"title\":\"Smoke overdue\",\"company_id\":\"${ID}\",\"due_date\":\"2020-01-01\"}" "${BASE}/tasks"

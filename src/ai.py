@@ -7,7 +7,7 @@
 One adapter per AI_PROVIDER code. An adapter has two methods, research and score, and makes plain
 HTTP requests: no provider's Software Development Kit (SDK) is used, because one may not load in a
 Python Worker. The stub is in specs/009-ai-runs/spec.md, Claude in specs/010-ai-adapter-claude/spec.md,
-and Workers AI in specs/011-ai-adapter-workers-ai/spec.md.
+Workers AI in specs/011-ai-adapter-workers-ai/spec.md, and TypeSafe in specs/012-ai-adapter-typesafe/spec.md.
 
 Everything a model returns is untrusted. It is cleaned here, by pure functions, before it is stored:
 nothing a model says is taken as an instruction, and nothing is applied to a company by a run.
@@ -493,8 +493,195 @@ class WorkersAI:
         return {"answers": json_list(workers_ai_text(reply), "answers"), **workers_ai_usage([reply])}
 
 
+# ---- The TypeSafe adapter ------------------------------------------------------------------------
+# Jev is a decision model: it answers typed questions with probabilities and writes no text. It
+# scores only. One request carries the material as state and one question per criterion. The model
+# gives judgments; what counts as an answer is decided here, in code.
+
+TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
+
+# The wording and the thresholds, in one place. A probability near 0.5 means the material does not
+# settle the question, and such a criterion is left unknown, never guessed.
+YES_AT = 0.7  # a yes-or-no question is YES at or above this
+NO_AT = 0.3  # and NO at or below this
+# The companion question. Jev always picks a level for a rating and an option for a choice, even
+# when nothing in the material supports one: a pick is not evidence that the question can be
+# answered. So every RATING and CHOICE question is sent with a second, yes-or-no question about the
+# same criterion, the companion, that asks whether the material can answer it at all. The pick is
+# kept only when the companion says yes strongly enough. Otherwise the criterion is left unknown,
+# which lowers confidence and never lowers a score.
+#
+# A YES_NO question has a companion too, for another reason. Its own probability says how sure Jev
+# is of yes or no, and that already decides whether it is kept. But Jev can be sure on thin
+# material. The companion says whether the material held the evidence, so it is written into the
+# answer's rationale, and an answer whose companion is low is marked "weak evidence" there. It does
+# not remove a YES_NO answer.
+ANSWERABLE_AT = 0.7  # a rating or a choice is kept when its companion question reaches this
+ANSWERABLE = "Is there enough information here to answer this question: {prompt}"
+# A rating is 0 to 5. Each level is worded so that it makes sense read by itself.
+RATING_LEVELS = [
+    "Not at all, or the lowest possible",
+    "Very little, or very low",
+    "A little, or low",
+    "A moderate amount, or medium",
+    "A lot, or high",
+    "Completely, or the highest possible",
+]
+
+
+def material_parts(text: str) -> Row:
+    """The text of material() as named parts: company, dossier, facts. An empty part is left out,
+    because a model can read an empty part as a signal."""
+
+    def pairs(block: str) -> dict[str, str]:
+        return {key: value for key, _, value in (line.partition(": ") for line in block.split("\n")) if value}
+
+    head, found, facts = text.rpartition("\n\nFACTS\n")
+    if not found:
+        return {"material": text}
+    company, _, dossier = head.partition("\n\nDOSSIER\n")
+    parts: Row = {"company": pairs(company), "dossier": dossier.strip(), "facts": pairs(facts)}
+    return {name: part for name, part in parts.items() if part}
+
+
+def _choices(criterion: Row) -> dict[str, str]:
+    """A choice criterion's codes with their labels. Empty when it has none."""
+    try:
+        config: Any = json.loads(criterion.get("config_json") or "{}")
+        choices: list[Any] = config.get("choices") or []
+        return {str(choice["code"]): str(choice.get("label") or choice["code"]) for choice in choices}
+    except (ValueError, AttributeError, KeyError, TypeError):
+        return {}
+
+
+def typesafe_questions(criteria: list[Row]) -> Row:
+    """One typed question per criterion, named by the criterion's id, and a companion question for
+    each (see ANSWERABLE_AT). A NUMBER criterion is not asked: it is answered from the facts."""
+    questions: Row = {}
+    for criterion in criteria:
+        prompt = str(criterion["prompt"]) + (f" ({criterion['help']})" if criterion.get("help") else "")
+        kind = criterion.get("answer_type")
+        if kind == "YES_NO":
+            questions[criterion["id"]] = {"type": "noul", "instructions": prompt}
+        elif kind == "RATING":
+            questions[criterion["id"]] = {"type": "score", "instructions": prompt, "criteria": RATING_LEVELS}
+        elif kind == "CHOICE" and _choices(criterion):
+            questions[criterion["id"]] = {"type": "choice", "instructions": prompt, "criteria": _choices(criterion)}
+        else:
+            continue
+        # The companion question of this criterion: can the material answer it at all?
+        # It is named by the criterion's id and ".answerable", and typesafe_answers reads it.
+        questions[f"{criterion['id']}.answerable"] = {"type": "noul", "instructions": ANSWERABLE.format(prompt=prompt)}
+    return questions
+
+
+def _chance(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        return None
+    return float(value)
+
+
+def typesafe_answers(criteria: list[Row], replies: Row, parts: Row) -> list[Row]:
+    """The answers to store, from the model's judgments and, for a NUMBER criterion, from the facts.
+    A criterion that is not settled is left out and counts as unknown."""
+    facts: dict[str, str] = {**parts.get("company", {}), **parts.get("facts", {})}
+    answers: list[Row] = []
+
+    def keep(criterion: Row, value: str, probability: float | None, rationale: str | None = None) -> None:
+        answers.append({"criterion_id": criterion["id"], "value": value, "probability": probability, "rationale": rationale})
+
+    for criterion in criteria:
+        kind = criterion.get("answer_type")
+        found: Any = replies.get(criterion["id"])
+        reply: Row = cast(Row, found) if isinstance(found, dict) else {}
+        if kind == "NUMBER":
+            key = criterion.get("enrichment_key")
+            if key and key in facts:
+                keep(criterion, facts[key], None, f"Taken from the fact {key}.")
+            continue
+        other: Any = replies.get(f"{criterion['id']}.answerable")
+        companion: Row = cast(Row, other) if isinstance(other, dict) else {}
+        answerable = _chance(companion.get("noul"))
+        # What the companion said, for the rationale: Jev writes no reason, so this is the one place
+        # where a reader sees that an answer rests on little.
+        if answerable is None:
+            evidence = ""
+        else:
+            evidence = f" Enough information to answer: {answerable:.2f}{' (weak evidence)' if answerable < ANSWERABLE_AT else ''}."
+        if kind == "YES_NO":
+            # Kept or not by its own probability. The companion only marks the evidence.
+            yes = _chance(reply.get("noul"))
+            if yes is not None and yes >= YES_AT:
+                keep(criterion, "YES", yes, f"Jev: yes {yes:.2f}.{evidence}")
+            elif yes is not None and yes <= NO_AT:
+                keep(criterion, "NO", 1 - yes, f"Jev: no {1 - yes:.2f}.{evidence}")
+            continue
+        # A rating or a choice. Its companion question decides whether the pick is kept: below
+        # ANSWERABLE_AT the material does not settle it, and the criterion is left unknown.
+        chances: Any = reply.get("probabilities")
+        if answerable is None or answerable < ANSWERABLE_AT or not isinstance(chances, dict) or not chances:
+            continue
+        # The most likely level or option. A rating's average is not used: it is pulled to the middle.
+        ranked = {str(name): _chance(chance) or 0.0 for name, chance in cast(dict[Any, Any], chances).items()}
+        top = max(ranked, key=lambda name: ranked[name])
+        keep(criterion, top, ranked[top], f"Jev: {'level ' if kind == 'RATING' else ''}{top} at {ranked[top]:.2f}.{evidence}")
+    return answers
+
+
+async def typesafe_post(env: Any, body: Row) -> tuple[int, Row]:
+    """Send one request to TypeSafe. The key comes from Secrets Store and goes nowhere else."""
+    # Loaded by name: the module exists only inside a Worker.
+    workers: Any = importlib.import_module("workers")
+    try:
+        key = await env.TYPESAFE_API_KEY.get()
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_typesafe_error", "detail": f"no API key: {type(e).__name__}"}))
+        raise RunError("The TypeSafe API key is not available to this Worker") from e
+    headers = {"authorization": f"Bearer {key}", "content-type": "application/json"}
+    try:
+        response: Any = await workers.fetch(TYPESAFE_URL, method="POST", headers=headers, body=json.dumps(body))
+        data: Any = await response.json()
+        return int(response.status), cast(Row, data) if isinstance(data, dict) else {}
+    except Exception as e:
+        # The request did not complete, or the reply was not JSON. The key is not part of the detail.
+        logger.error(json.dumps({"event": "carmen_typesafe_error", "detail": f"request failed: {type(e).__name__}"}))
+        raise RunError(f"The TypeSafe API could not be reached ({type(e).__name__})") from e
+
+
+class TypeSafe:
+    def __init__(self, post: Poster = typesafe_post) -> None:
+        self.post = post
+
+    async def research(self, env: Any, model: Row, company: Row, pages: list[str] | None = None) -> Row:
+        raise RunError("This model answers questions and cannot research")
+
+    async def score(self, env: Any, model: Row, criteria: list[Row], material: str) -> Row:
+        parts = material_parts(material)
+        questions = typesafe_questions(criteria)
+        tokens: Row = {"input_tokens": 0, "output_tokens": 0}
+        judged: Row = {}
+        if questions:
+            status, reply = await self.post(env, {"model": model["model_id"], "state": parts, "questions": questions})
+            if status != 200:
+                # The provider's own message stays in the log. A failed call is an error, never an answer.
+                logger.error(json.dumps({"event": "carmen_typesafe_error", "status": status, "detail": json.dumps(reply.get("detail"))[:500]}))
+                limited = " (too many requests; try again later)" if status == 429 else ""
+                raise RunError(f"The TypeSafe API answered {status}{limited}")
+            found: Any = reply.get("answers")
+            if not isinstance(found, dict):
+                raise BadOutput("the reply has no answers")
+            judged = cast(Row, found)
+            # Every judgment is logged, the unsettled ones included, so that a threshold can be checked later.
+            logger.info(json.dumps({"event": "carmen_typesafe_judgments", "model": reply.get("model"), "answers": judged})[:8000])
+            usage: Any = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
+            tokens = {"input_tokens": _count(usage.get("input_tokens")) or 0, "output_tokens": _count(usage.get("output_tokens")) or 0}
+            # An alias such as jev-latest moves; the reply names the version that answered.
+            tokens["model_id_used"] = _text(reply.get("model"), 200)
+        return {"answers": typesafe_answers(criteria, judged, parts), **tokens}
+
+
 # The providers that can run. A model of any other provider cannot start a run.
-ADAPTERS: dict[str, Adapter] = {"STUB": Stub(), "CLAUDE": Claude(), "WORKERS_AI": WorkersAI()}
+ADAPTERS: dict[str, Adapter] = {"STUB": Stub(), "CLAUDE": Claude(), "WORKERS_AI": WorkersAI(), "TYPESAFE": TypeSafe()}
 
 
 # ---- Cleaning what a model returns ---------------------------------------------------------------

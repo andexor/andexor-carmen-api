@@ -73,7 +73,7 @@ from records import (
     slug,
 )
 from roles import ADMIN, DELETE, MANAGE, PUBLIC, READ, WRITE, action, allowed
-from scoring import Row, notable, points, score, valid_config
+from scoring import Row, from_fact, measured, notable, points, score, valid_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("carmen")
@@ -2576,10 +2576,15 @@ async def scoring_statements(env: Any, run: Row, model: Row) -> tuple[list[Any],
         text = ai.material(company, facts["results"])
     criteria, services, thresholds = await load_rubric(database)
     in_use = [criterion for criterion in criteria if criterion["active"]]
-    output = await call_twice(run, lambda: ai.ADAPTERS[model["provider"]].score(env, model, in_use, text))
-    answers, dropped = ai.clean_answers(output.get("answers"), criteria)
+    # A measured criterion is answered by code from its fact, and no model is asked it: a model that
+    # reads text cannot measure. With no such fact it stays unknown.
+    asked = [criterion for criterion in in_use if not measured(criterion)]
+    output = await call_twice(run, lambda: ai.ADAPTERS[model["provider"]].score(env, model, asked, text))
+    answers, dropped = ai.clean_answers(output.get("answers"), asked)
     if dropped:
         run_log(run["id"], "answers_dropped", str(dropped))
+    known = {fact["key"]: fact["value"] for fact in facts["results"]}
+    answers += ai.clean_answers([from_fact(criterion, known) for criterion in in_use], in_use)[0]
     # The run's own scores, from the same engine as the company's. Nothing is applied to the company.
     scores = score(criteria, {answer["criterion_id"]: answer["value"] for answer in answers}, services, thresholds)
     statements = [insert(database, "ai_run_answer", {"ai_run_id": run["id"], **answer}) for answer in answers]
@@ -2639,12 +2644,15 @@ async def process_run(env: Any, run_id: str) -> None:
         tokens_in, tokens_out = ai.token_counts(output)
         finish = (
             "UPDATE ai_run SET status = 'SUCCEEDED', finished_at = ?, dossier = ?, fit_score = ?, need_score = ?,"
-            " confidence = ?, recommendation = ?, input_tokens = ?, output_tokens = ?, search_count = ?, model_ms = ?"
+            " confidence = ?, recommendation = ?, input_tokens = ?, output_tokens = ?, search_count = ?, model_ms = ?,"
+            " model_id_used = COALESCE(?, model_id_used)"
             " WHERE id = ?"
         )
         results = [output.get(key) for key in ("dossier", "fit_score", "need_score", "confidence", "recommendation")]
         searches = output.get("search_count") if isinstance(output.get("search_count"), int) else None
-        statements.append(database.prepare(finish).bind(now_ms(), *results, tokens_in, tokens_out, searches, model_ms, run_id))
+        # An alias can move, so the version that answered replaces the name that was asked for.
+        used = output.get("model_id_used") if isinstance(output.get("model_id_used"), str) else None
+        statements.append(database.prepare(finish).bind(now_ms(), *results, tokens_in, tokens_out, searches, model_ms, used, run_id))
         statements.append(
             insert(database, "activity", run_entry(run, f"{run['kind'].capitalize()} run by {run['label']} finished: {said}"))
         )
