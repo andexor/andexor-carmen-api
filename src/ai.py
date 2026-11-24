@@ -402,8 +402,8 @@ DEFAULT_MAX_PAGES = 8  # used only when the setting ai.research.max_pages is mis
 
 # run(env, model id, body) sends one request and returns the reply as a dict.
 Runner = Callable[[Any, str, Row], Awaitable[Row]]
-# fetch(url) returns (the address after redirects, the HTML), or None.
-Fetcher = Callable[[str], Awaitable[tuple[str, str] | None]]
+# fetch(url) returns (the address after redirects, the HTML), or a short reason why it cannot be read.
+Fetcher = Callable[[str], Awaitable[tuple[str, str] | str]]
 
 
 def workers_ai_limits(model_id: str) -> tuple[int, int]:
@@ -461,9 +461,10 @@ class WorkersAI:
         self.fetch = fetch
 
     async def run_research(self, env: Any, model_id: str, company: Row, services: str, keys: list[Row], max_pages: int) -> Row:
-        read = await site.read_site(company.get("website"), max_pages, self.fetch)
+        read, skipped = await site.read_site(company.get("website"), max_pages, self.fetch)
         if not read:
-            raise RunError("No page of the company's website could be read, and this model cannot search the web")
+            # The reasons are short and safe to show; the details are in the Worker log.
+            raise RunError(f"No page of the company's website could be read ({'; '.join(skipped[:3])}). This model cannot search the web")
         text = site.as_text(site.trim(read, workers_ai_limits(model_id)[1]))
         prompt = render("research-pages", services=services, company=company_text(company), pages=text)
         replies = [await self.run(env, model_id, workers_ai_body(model_id, prompt))]
@@ -476,7 +477,7 @@ class WorkersAI:
             replies.append(await self.run(env, model_id, body))
             try:
                 facts = json_list(workers_ai_text(replies[-1]), "facts")
-                return {"dossier": dossier, "facts": facts, **workers_ai_usage(replies)}
+                return {"dossier": dossier, "facts": facts, "skipped_pages": skipped, **workers_ai_usage(replies)}
             except BadOutput:
                 if attempt == 2:
                     raise RunError("The model's list of facts could not be read, twice") from None
@@ -573,6 +574,17 @@ def clean_answers(raw: object, criteria: list[Row]) -> tuple[list[Row], int]:
             "rationale": _text(answer.get("rationale"), 2000),
         }
     return list(answers.values()), dropped
+
+
+def skipped_note(output: Row, most: int = 5) -> str:
+    """What a run's timeline entry says about pages that could not be read. Empty when there were none."""
+    found: Any = output.get("skipped_pages")
+    skipped = [str(item)[:300] for item in cast(list[Any], found)] if isinstance(found, list) else []
+    if not skipped:
+        return ""
+    more = f"; and {len(skipped) - most} more" if len(skipped) > most else ""
+    pages = "1 page" if len(skipped) == 1 else f"{len(skipped)} pages"
+    return f"; {pages} could not be read: {'; '.join(skipped[:most])}{more}"
 
 
 def token_counts(output: Row) -> tuple[int | None, int | None]:
