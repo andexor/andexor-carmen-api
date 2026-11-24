@@ -262,9 +262,9 @@ class ClaudeReplies(unittest.TestCase):
             ai.claude_check(200, reply("x", stop="refusal"))
         with self.assertRaisesRegex(ai.RunError, "cut off"):
             ai.claude_check(200, reply("x", stop="max_tokens"))
-        secret = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key sk-secret"}}
+        failure = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key sk-secret"}}
         with self.assertLogs("carmen", level="ERROR"), self.assertRaises(ai.RunError) as caught:
-            ai.claude_check(401, secret)
+            ai.claude_check(401, failure)
         self.assertEqual(str(caught.exception), "The Claude API answered 401 (authentication_error)")
         self.assertNotIn("sk-secret", str(caught.exception))
         ai.claude_check(200, reply("fine"))
