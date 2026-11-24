@@ -88,7 +88,23 @@
                         "max_retries": 1
                     }
                 ]
-            }
+            },
+            "secrets_store_secrets": [
+                {
+                    "binding": "CLAUDE_API_KEY",
+                    "store_id": "9981f1115d4747dc92397cb729164810",
+                    "secret_name": "carmen-claude-api-key"
+                }
+            ],
+            "rules": [
+                {
+                    "type": "Data",
+                    "globs": [
+                        "prompts/*.md"
+                    ],
+                    "fallthrough": true
+                }
+            ]
         }
     },
     "r2_buckets": [
@@ -112,5 +128,21 @@
                 "max_retries": 1
             }
         ]
-    }
+    },
+    "secrets_store_secrets": [
+        {
+            "binding": "CLAUDE_API_KEY",
+            "store_id": "9981f1115d4747dc92397cb729164810",
+            "secret_name": "carmen-claude-api-key"
+        }
+    ],
+    "rules": [
+        {
+            "type": "Data",
+            "globs": [
+                "prompts/*.md"
+            ],
+            "fallthrough": true
+        }
+    ]
 }

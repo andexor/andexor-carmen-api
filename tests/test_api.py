@@ -399,10 +399,27 @@ class Config(unittest.TestCase):
             self.assertEqual(environment["d1_databases"][0]["binding"], "DB")
             self.assertEqual(environment["r2_buckets"][0]["binding"], "DOCS")
             self.assertEqual(environment["queues"]["producers"][0]["binding"], "RUNS")
+            # The Claude key is bound in both, so that the adapter can be tried on the preview first.
+            self.assertEqual(environment["secrets_store_secrets"][0]["binding"], "CLAUDE_API_KEY")
+            # The prompt files are packaged with the Worker.
+            self.assertIn("prompts/*.md", environment["rules"][0]["globs"])
             # Each Worker consumes its own queue, one run at a time, with one more delivery after a crash.
             consumer = environment["queues"]["consumers"][0]
             self.assertEqual(consumer["queue"], environment["queues"]["producers"][0]["queue"])
             self.assertEqual((consumer["max_batch_size"], consumer["max_retries"]), (1, 1))
+
+    def test_no_secret_value_is_in_the_config(self):
+        # A binding names a secret; it never holds one. An Anthropic key starts with sk-ant.
+        self.assertNotIn("sk-ant", self.text.lower())
+        for environment in (self.config, self.config["env"]["preview"]):
+            for secret in environment["secrets_store_secrets"]:
+                self.assertEqual(set(secret), {"binding", "store_id", "secret_name"})
+
+    def test_the_smoke_test_calls_no_paid_model(self):
+        smoke = (ROOT / "preview-test.sh").read_text()
+        self.assertIn('select(.provider == "STUB")', smoke)
+        for provider in ("CLAUDE", "WORKERS_AI", "TYPESAFE"):
+            self.assertNotIn(provider, smoke)
 
     def test_production_allows_no_other_origin(self):
         self.assertEqual(self.config["vars"]["ALLOWED_ORIGINS"], "")
