@@ -178,7 +178,19 @@ expect 200 "Task Smoke task edited: title 'Smoke task' to 'Smoke task 2'" "${BAS
 expect 201 '"status":"DRAFT"' -X POST "${JSON[@]}" \
     -d "{\"company_id\":\"${ID}\",\"type\":\"MSA\",\"title\":\"Smoke MSA\",\"signed_date\":\"11/01/2026\"}" "${BASE}/agreements"
 AGREEMENT=$(jq -r '.id' "${BODY}")
-expect 200 '"status":"ACTIVE"' -X PATCH "${JSON[@]}" -d '{"status":"ACTIVE"}' "${BASE}/agreements/${AGREEMENT}"
+# An agreement cannot become active without a renewal policy and an end basis (specs/024-renewal-policy/spec.md).
+expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"status":"ACTIVE"}' "${BASE}/agreements/${AGREEMENT}"
+expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"status":"ACTIVE","renewal_policy":"AUTO_RENEW"}' "${BASE}/agreements/${AGREEMENT}"
+expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" \
+    -d '{"status":"ACTIVE","renewal_policy":"AUTO_RENEW","end_basis":"INTERNAL_DECISION"}' "${BASE}/agreements/${AGREEMENT}"
+expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" \
+    -d '{"status":"ACTIVE","renewal_policy":"AUTO_RENEW","end_basis":"SIGNED_CONTRACT","end_date":"2030-01-31"}' "${BASE}/agreements/${AGREEMENT}"
+expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" \
+    -d '{"status":"ACTIVE","renewal_policy":"APPROVAL","end_basis":"SIGNED_CONTRACT","end_date":"2030-01-31"}' "${BASE}/agreements/${AGREEMENT}"
+expect 200 '"status":"ACTIVE"' -X PATCH "${JSON[@]}" \
+    -d '{"status":"ACTIVE","renewal_policy":"AUTO_RENEW","end_basis":"SIGNED_CONTRACT"}' "${BASE}/agreements/${AGREEMENT}"
+# Only an agreement that renews on approval can have its renewal approved.
+expect 409 '"error":"CONFLICT"' -X POST "${BASE}/agreements/${AGREEMENT}/renewal"
 expect 200 '"title":"Smoke MSA"' "${BASE}/agreements?company_id=${ID}&status=ACTIVE"
 printf 'smoke document\n' > "${FILE}"
 expect 201 '"size_bytes":15' -X POST -H "Content-Type: text/plain" --data-binary "@${FILE}" \
@@ -358,18 +370,23 @@ STAG="sched${RANDOM}${RANDOM}"
 expect 201 '"stage":"LEAD"' "${JSON[@]}" -d "{\"name\":\"Scheduler ${STAG}\"}" "${BASE}/companies"
 SCO=$(jq -r '.id' "${BODY}")
 expect 201 '"status":"ACTIVE"' "${JSON[@]}" \
-    -d "{\"company_id\":\"${SCO}\",\"type\":\"MSA\",\"title\":\"Renewing ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '+10 days' +%F)\",\"renewal_notice_days\":30}" "${BASE}/agreements"
+    -d "{\"company_id\":\"${SCO}\",\"type\":\"MSA\",\"title\":\"Renewing ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '+10 days' +%F)\",\"renewal_notice_days\":30,\"renewal_policy\":\"APPROVAL\",\"end_basis\":\"SIGNED_CONTRACT\",\"term_months\":6}" "${BASE}/agreements"
 RENEWING=$(jq -r '.id' "${BODY}")
 expect 201 '"status":"ACTIVE"' "${JSON[@]}" \
-    -d "{\"company_id\":\"${SCO}\",\"type\":\"MSA\",\"title\":\"Ended ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '-3 days' +%F)\"}" "${BASE}/agreements"
+    -d "{\"company_id\":\"${SCO}\",\"type\":\"MSA\",\"title\":\"Ended ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '-3 days' +%F)\",\"renewal_policy\":\"APPROVAL\",\"end_basis\":\"INTERNAL_DECISION\",\"end_basis_reason\":\"Smoke test\",\"term_months\":6}" "${BASE}/agreements"
 ENDED=$(jq -r '.id' "${BODY}")
+expect 201 '"status":"ACTIVE"' "${JSON[@]}" \
+    -d "{\"company_id\":\"${SCO}\",\"type\":\"SOW\",\"title\":\"Project ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '-3 days' +%F)\",\"renewal_policy\":\"ONE_TIME\",\"end_basis\":\"SIGNED_CONTRACT\"}" "${BASE}/agreements"
+PROJECT=$(jq -r '.id' "${BODY}")
 expect 200 '"failed":\[\]' -X POST "${BASE}/scheduler/run"
-if [[ "$(jq -c '[.expired >= 1, .alerts >= 1]' "${BODY}")" != "[true,true]" ]]; then
-    echo "FAILED: the run should expire one agreement and alert for another: $(cat "${BODY}")"
+if [[ "$(jq -c '[.expired >= 1, .completed >= 1, .alerts >= 1]' "${BODY}")" != "[true,true,true]" ]]; then
+    echo "FAILED: the run should expire one agreement, complete another, and alert for a third: $(cat "${BODY}")"
     exit 1
 fi
-echo "ok: the run expired an agreement and made an alert"
+echo "ok: the run expired an agreement, completed another, and made an alert"
 expect 200 '"status":"EXPIRED"' "${BASE}/agreements/${ENDED}"
+expect 200 '"status":"COMPLETED"' "${BASE}/agreements/${PROJECT}"
+expect 409 '"error":"CONFLICT"' -X POST "${BASE}/agreements/${ENDED}/renewal"
 expect 200 "It ended on" "${BASE}/companies/${SCO}/activities?kind=SYSTEM"
 expect 200 "\"subject\":\"Renewal: Renewing ${STAG} ends" "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
 expect 200 '"status":"STUBBED"' "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
@@ -382,8 +399,17 @@ if [[ "$(jq -c '.items | length' "${BODY}")" != "1" ]]; then
     exit 1
 fi
 echo "ok: the second run made no second alert"
+# Approving the renewal moves the end date forward by the term, records it, and closes the task.
+expect 200 '"status":"ACTIVE"' -X POST "${BASE}/agreements/${RENEWING}/renewal"
+if [[ "$(jq -r '.end_date' "${BODY}")" < "$(date -u -d '+5 months' +%F)" ]]; then
+    echo "FAILED: the end date should be about six months later: $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: the renewal moved the end date forward by the term"
+expect 200 "renewal approved for 6 months" "${BASE}/companies/${SCO}/activities?kind=SYSTEM"
+expect 200 '"status":"DONE"' "${BASE}/tasks?company_id=${SCO}"
 # Only a draft can be deleted.
-for agreement in "${RENEWING}" "${ENDED}"; do
+for agreement in "${RENEWING}" "${ENDED}" "${PROJECT}"; do
     expect 200 '"status":"DRAFT"' -X PATCH -H 'Content-Type: application/json' -d '{"status":"DRAFT"}' "${BASE}/agreements/${agreement}"
     expect 204 '' -X DELETE "${BASE}/agreements/${agreement}"
 done

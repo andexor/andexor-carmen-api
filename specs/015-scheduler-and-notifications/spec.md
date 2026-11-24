@@ -10,7 +10,7 @@ Author: Ed Jenkins
 
 **Created**: 2026-11-24
 
-**Status**: Implemented, and live on the preview. Changed by `specs/023-weekday-digest/spec.md`: the digest is made on weekdays, and also when it is empty.
+**Status**: Implemented, and live on the preview. Changed by `specs/023-weekday-digest/spec.md`: the digest is made on weekdays, and also when it is empty. Changed by `specs/024-renewal-policy/spec.md`: an agreement ends by its renewal policy.
 
 **Input**: Issue #44. Backlog feature 015: once an hour the Worker looks at what is due. It sends a daily digest, alerts before an agreement ends or renews, and marks an ended agreement as expired. Email goes through Cloudflare Email Sending, as decided in `andexor-carmen-main/specs/001-review-open-items/decisions.md` (Q5). Where this spec and an earlier document differ, this spec governs.
 
