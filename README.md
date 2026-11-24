@@ -16,7 +16,8 @@ src/worker.py        the Worker entry point
 src/app.py           the FastAPI application: identity, role check, endpoints
 src/records.py       what a caller may write to each kind of record, the date rule, and the domain rule
 src/scoring.py       the scoring engine: points, Fit, Need, confidence, recommendation
-src/ai.py            AI adapters (the stub so far), and the cleaning of what a model returns
+src/ai.py            AI adapters (stub, Claude), and the cleaning of what a model returns
+src/prompts/         the prompts a model is given, as files with {{name}} placeholders
 src/access.py        Cloudflare Access token verification
 src/roles.py         who may do what
 tests/               unit tests, run by unit-test.sh
@@ -49,6 +50,7 @@ Nothing is served from `workers.dev`.
 | `run.sh` | Local run at `http://localhost:8787`, with a local database built from the migrations. Acts as the user named by `DEV_USER_EMAIL` in `.dev.vars` |
 | `preview-create.sh` | Finds or creates the preview database, bucket, and queue, and applies the migrations. Safe to run again |
 | `preview-test.sh` | Runs the unit tests, migrates the preview database, deploys the preview Worker, and smoke tests it through Cloudflare Access |
+| `ai-test.sh` | Tries a real AI model on the preview, on demand: list, enable, or disable models, or run one. `run` costs money. Not part of the pipeline |
 | `preview-delete.sh` | Deletes the preview Worker, the preview database, and the preview bucket if it is empty. Never touches production |
 | `health.sh` | Health check through Cloudflare Access: `./health.sh [preview\|production] [tries]` |
 | `deploy.sh` | Production deploy by hand: runs `preview-test.sh` first, then migrates and deploys production |

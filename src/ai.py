@@ -5,18 +5,25 @@
 """AI adapters, and what is done with their output. See specs/009-ai-runs/spec.md.
 
 One adapter per AI_PROVIDER code. An adapter has two methods, research and score, and makes plain
-HTTP requests: no provider's Software Development Kit (SDK) is used. This feature holds the stub
-adapter only; the real ones are added by features 010 to 012.
+HTTP requests: no provider's Software Development Kit (SDK) is used, because one may not load in a
+Python Worker. The stub is in specs/009-ai-runs/spec.md, Claude in specs/010-ai-adapter-claude/spec.md.
 
 Everything a model returns is untrusted. It is cleaned here, by pure functions, before it is stored:
 nothing a model says is taken as an instruction, and nothing is applied to a company by a run.
 """
 
+import importlib
 import json
+import logging
+import pathlib
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, cast
 
 from records import BadBody, fact_key, fact_value
 from scoring import Row, points
+
+
+logger = logging.getLogger("carmen")
 
 
 class RunError(Exception):
@@ -100,8 +107,259 @@ class Stub:
         return stub_score(criteria)
 
 
+# ---- Prompts -------------------------------------------------------------------------------------
+# Files in src/prompts, so that they can be edited without touching code. A placeholder is {{name}}.
+
+PROMPTS = pathlib.Path(__file__).parent / "prompts"
+
+
+def render(name: str, **values: str) -> str:
+    """The prompt file with its placeholders filled in. A placeholder with no value is an error."""
+    text = (PROMPTS / f"{name}.md").read_text()
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    if "{{" in text:
+        raise RunError(f"The prompt {name} has a placeholder with no value")
+    return text
+
+
+def company_text(company: Row) -> str:
+    """The company as data for a prompt: the same fields a scoring model is given."""
+    return "\n".join(f"{column}: {company[column]}" for column in COMPANY_FACTS if company.get(column) is not None)
+
+
+def keys_text(keys: list[Row]) -> str:
+    return "\n".join(f"- {row['key']} ({row['value_type']}): {row.get('description') or row.get('label') or ''}" for row in keys)
+
+
+def criteria_text(criteria: list[Row]) -> str:
+    """The criteria as one JSON object per line: id, question, type, and for a choice its codes."""
+    lines: list[str] = []
+    for criterion in criteria:
+        item: Row = {"criterion_id": criterion["id"], "question": criterion["prompt"], "type": criterion["answer_type"]}
+        if criterion.get("help"):
+            item["help"] = criterion["help"]
+        if criterion["answer_type"] == "CHOICE":
+            try:
+                config: Any = json.loads(criterion.get("config_json") or "{}")
+                choices: list[Any] = config.get("choices") or []
+                item["choices"] = [{"code": choice["code"], "label": choice.get("label")} for choice in choices]
+            except (ValueError, AttributeError, KeyError, TypeError):
+                item["choices"] = []
+        lines.append(json.dumps(item))
+    return "\n".join(lines)
+
+
+# ---- The Claude adapter --------------------------------------------------------------------------
+# The Messages API over plain HTTPS. Research is two requests: one with the web search tool, which
+# writes the dossier, and one with no tools, which lists the dossier's facts in a fixed JSON shape.
+# They are separate because web search always returns citations, and the API refuses citations
+# together with a fixed JSON shape. Scoring is one request with a fixed JSON shape.
+
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_VERSION = "2026-10-21"
+CLAUDE_MAX_TOKENS = 16000
+WEB_SEARCH_TOOL = "web_search_20260209"
+DEFAULT_MAX_SEARCHES = 5  # each search is billed; the setting ai.research.max_searches overrides this
+MAX_PAUSES = 3
+
+# post(env, body) sends one request and returns (HTTP status, the response as a dict).
+Poster = Callable[[Any, Row], Awaitable[tuple[int, Row]]]
+
+_TEXT_OR_NULL = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+FACTS_SCHEMA: Row = {
+    "type": "object",
+    "properties": {
+        "facts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                    "source_url": _TEXT_OR_NULL,
+                    "notes": _TEXT_OR_NULL,
+                },
+                "required": ["key", "value", "source_url", "notes"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["facts"],
+    "additionalProperties": False,
+}
+ANSWERS_SCHEMA: Row = {
+    "type": "object",
+    "properties": {
+        "answers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "criterion_id": {"type": "string"},
+                    "value": {"type": "string"},
+                    "probability": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    "rationale": _TEXT_OR_NULL,
+                },
+                "required": ["criterion_id", "value", "probability", "rationale"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["answers"],
+    "additionalProperties": False,
+}
+
+
+def claude_search_body(model_id: str, prompt: str, max_searches: int) -> Row:
+    return {
+        "model": model_id,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [{"type": WEB_SEARCH_TOOL, "name": "web_search", "max_uses": max_searches}],
+    }
+
+
+def claude_json_body(model_id: str, prompt: str, schema: Row) -> Row:
+    return {
+        "model": model_id,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+        "output_config": {"format": {"type": "json_schema", "schema": schema}},
+    }
+
+
+def claude_check(status: int, reply: Row) -> None:
+    """Raise RunError unless the reply is a complete answer. The message is safe to store and show."""
+    if status != 200:
+        problem: Any = reply.get("error") if isinstance(reply.get("error"), dict) else {}
+        # The provider's own message stays in the log. Only its error type is shown.
+        logger.error(json.dumps({"event": "carmen_claude_error", "status": status, "detail": str(problem.get("message"))[:500]}))
+        raise RunError(f"The Claude API answered {status} ({problem.get('type') or 'no error type'})")
+    reason = reply.get("stop_reason")
+    if reason == "refusal":
+        raise RunError("Claude declined the request")
+    if reason == "max_tokens":
+        raise RunError("Claude's answer was cut off at the token limit")
+
+
+def claude_text(reply: Row) -> str:
+    """The final answer: the text after the last tool block. Text before a search is only a note
+    that the model is about to search."""
+    parts: list[str] = []
+    content: Any = reply.get("content")
+    for item in cast(list[Any], content) if isinstance(content, list) else []:
+        block: Row = cast(Row, item) if isinstance(item, dict) else {}
+        if block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+        elif block.get("type") != "thinking":
+            parts = []
+    return "".join(parts).strip()
+
+
+def claude_usage(replies: list[Row]) -> Row:
+    """Tokens and searches over every request of one run. Cached input tokens are input tokens too."""
+    tokens_in = tokens_out = searches = 0
+    for reply in replies:
+        usage: Any = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
+        for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            tokens_in += _count(usage.get(key)) or 0
+        tokens_out += _count(usage.get("output_tokens")) or 0
+        tools: Any = usage.get("server_tool_use") if isinstance(usage.get("server_tool_use"), dict) else {}
+        searches += _count(tools.get("web_search_requests")) or 0
+    return {"input_tokens": tokens_in, "output_tokens": tokens_out, "search_count": searches}
+
+
+def claude_json(reply: Row, key: str) -> list[Any]:
+    """The list under the key in a reply that was asked for a fixed JSON shape. Raises BadOutput."""
+    try:
+        data: Any = json.loads(claude_text(reply))
+        found: Any = data[key]
+    except (ValueError, KeyError, TypeError) as e:
+        raise BadOutput(f"the reply is not the JSON that was asked for: {type(e).__name__}") from e
+    if not isinstance(found, list):
+        raise BadOutput(f"{key} is not a list")
+    return cast(list[Any], found)
+
+
+async def claude_post(env: Any, body: Row) -> tuple[int, Row]:
+    """Send one request to the Messages API. The key comes from Secrets Store and goes nowhere else."""
+    # Loaded by name: the module exists only inside a Worker.
+    workers: Any = importlib.import_module("workers")
+    try:
+        key = await env.CLAUDE_API_KEY.get()
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_claude_error", "detail": f"no API key: {type(e).__name__}"}))
+        raise RunError("The Claude API key is not available to this Worker") from e
+    headers = {"x-api-key": str(key), "anthropic-version": CLAUDE_VERSION, "content-type": "application/json"}
+    response: Any = await workers.fetch(CLAUDE_URL, method="POST", headers=headers, body=json.dumps(body))
+    data: Any = await response.json()
+    return int(response.status), cast(Row, data) if isinstance(data, dict) else {}
+
+
+class Claude:
+    def __init__(self, post: Poster = claude_post) -> None:
+        self.post = post
+
+    async def ask(self, env: Any, body: Row) -> list[Row]:
+        """Send a request, and send it again while the API pauses a long search turn."""
+        replies: list[Row] = []
+        messages: list[Row] = list(body["messages"])
+        for _ in range(MAX_PAUSES + 1):
+            status, reply = await self.post(env, {**body, "messages": messages})
+            claude_check(status, reply)
+            replies.append(reply)
+            if reply.get("stop_reason") != "pause_turn":
+                return replies
+            # The paused answer goes back unchanged, and the API carries on from it.
+            messages = [*body["messages"], {"role": "assistant", "content": reply["content"]}]
+        raise RunError("Claude paused the search too many times")
+
+    async def find_facts(self, env: Any, model_id: str, dossier: str, keys: list[Row]) -> tuple[list[Any], list[Row]]:
+        """List the dossier's facts. Output that cannot be read is asked for once more: the search is
+        the costly part, and it is not repeated for this."""
+        body = claude_json_body(model_id, render("facts", dossier=dossier, keys=keys_text(keys)), FACTS_SCHEMA)
+        replies: list[Row] = []
+        for attempt in (1, 2):
+            replies += await self.ask(env, body)
+            try:
+                return claude_json(replies[-1], "facts"), replies
+            except BadOutput:
+                if attempt == 2:
+                    raise RunError("Claude's list of facts could not be read, twice") from None
+        return [], replies
+
+    async def run_research(self, env: Any, model_id: str, company: Row, services: str, keys: list[Row], max_searches: int) -> Row:
+        prompt = render("research", services=services, company=company_text(company))
+        replies = await self.ask(env, claude_search_body(model_id, prompt, max_searches))
+        dossier = claude_text(replies[-1])
+        if not dossier:
+            raise RunError("Claude returned no dossier")
+        facts, more = await self.find_facts(env, model_id, dossier, keys)
+        return {"dossier": dossier, "facts": facts, **claude_usage(replies + more)}
+
+    async def research(self, env: Any, model: Row, company: Row, pages: list[str] | None = None) -> Row:
+        found = await env.DB.batch(
+            [
+                env.DB.prepare("SELECT name FROM service WHERE active = 1 AND offered = 1 ORDER BY sort_order, name"),
+                env.DB.prepare("SELECT key, label, value_type, description FROM enrichment_key WHERE active = 1 ORDER BY sort_order, key"),
+                env.DB.prepare("SELECT value FROM setting WHERE key = 'ai.research.max_searches'"),
+            ]
+        )
+        services = ", ".join(row["name"] for row in found[0]["results"])
+        limit = found[2]["results"]
+        wanted = str(limit[0]["value"]) if limit else ""
+        max_searches = min(20, max(1, int(wanted))) if wanted.isdigit() else DEFAULT_MAX_SEARCHES
+        return await self.run_research(env, model["model_id"], company, services, found[1]["results"], max_searches)
+
+    async def score(self, env: Any, model: Row, criteria: list[Row], material: str) -> Row:
+        prompt = render("scoring", criteria=criteria_text(criteria), material=material)
+        replies = await self.ask(env, claude_json_body(model["model_id"], prompt, ANSWERS_SCHEMA))
+        return {"answers": claude_json(replies[-1], "answers"), **claude_usage(replies)}
+
+
 # The providers that can run. A model of any other provider cannot start a run.
-ADAPTERS: dict[str, Adapter] = {"STUB": Stub()}
+ADAPTERS: dict[str, Adapter] = {"STUB": Stub(), "CLAUDE": Claude()}
 
 
 # ---- Cleaning what a model returns ---------------------------------------------------------------

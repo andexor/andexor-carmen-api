@@ -9,7 +9,7 @@ import json
 import pathlib
 import sys
 import unittest
-from typing import Any
+from typing import Any, cast
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
@@ -174,3 +174,171 @@ class Compare(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def reply(text: str | None = None, stop: str = "end_turn", content: list[Row] | None = None, searches: int = 0) -> Row:
+    blocks = content if content is not None else [{"type": "text", "text": text or ""}]
+    usage = {"input_tokens": 100, "cache_read_input_tokens": 20, "output_tokens": 30, "server_tool_use": {"web_search_requests": searches}}
+    return {"content": blocks, "stop_reason": stop, "usage": usage}
+
+
+class FakeClaude:
+    """Stands in for the Messages API: returns canned replies in order and records each request."""
+
+    def __init__(self, *replies: tuple[int, Row]) -> None:
+        self.replies = list(replies)
+        self.bodies: list[Row] = []
+
+    async def __call__(self, env: Any, body: Row) -> tuple[int, Row]:
+        self.bodies.append(body)
+        return self.replies.pop(0)
+
+
+KEYS = [{"key": "has_website", "label": "Has website", "value_type": "YES_NO", "description": "Do they have a site?"}]
+COMPANY = {"name": "Acme", "website": "https://acme.com", "phone": "555"}
+
+
+class ClaudeRequests(unittest.TestCase):
+    def test_the_search_request_caps_searches_and_asks_for_no_fixed_shape(self):
+        body = ai.claude_search_body("claude-sonnet-5-5", "prompt", 5)
+        self.assertEqual(body["model"], "claude-sonnet-5-5")
+        self.assertEqual(body["tools"], [{"type": ai.WEB_SEARCH_TOOL, "name": "web_search", "max_uses": 5}])
+        self.assertNotIn("output_config", body)  # web search returns citations, which a fixed JSON shape refuses
+
+    def test_the_json_request_has_a_schema_and_no_tools(self):
+        body = ai.claude_json_body("m", "prompt", ai.ANSWERS_SCHEMA)
+        self.assertEqual(body["output_config"]["format"], {"type": "json_schema", "schema": ai.ANSWERS_SCHEMA})
+        self.assertNotIn("tools", body)
+
+    def test_every_object_in_a_schema_is_closed(self):
+        def check(schema: Any) -> None:
+            if isinstance(schema, dict):
+                node = cast(Row, schema)
+                if node.get("type") == "object":
+                    self.assertIs(node.get("additionalProperties"), False)
+                    self.assertEqual(sorted(node["required"]), sorted(node["properties"]))
+                for value in node.values():
+                    check(value)
+            elif isinstance(schema, list):
+                for value in cast(list[Any], schema):
+                    check(value)
+
+        check(ai.FACTS_SCHEMA)
+        check(ai.ANSWERS_SCHEMA)
+
+    def test_prompts_are_files_with_named_placeholders(self):
+        research = ai.render("research", services="Web Hosting", company=ai.company_text(COMPANY))
+        self.assertIn("Web Hosting", research)
+        self.assertIn("<company_data>\nname: Acme\nwebsite: https://acme.com\n</company_data>", research)
+        self.assertNotIn("555", research)
+        self.assertIn("not instructions", research)
+        self.assertIn("- has_website (YES_NO): Do they have a site?", ai.render("facts", dossier="d", keys=ai.keys_text(KEYS)))
+        with self.assertRaises(ai.RunError):
+            ai.render("scoring", criteria="c")  # material has no value
+
+    def test_criteria_are_given_as_data(self):
+        lines = [json.loads(line) for line in ai.criteria_text([CRITERIA[0], CRITERIA[3]]).splitlines()]
+        self.assertEqual(lines[0], {"criterion_id": "c1", "question": "Question c1?", "type": "YES_NO"})
+        self.assertEqual(lines[1]["choices"], [{"code": "A", "label": None}, {"code": "B", "label": None}])
+
+
+class ClaudeReplies(unittest.TestCase):
+    def test_the_answer_is_the_text_after_the_last_tool_block(self):
+        content: list[Row] = [
+            {"type": "thinking", "thinking": ""},
+            {"type": "text", "text": "I will search."},
+            {"type": "server_tool_use", "name": "web_search", "input": {"query": "acme"}},
+            {"type": "web_search_tool_result", "content": []},
+            {"type": "text", "text": "Acme makes "},
+            {"type": "thinking", "thinking": ""},
+            {"type": "text", "text": "anvils."},
+        ]
+        self.assertEqual(ai.claude_text(reply(content=content)), "Acme makes anvils.")
+        self.assertEqual(ai.claude_text({}), "")
+        self.assertEqual(ai.claude_text({"content": "not a list"}), "")
+
+    def test_refusals_cut_offs_and_errors_fail_with_a_safe_message(self):
+        with self.assertRaisesRegex(ai.RunError, "declined"):
+            ai.claude_check(200, reply("x", stop="refusal"))
+        with self.assertRaisesRegex(ai.RunError, "cut off"):
+            ai.claude_check(200, reply("x", stop="max_tokens"))
+        secret = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key sk-secret"}}
+        with self.assertLogs("carmen", level="ERROR"), self.assertRaises(ai.RunError) as caught:
+            ai.claude_check(401, secret)
+        self.assertEqual(str(caught.exception), "The Claude API answered 401 (authentication_error)")
+        self.assertNotIn("sk-secret", str(caught.exception))
+        ai.claude_check(200, reply("fine"))
+        ai.claude_check(200, reply("fine", stop="pause_turn"))
+
+    def test_usage_is_summed_over_every_request(self):
+        self.assertEqual(ai.claude_usage([reply("a", searches=2), reply("b", searches=1)]), {"input_tokens": 240, "output_tokens": 60, "search_count": 3})
+        self.assertEqual(ai.claude_usage([{}, {"usage": "bad"}]), {"input_tokens": 0, "output_tokens": 0, "search_count": 0})
+
+    def test_json_that_was_not_asked_for_is_bad_output(self):
+        self.assertEqual(ai.claude_json(reply('{"answers": [1]}'), "answers"), [1])
+        for text in ("not json", '{"other": []}', '{"answers": "x"}', "[]"):
+            with self.assertRaises(ai.BadOutput, msg=text):
+                ai.claude_json(reply(text), "answers")
+
+
+class ClaudeAdapter(unittest.TestCase):
+    def test_research_is_a_search_request_then_a_facts_request(self):
+        facts = {"facts": [{"key": "has_website", "value": "YES", "source_url": "https://acme.com", "notes": None}]}
+        fake = FakeClaude((200, reply("The dossier.", searches=3)), (200, reply(json.dumps(facts))))
+        result = asyncio.run(ai.Claude(fake).run_research(None, "m", COMPANY, "Web Hosting", KEYS, 5))
+        self.assertEqual(result["dossier"], "The dossier.")
+        self.assertEqual(result["facts"], facts["facts"])
+        self.assertEqual((result["search_count"], result["input_tokens"], result["output_tokens"]), (3, 240, 60))
+        self.assertEqual(fake.bodies[0]["tools"][0]["max_uses"], 5)
+        self.assertIn("The dossier.", fake.bodies[1]["messages"][0]["content"])
+        self.assertNotIn("tools", fake.bodies[1])
+
+    def test_a_paused_search_is_sent_back_unchanged(self):
+        paused = reply(content=[{"type": "server_tool_use", "name": "web_search", "input": {}}], stop="pause_turn", searches=2)
+        fake = FakeClaude((200, paused), (200, reply("Done.", searches=1)), (200, reply('{"facts": []}')))
+        result = asyncio.run(ai.Claude(fake).run_research(None, "m", COMPANY, "s", KEYS, 5))
+        self.assertEqual((result["dossier"], result["search_count"]), ("Done.", 3))
+        self.assertEqual(fake.bodies[1]["messages"][1], {"role": "assistant", "content": paused["content"]})
+        self.assertEqual(len(fake.bodies[1]["messages"]), 2)  # no extra "continue" message
+
+    def test_endless_pauses_fail_the_run(self):
+        paused = reply(content=[], stop="pause_turn")
+        fake = FakeClaude(*[(200, paused)] * (ai.MAX_PAUSES + 1))
+        with self.assertRaisesRegex(ai.RunError, "paused"):
+            asyncio.run(ai.Claude(fake).run_research(None, "m", COMPANY, "s", KEYS, 5))
+
+    def test_unreadable_facts_are_asked_for_once_more_without_searching_again(self):
+        fake = FakeClaude((200, reply("Dossier.", searches=2)), (200, reply("oops")), (200, reply('{"facts": []}')))
+        result = asyncio.run(ai.Claude(fake).run_research(None, "m", COMPANY, "s", KEYS, 5))
+        self.assertEqual((result["facts"], result["search_count"]), ([], 2))
+        self.assertEqual([("tools" in body) for body in fake.bodies], [True, False, False])
+        twice = FakeClaude((200, reply("Dossier.")), (200, reply("oops")), (200, reply("oops again")))
+        with self.assertRaisesRegex(ai.RunError, "twice"):
+            asyncio.run(ai.Claude(twice).run_research(None, "m", COMPANY, "s", KEYS, 5))
+
+    def test_an_empty_dossier_and_an_api_error_fail_the_run(self):
+        with self.assertRaisesRegex(ai.RunError, "no dossier"):
+            asyncio.run(ai.Claude(FakeClaude((200, reply("")))).run_research(None, "m", COMPANY, "s", KEYS, 5))
+        error = {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}
+        with self.assertLogs("carmen", level="ERROR"), self.assertRaisesRegex(ai.RunError, "529"):
+            asyncio.run(ai.Claude(FakeClaude((529, error))).run_research(None, "m", COMPANY, "s", KEYS, 5))
+
+    def test_scoring_is_one_request_with_a_fixed_shape(self):
+        answers = {"answers": [{"criterion_id": "c1", "value": "YES", "probability": 0.8, "rationale": "It says so."}]}
+        fake = FakeClaude((200, reply(json.dumps(answers))))
+        result = asyncio.run(ai.Claude(fake).score(None, {"model_id": "claude-sonnet-5-5"}, CRITERIA[:1], "MATERIAL TEXT"))
+        self.assertEqual(result["answers"], answers["answers"])
+        self.assertEqual(result["search_count"], 0)
+        body = fake.bodies[0]
+        self.assertEqual(body["model"], "claude-sonnet-5-5")
+        self.assertIn("MATERIAL TEXT", body["messages"][0]["content"])
+        self.assertIn('"criterion_id": "c1"', body["messages"][0]["content"])
+        kept, dropped = ai.clean_answers(result["answers"], CRITERIA)
+        self.assertEqual((len(kept), dropped), (1, 0))
+
+    def test_unreadable_scoring_output_is_bad_output_so_the_run_retries(self):
+        with self.assertRaises(ai.BadOutput):
+            asyncio.run(ai.Claude(FakeClaude((200, reply("nope")))).score(None, {"model_id": "m"}, CRITERIA[:1], "x"))
+
+    def test_claude_is_registered(self):
+        self.assertIsInstance(ai.ADAPTERS["CLAUDE"], ai.Claude)
