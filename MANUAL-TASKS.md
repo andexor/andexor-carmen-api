@@ -57,6 +57,7 @@ No billing account should be needed for this API. If the console asks for one, s
 - [X] Recompute the stored scores in production. Not needed: production held no companies and no answers when the Need direction changed (checked on 2026-11-24).
 - [ ] Feature 015 (scheduler and notifications): confirm that the test alert sent from the preview on 2026-11-24, "Renewal: Test agreement from the Carmen preview", reached the inbox.
 - [ ] After the first morning in production with something to report, confirm that the digest reached the inbox. That closes master question Q5.
+- [ ] After the first one-time agreement is completed in production, confirm that the proposals email reached the inbox and that its research is from that day (`specs/025-service-proposals/spec.md`).
 
 ## A service token for production (for later)
 

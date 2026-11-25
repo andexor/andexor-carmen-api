@@ -92,6 +92,35 @@ def digest_sections(lists: dict[str, list[dict[str, Any]]]) -> str:
     return "\n\n".join(parts)
 
 
+NO_PROPOSALS = "No other service is a good match."
+
+
+def proposal_sections(items: list[dict[str, Any]]) -> str:
+    """The services worth proposing as text, in the order given: the score of each, then the answers
+    and the facts behind it. Empty when there is none: the message then says NO_PROPOSALS."""
+    parts: list[str] = []
+    for place, item in enumerate(items, start=1):
+        sure = f", confidence {item['confidence']}" if item.get("confidence") is not None else ""
+        lines = [f"{place}. {item['name']}: Need {item['need_score']}{sure}"]
+        for answer in item["answers"]:
+            reason = f". {answer['rationale']}" if answer.get("rationale") else ""
+            lines.append(f"   - {answer['prompt']} {answer['value']}{reason}")
+        facts = "; ".join(f"{fact['key']} = {fact['value']}" for fact in item["facts"])
+        if facts:
+            lines.append(f"   Facts: {facts}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def run_lines(runs: list[dict[str, Any]]) -> str:
+    """The runs a proposals job made, one line each, in the order they were made, failed ones too."""
+    lines: list[str] = []
+    for run in runs:
+        result = "succeeded" if run["status"] == "SUCCEEDED" else f"failed. {run['error'] or 'No reason was stored'}"
+        lines.append(f"- {str(run['kind']).capitalize()} with {run['model_label']}: {result}")
+    return "\n".join(lines) or "- None. No model could be used."
+
+
 class Provider(Protocol):
     status: str  # the NOTIFICATION_STATUS of a message this provider accepted
 

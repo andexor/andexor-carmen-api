@@ -11,6 +11,7 @@
         "ACCESS_TEAM_DOMAIN": "andexor.cloudflareaccess.com",
         "ACCESS_AUD": "17fc8e216219c7456af6fce2bb529e0c99df04b37eb244317d5ac662c2aa451c",
         "EMAIL_PROVIDER": "CLOUDFLARE",
+        "PROPOSAL_MODELS": "DEFAULT",
         "EMAIL_FROM": "carmen@carmen.andexor.net"
     },
     "observability": {
@@ -56,6 +57,7 @@
                 "ACCESS_AUD": "8154464c2b9aa058e7457872b661ce7b80996e8437f1b7e3fe678ab5068c0429",
                 "SERVICE_TOKENS_ARE_ADMIN": "true",
                 "EMAIL_PROVIDER": "STUB",
+            "PROPOSAL_MODELS": "STUB",
                 "EMAIL_FROM": "carmen@carmen.andexor.net"
             },
             "routes": [

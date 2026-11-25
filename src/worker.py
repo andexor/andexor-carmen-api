@@ -9,11 +9,20 @@ from typing import Any
 
 from workers import asgi
 
-from app import add_facts, app, create_lead, machine_call, process_import, process_run, run_scheduler
+from app import add_facts, app, create_lead, machine_call, process_import, process_proposals, process_run, run_scheduler
+
+
+def field(body: Any, name: str) -> Any:
+    """One field of a queue message, or None: a message holds import_id, proposal_agreement_id, or run_id."""
+    try:
+        return body[name]
+    except Exception:  # the message has no such key
+        return None
 
 
 class Default(asgi.entrypoint(app)):
-    """Requests go to the FastAPI application. A message on the RUNS queue carries one AI run or one CSV import.
+    """Requests go to the FastAPI application. A message on the RUNS queue carries one AI run, one CSV import,
+    or one proposals job.
     The Cron Trigger runs the scheduler every hour."""
 
     # The machine methods, for another Worker that calls over a Service Binding: await env.CARMEN.create_lead({...}).
@@ -31,12 +40,11 @@ class Default(asgi.entrypoint(app)):
     async def queue(self, batch: Any, *_: Any) -> None:
         env: Any = getattr(self, "env")
         for message in batch.messages:
-            try:
-                import_id = message.body["import_id"]
-            except Exception:  # not an import: the message has no such key, so it carries a run
-                import_id = None
+            import_id, agreement_id = field(message.body, "import_id"), field(message.body, "proposal_agreement_id")
             if import_id:
                 await process_import(env, str(import_id))
+            elif agreement_id:
+                await process_proposals(env, str(agreement_id), field(message.body, "real") is True)
             else:
                 await process_run(env, str(message.body["run_id"]))
             message.ack()

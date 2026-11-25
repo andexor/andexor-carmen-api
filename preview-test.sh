@@ -386,6 +386,30 @@ fi
 echo "ok: the run expired an agreement, completed another, and made an alert"
 expect 200 '"status":"EXPIRED"' "${BASE}/agreements/${ENDED}"
 expect 200 '"status":"COMPLETED"' "${BASE}/agreements/${PROJECT}"
+# Service proposals (specs/025-service-proposals/spec.md). Completing the one-time agreement queued
+# its job. On the preview the job uses the stub model and the stub provider: no model is paid and
+# no email is sent. The job is then started once more by hand, and both must finish before the
+# company is deleted.
+PROPOSALS="${BASE}/notifications?kind=SERVICE_PROPOSALS&agreement_id=${PROJECT}"
+for wanted in 1 2; do
+    for attempt in $(seq 1 60); do
+        expect 200 '"items"' "${PROPOSALS}" > /dev/null
+        [[ "$(jq -r '.items | length' "${BODY}")" -ge "${wanted}" ]] && break
+        sleep 2
+    done
+    echo "ok: proposals email ${wanted} was stored after ${attempt} checks"
+    expect 200 "\"subject\":\"Proposals for Scheduler ${STAG}\"" "${PROPOSALS}"
+    if [[ "$(jq -c '[.items[] | (.status == "STUBBED" and (.body | contains("failed") | not) and (.body | contains("Research with")) and (.body | contains("Scoring with")))] | all' "${BODY}")" != "true" ]]; then
+        echo "FAILED: a proposals email should be stubbed, list its runs, and say nothing of a failed run: $(cat "${BODY}")"
+        exit 1
+    fi
+    [[ "${wanted}" == "1" ]] && expect 202 '"queued":true' -X POST "${BASE}/agreements/${PROJECT}/proposals"
+done
+echo "ok: the proposals emails came from fresh stub runs"
+expect 200 '"provider":"STUB"' "${BASE}/companies/${SCO}/runs"
+expect 200 '"scored_at":"2' "${BASE}/companies/${SCO}/proposals"
+expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/00000000-0000-4000-8000-00000000dead/proposals"
+expect 404 '"error":"NOT_FOUND"' -X POST "${BASE}/agreements/00000000-0000-4000-8000-00000000dead/proposals"
 expect 409 '"error":"CONFLICT"' -X POST "${BASE}/agreements/${ENDED}/renewal"
 expect 200 "It ended on" "${BASE}/companies/${SCO}/activities?kind=SYSTEM"
 expect 200 "\"subject\":\"Renewal: Renewing ${STAG} ends" "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"

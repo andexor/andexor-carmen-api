@@ -1384,6 +1384,11 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
 
 FACT_COLUMNS = "id, company_id, key, value, source, source_detail, notes, ai_run_id, observed_at, created_at"
 NEWEST_FACT = "observed_at DESC, created_at DESC, id"
+# The company's latest fact for each key.
+LATEST_FACTS = (
+    "SELECT key, value FROM (SELECT key, value, ROW_NUMBER() OVER (PARTITION BY key ORDER BY"
+    f" {NEWEST_FACT}) AS place FROM enrichment_fact WHERE company_id = ?) WHERE place = 1 ORDER BY key"
+)
 
 
 def fact_fields(entry: object) -> Values:
@@ -2096,6 +2101,8 @@ async def update_agreement(request: Request, agreement_id: str, body: dict[str, 
         row = await database.prepare(f"{AGREEMENT_SELECT} WHERE a.id = ?").bind(agreement_id).first()
     except Exception as e:
         return failed(request, "update_agreement", e)
+    if changed.get("status") == "COMPLETED" and row["renewal_policy"] == "ONE_TIME":
+        await queue_proposals(request.scope["env"], agreement_id)  # logs a failure itself; the edit stands
     return JSONResponse(agreement_out(row))
 
 
@@ -2635,11 +2642,7 @@ async def scoring_statements(env: Any, run: Row, model: Row) -> tuple[list[Any],
         text = ai.material(company, facts["results"], source["dossier"] if source else None)
     else:
         # The company's latest fact for each key.
-        sql = (
-            "SELECT key, value FROM (SELECT key, value, ROW_NUMBER() OVER (PARTITION BY key ORDER BY"
-            f" {NEWEST_FACT}) AS place FROM enrichment_fact WHERE company_id = ?) WHERE place = 1 ORDER BY key"
-        )
-        facts = await database.prepare(sql).bind(run["company_id"]).all()
+        facts = await database.prepare(LATEST_FACTS).bind(run["company_id"]).all()
         text = ai.material(company, facts["results"])
     criteria, services, thresholds = await load_rubric(database)
     in_use = [criterion for criterion in criteria if criterion["active"]]
@@ -2916,17 +2919,12 @@ async def decide_facts(request: Request, run_id: str, body: dict[str, Any]) -> J
     return JSONResponse({"items": facts["results"]})
 
 
-@app.post("/api/v1/runs/{run_id}/apply")
-@action(WRITE)
-async def apply_run(request: Request, run_id: str) -> JSONResponse:
-    database = db(request)
+async def apply_scoring(request: Request, run: Row) -> tuple[Row, list[Row]]:
+    """Make a finished scoring run's answers the company's answers, and store the scores that follow.
+    Returns the scores and the services. Raises StepFailed. Written once: a person applies a run
+    through apply_run, and the proposals job applies its own (specs/025-service-proposals/spec.md)."""
+    database, run_id, company_id = db(request), run["id"], run["company_id"]
     try:
-        run = await database.prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run_id).first()
-        if not run:
-            return error(request, 404)
-        if run["kind"] != "SCORING" or run["status"] != "SUCCEEDED":
-            return error(request, 409)  # only a finished scoring run can be applied
-        company_id = run["company_id"]
         company = await database.prepare(
             "SELECT id, fit_score, need_score, recommendation FROM company WHERE id = ?"
         ).bind(company_id).first()
@@ -2934,7 +2932,7 @@ async def apply_run(request: Request, run_id: str) -> JSONResponse:
         stored = await database.prepare("SELECT criterion_id, value FROM rubric_answer WHERE company_id = ?").bind(company_id).all()
         given = await database.prepare("SELECT criterion_id, value FROM ai_run_answer WHERE ai_run_id = ?").bind(run_id).all()
     except Exception as e:
-        return failed(request, "load_run", e)
+        raise StepFailed("load_run", e) from e
 
     by_id = {criterion["id"]: criterion for criterion in criteria}
     old: Row = {row["criterion_id"]: row["value"] for row in stored["results"]}
@@ -2963,7 +2961,25 @@ async def apply_run(request: Request, run_id: str) -> JSONResponse:
         statements.append(database.prepare(f"UPDATE ai_run SET applied_at = {NOW} WHERE id = ?").bind(run_id))
         await database.batch(statements)
     except Exception as e:
-        return failed(request, "apply_run", e)
+        raise StepFailed("apply_run", e) from e
+    return scores, services
+
+
+@app.post("/api/v1/runs/{run_id}/apply")
+@action(WRITE)
+async def apply_run(request: Request, run_id: str) -> JSONResponse:
+    try:
+        run = await db(request).prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run_id).first()
+    except Exception as e:
+        return failed(request, "load_run", e)
+    if not run:
+        return error(request, 404)
+    if run["kind"] != "SCORING" or run["status"] != "SUCCEEDED":
+        return error(request, 409)  # only a finished scoring run can be applied
+    try:
+        scores, services = await apply_scoring(request, run)
+    except StepFailed as e:
+        return failed(request, e.step, e.cause)
     return JSONResponse(scores_body(scores, services))
 
 
@@ -3474,9 +3490,10 @@ ALERT_WORDS = {
 }
 
 
-async def end_agreements(database: Any, date: str) -> dict[str, int]:
+async def end_agreements(env: Any, date: str) -> dict[str, int]:
     """An active agreement past its end date becomes what its renewal policy says: COMPLETED or EXPIRED.
-    Returns how many of each."""
+    Returns how many of each. A completed one gets its proposals job (specs/025-service-proposals/spec.md)."""
+    database = env.DB
     sql = "SELECT * FROM agreement WHERE status = 'ACTIVE' AND end_date < ? AND renewal_policy IN ('ONE_TIME', 'APPROVAL') LIMIT ?"
     found = await database.prepare(sql).bind(date, DIGEST_ROWS).all()
     statements: list[Any] = []
@@ -3493,6 +3510,9 @@ async def end_agreements(database: Any, date: str) -> dict[str, int]:
         statements += [insert(database, "activity", entry), update(database, "agreement", {"status": status}, agreement["id"])]
     if statements:
         await database.batch(statements)
+    for agreement in found["results"]:
+        if ENDED_STATUS[agreement["renewal_policy"]] == "COMPLETED":
+            await queue_proposals(env, agreement["id"])  # logs a failure itself; the agreement stays completed
     return counts
 
 
@@ -3579,7 +3599,7 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     recipient = settings.get("digest.recipient", "")
 
     try:
-        ended = await end_agreements(env.DB, date)
+        ended = await end_agreements(env, date)
         summary.update(completed=ended["COMPLETED"], expired=ended["EXPIRED"])
     except Exception as e:
         scheduler_log("failed", f"end_agreements: {type(e).__name__}: {e}")
@@ -3631,6 +3651,221 @@ async def list_notifications(
     except Exception as e:
         return failed(request, "list_notifications", e)
     return page(result, limit, cursor)
+
+
+# ---- Service proposals ---------------------------------------------------------------------------
+# specs/025-service-proposals/spec.md. The list is read from the stored scores, for the Company
+# screen at any time. The job, run from the queue when a one-time agreement is completed, first makes
+# those scores fresh and then sends the list as an email.
+
+# A service is worth proposing from the Need score below which a company is skipped.
+PROPOSAL_MIN_NEED = "COALESCE((SELECT CAST(value AS INTEGER) FROM setting WHERE key = 'score.skip.max_need'), 30)"
+# Offered services the company does not already have, the best match first. ?2 is an agreement whose
+# services are left out too: the one that was just completed, in the email.
+PROPOSED_SERVICES = (
+    "SELECT s.id AS service_id, s.name, s.category, cs.need_score, cs.confidence FROM company_service cs"
+    " JOIN service s ON s.id = cs.service_id WHERE cs.company_id = ?1 AND s.offered = 1 AND s.active = 1"
+    f" AND cs.need_score >= {PROPOSAL_MIN_NEED}"
+    " AND NOT EXISTS (SELECT 1 FROM agreement_service x JOIN agreement a ON a.id = x.agreement_id"
+    " WHERE x.service_id = s.id AND a.company_id = ?1 AND (a.status = 'ACTIVE' OR a.id = ?2))"
+    " ORDER BY cs.need_score DESC, cs.confidence DESC, s.sort_order, s.id"
+)
+# The scoring behind a service: the company's answers to its Need questions, with the model's reason.
+PROPOSAL_ANSWERS = (
+    "SELECT c.service_id, c.id AS criterion_id, c.prompt, c.enrichment_key, ra.value, ra.points, ra.source, x.rationale"
+    " FROM rubric_answer ra JOIN rubric_criterion c ON c.id = ra.criterion_id"
+    " LEFT JOIN ai_run_answer x ON x.ai_run_id = ra.ai_run_id AND x.criterion_id = ra.criterion_id"
+    " WHERE ra.company_id = ? AND c.section = 'NEED' AND c.active = 1 ORDER BY c.sort_order, c.id"
+)
+
+
+def proposal_log(agreement_id: str, step: str, detail: str) -> None:
+    logger.info(json.dumps({"event": "carmen_proposals", "agreement_id": agreement_id, "step": step, "detail": detail[:300]}))
+
+
+async def proposals_of(database: Any, company_id: str, agreement_id: str | None = None) -> Row | None:
+    """The services worth proposing to a company, the best match between a need and a service first,
+    each with the answers and the facts behind its score. None when there is no such company."""
+    company, services, answers, facts = await database.batch(
+        [
+            database.prepare("SELECT scored_at FROM company WHERE id = ?").bind(company_id),
+            database.prepare(PROPOSED_SERVICES).bind(company_id, agreement_id),
+            database.prepare(PROPOSAL_ANSWERS).bind(company_id),
+            database.prepare(LATEST_FACTS).bind(company_id),
+        ]
+    )
+    if not company["results"]:
+        return None
+    known = {fact["key"]: fact["value"] for fact in facts["results"]}
+    items: list[Row] = []
+    for service in services["results"]:
+        own = [answer for answer in answers["results"] if answer["service_id"] == service["service_id"]]
+        keys = dict.fromkeys(answer["enrichment_key"] for answer in own if answer["enrichment_key"] in known)
+        shown = ("criterion_id", "prompt", "value", "points", "source", "rationale")
+        items.append(
+            {
+                **service,
+                "answers": [{key: answer[key] for key in shown} for answer in own],
+                "facts": [{"key": key, "value": known[key]} for key in keys],  # the research behind the answers
+            }
+        )
+    return {"scored_at": company["results"][0]["scored_at"], "items": items}
+
+
+@app.get("/api/v1/companies/{company_id}/proposals")
+@action(READ)
+async def list_proposals(request: Request, company_id: str) -> JSONResponse:
+    try:
+        found = await proposals_of(db(request), company_id)
+    except Exception as e:
+        return failed(request, "list_proposals", e)
+    return error(request, 404) if found is None else JSONResponse(found)
+
+
+async def queue_proposals(env: Any, agreement_id: str, real: bool = False) -> bool:
+    """Put the proposals job of an agreement on the queue. Never raises: says whether it was queued."""
+    try:
+        await env.RUNS.send({"proposal_agreement_id": agreement_id, "real": real})
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_proposals", "agreement_id": agreement_id, "step": "queue", "error": type(e).__name__}))
+        return False
+    return True
+
+
+# For an administrator, and for the smoke test: the same job a completed one-time agreement starts.
+# With real=true the job uses the default models and sends real email in any environment. It costs
+# money, so the smoke test never sets it.
+@app.post("/api/v1/agreements/{agreement_id}/proposals")
+@action(MANAGE)
+async def start_proposals(request: Request, agreement_id: str, real: bool = False) -> JSONResponse:
+    try:
+        found = await db(request).prepare("SELECT id FROM agreement WHERE id = ?").bind(agreement_id).first()
+    except Exception as e:
+        return failed(request, "load_agreement", e)
+    if not found:
+        return error(request, 404)
+    if not await queue_proposals(request.scope["env"], agreement_id, real):
+        return error(request, 500)
+    return JSONResponse({"queued": True}, status_code=202)
+
+
+def job_request(env: Any, name: str) -> Request:
+    """A request for a job that has none, so the job can use the code a person's request uses. It has
+    no caller: the record of a change says the job's name where a request has its id."""
+    return Request({"type": "http", "env": env, "state": {"identity": {"id": None, "machine": True}, "request_id": name}})
+
+
+async def proposal_run(env: Any, company_id: str, kind: str, model: Row, input_run_id: str | None = None) -> Row:
+    """Carry out one run inside the job, and return it as it was stored."""
+    run: Row = {
+        "id": str(uuid.uuid4()),
+        "company_id": company_id,
+        "kind": kind,
+        "ai_model_id": model["id"],
+        "model_id_used": model["model_id"],
+        "input_run_id": input_run_id,
+    }
+    await insert(env.DB, "ai_run", run).run()
+    await process_run(env, run["id"])  # never raises: a failure is on the run
+    return await env.DB.prepare(f"{RUN_SELECT} WHERE r.id = ?").bind(run["id"]).first()
+
+
+PROPOSAL_TRIES = 3  # the fallback for a missing setting proposal.max_tries; a job must end inside one queue invocation (15 minutes)
+
+
+async def proposal_models(database: Any, default_id: str, capability: str, tries: int) -> list[Row]:
+    """The models that can do a part (can_research or can_score): the default first, then every other
+    enabled model in catalog order, at most tries of them. The stub is never one of them."""
+    sql = f"SELECT * FROM ai_model WHERE active = 1 AND {capability} = 1 ORDER BY id = ? DESC, sort_order, id"
+    found = await database.prepare(sql).bind(default_id).all()
+    return [model for model in found["results"] if model["provider"] in ai.ADAPTERS and model["provider"] != "STUB"][:tries]
+
+
+async def first_success(env: Any, agreement_id: str, company_id: str, kind: str, models: list[Row], runs: list[Row], input_run_id: str | None = None) -> Row | None:
+    """Try the models in order until a run succeeds. Each try is a run of its own, with its own model,
+    so runs stay comparable per model. Every run is logged and added to runs."""
+    for model in models:
+        run = await proposal_run(env, company_id, kind, model, input_run_id)
+        runs.append(run)
+        proposal_log(agreement_id, "run", f"{kind} with {run['model_label']}: {run['status']} {run['error'] or ''}")
+        if run["status"] == "SUCCEEDED":
+            return run
+    return None
+
+
+async def fresh_scores(env: Any, agreement_id: str, company_id: str, settings: dict[str, str], real: bool) -> tuple[str | None, list[Row]]:
+    """Research the company, score it, and apply the scores. Returns why it failed, in words that are
+    safe to show, or None; and every run that was made. When a run fails, the next model that can do
+    the part is tried, and the failure stays on its own run.
+
+    The models are the real ones where the variable PROPOSAL_MODELS is DEFAULT, or when a person
+    asked for a real run. Anywhere else the stub is used, so the preview and the pipeline pay nothing.
+    """
+    database = env.DB
+    runs: list[Row] = []
+    if real or str(getattr(env, "PROPOSAL_MODELS", "")) == "DEFAULT":
+        wanted = settings.get("proposal.max_tries", "")
+        tries = int(wanted) if wanted.isdecimal() and int(wanted) > 0 else PROPOSAL_TRIES
+        researchers = await proposal_models(database, settings.get("ai.default_research_model", ""), "can_research", tries)
+        scorers = await proposal_models(database, settings.get("ai.default_scoring_model", ""), "can_score", tries)
+    else:
+        found = await database.prepare("SELECT * FROM ai_model WHERE provider = 'STUB' ORDER BY sort_order LIMIT 1").all()
+        researchers = scorers = cast(list[Row], found["results"])
+    research = await first_success(env, agreement_id, company_id, "RESEARCH", researchers, runs)
+    if not research:
+        return "No model could do the research", runs
+    scoring = await first_success(env, agreement_id, company_id, "SCORING", scorers, runs, research["id"])
+    if not scoring:
+        return "No model could do the scoring", runs
+    try:
+        await apply_scoring(job_request(env, "proposals"), scoring)
+    except StepFailed as e:
+        logger.error(json.dumps({"event": "carmen_error", "step": e.step, "error": type(e.cause).__name__, "description": str(e.cause)}))
+        return "The new scores could not be stored", runs
+    return None, runs
+
+
+async def process_proposals(env: Any, agreement_id: str, real: bool = False) -> None:
+    """The proposals job of one agreement: fresh research and scoring, then one email with the other
+    services worth proposing. Never raises. With real, a person asked for the default models and real
+    email, whatever the environment says."""
+    try:
+        database = env.DB
+        sql = (
+            "SELECT a.id, a.title, a.type, a.company_id, c.name AS company_name FROM agreement a"
+            " JOIN company c ON c.id = a.company_id WHERE a.id = ?"
+        )
+        agreement = await database.prepare(sql).bind(agreement_id).first()
+        if not agreement:
+            return proposal_log(agreement_id, "skipped", "no such agreement")
+        found = await database.prepare("SELECT key, value FROM setting WHERE key IN ('digest.recipient', 'proposal.max_tries') OR key LIKE 'ai.default_%'").all()
+        settings: dict[str, str] = {row["key"]: row["value"] for row in found["results"]}
+        recipient = settings.get("digest.recipient", "")
+        if not recipient:
+            return proposal_log(agreement_id, "skipped", "the setting digest.recipient is missing, so nothing is sent")
+
+        problem, runs = await fresh_scores(env, agreement_id, agreement["company_id"], settings, real)
+        proposals = await proposals_of(database, agreement["company_id"], agreement_id)
+        if proposals is None:
+            return proposal_log(agreement_id, "skipped", "the company is gone")
+        note = ""
+        if problem:
+            proposal_log(agreement_id, "not_fresh", problem)
+            age = f"This list comes from the scores of {proposals['scored_at']}." if proposals["scored_at"] else "No earlier scores are stored."
+            note = f"Fresh research and scoring failed. {problem}. {age}\n\n"
+        subject, body = notify.render(
+            "proposals",
+            company=str(agreement["company_name"]),
+            title=str(agreement["title"] or agreement["type"]),
+            note=note,
+            runs=notify.run_lines(runs),
+            sections=notify.proposal_sections(proposals["items"]) or notify.NO_PROPOSALS,
+        )
+        provider = notify.PROVIDERS["CLOUDFLARE"] if real else notify.provider(getattr(env, "EMAIL_PROVIDER", None))
+        stored = await (await notification(env, provider, "SERVICE_PROPOSALS", recipient, subject, body, agreement_id)).first()
+        proposal_log(agreement_id, "finished", f"{len(runs)} runs, {len(proposals['items'])} services, email {stored['status']}")
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_proposals", "agreement_id": agreement_id, "step": "error", "error": type(e).__name__, "detail": str(e)[:300]}))
 
 
 # ---- Settings ------------------------------------------------------------------------------------

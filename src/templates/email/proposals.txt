@@ -1,0 +1,7 @@
+Proposals for {{company}}
+{{note}}The runs of this job:
+{{runs}}
+
+The agreement {{title}} with {{company}} is completed. Other services to propose, best match first:
+
+{{sections}}
