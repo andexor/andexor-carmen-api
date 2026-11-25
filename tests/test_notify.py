@@ -81,6 +81,39 @@ class Messages(unittest.TestCase):
             "Leads waiting for a score (1)\n- new.example",
         )
 
+    def test_proposals_show_the_score_and_the_answers_and_facts_behind_it(self):
+        items = [
+            {
+                "name": "Web design",
+                "need_score": 82,
+                "confidence": 70,
+                "answers": [{"prompt": "Is the site fast?", "value": "NO", "rationale": "It loads in 9 seconds"}],
+                "facts": [{"key": "pagespeed_mobile", "value": "31"}],
+            },
+            {"name": "Hosting", "need_score": 40, "confidence": None, "answers": [{"prompt": "Is it up?", "value": "YES", "rationale": None}], "facts": []},
+        ]
+        text = notify.proposal_sections(items)
+        self.assertEqual(
+            text,
+            "1. Web design: Need 82, confidence 70\n   - Is the site fast? NO. It loads in 9 seconds\n   Facts: pagespeed_mobile = 31"
+            "\n\n2. Hosting: Need 40\n   - Is it up? YES",
+        )
+
+    def test_every_run_of_a_proposals_job_is_listed_with_its_model_and_its_result(self):
+        runs = [
+            {"kind": "RESEARCH", "model_label": "First", "status": "FAILED", "error": "The model refused"},
+            {"kind": "RESEARCH", "model_label": "Second", "status": "SUCCEEDED", "error": None},
+        ]
+        self.assertEqual(notify.run_lines(runs), "- Research with First: failed. The model refused\n- Research with Second: succeeded")
+        self.assertIn("No model could be used", notify.run_lines([]))
+
+    def test_a_proposals_email_with_no_service_says_so_and_names_a_failed_run_first(self):
+        self.assertEqual(notify.proposal_sections([]), "")
+        subject, body = notify.render("proposals", company="Acme", title="Site build", note="Fresh research and scoring failed.\n\n", runs=notify.run_lines([]), sections=notify.NO_PROPOSALS)
+        self.assertEqual(subject, "Proposals for Acme")
+        self.assertTrue(body.startswith("Fresh research and scoring failed.\n\nThe runs of this job:\n- None. No model could be used.\n\nThe agreement Site build with Acme is completed."))
+        self.assertTrue(body.endswith("No other service is a good match.\n"))
+
     def test_the_first_line_of_a_template_is_the_subject(self):
         subject, body = notify.render("digest", date="2026-11-24", sections="Tasks due today (1)\n- Call")
         self.assertEqual(subject, "Carmen digest for 2026-11-24")

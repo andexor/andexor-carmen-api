@@ -153,6 +153,7 @@ class Settings(unittest.TestCase):
             "import.max_rows": "5000",
             "document.max_size_bytes": 1,
             "ai.research.max_pages": 8,
+            "proposal.max_tries": 3,
             "some.future.setting": "any text",
         }
         for key, value in good.items():
@@ -171,6 +172,7 @@ class Settings(unittest.TestCase):
             ("digest.recipient", "a@test.example, b@test.example"),
             ("renewal.default_notice_days", "1.5"),
             ("import.max_rows", 0),
+            ("proposal.max_tries", 0),
             ("some.future.setting", ""),
             ("some.future.setting", None),
             ("score.min_confidence", True),
@@ -231,6 +233,25 @@ class Routes(unittest.TestCase):
         self.assertEqual(len(routes), len(api.app.routes), "a route that is not an APIRoute is being served")
         for route in routes:
             self.assertIn(getattr(route.endpoint, "action", None), roles.ACTIONS, f"{route.path} declares no action")
+
+    def test_proposals_are_read_by_anyone_and_started_by_an_administrator(self):
+        routes = {r.path: r for r in api.app.routes if isinstance(r, APIRoute)}
+        self.assertEqual(getattr(routes["/api/v1/companies/{company_id}/proposals"].endpoint, "action"), roles.READ)
+        self.assertEqual(getattr(routes["/api/v1/agreements/{agreement_id}/proposals"].endpoint, "action"), roles.MANAGE)
+
+    def test_a_job_has_a_request_with_no_caller_that_names_the_job(self):
+        env = SimpleNamespace(DB="the database")
+        request = api.job_request(env, "proposals")
+        self.assertEqual(api.db(request), "the database")
+        self.assertIsNone(request.state.identity["id"])
+        self.assertEqual(request.state.request_id, "proposals")
+
+    def test_a_proposals_job_that_cannot_be_queued_says_so_and_does_not_raise(self):
+        class Queue:
+            async def send(self, message: dict[str, Any]) -> None:
+                raise RuntimeError("the queue is down")
+
+        self.assertFalse(asyncio.run(api.queue_proposals(SimpleNamespace(RUNS=Queue()), "a1")))
 
     def test_the_scheduler_is_run_by_an_administrator_only(self):
         routes = {r.path: r for r in api.app.routes if isinstance(r, APIRoute)}
