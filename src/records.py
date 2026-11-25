@@ -371,6 +371,13 @@ def _days(text: str) -> bool:
     return all(name in DAYS for name in names) and len(set(names)) == len(names)
 
 
+def _email(text: str) -> bool:
+    # No regular expression: a pattern with two repeats around the dot backtracks on a long value.
+    local, _, domain = text.partition("@")
+    host, _, tail = domain.rpartition(".")
+    return bool(local and host and tail) and not any(c in "@,;" or c.isspace() for c in local + domain)
+
+
 def setting_problem(key: str, value: object) -> str | None:
     """Why the setting may not hold the value, or None. The value is text, or a whole number."""
     if isinstance(value, bool) or not isinstance(value, (str, int)):
@@ -387,7 +394,7 @@ def setting_problem(key: str, value: object) -> str | None:
     elif key == "digest.days":
         ok, wanted = _days(text), "day names such as MON,TUE,WED,THU,FRI"
     elif key == "digest.recipient":
-        ok, wanted = re.fullmatch(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+", text) is not None, "one email address"
+        ok, wanted = _email(text), "one email address"
     elif key == "renewal.default_notice_days":
         ok, wanted = _whole(text, 0), "a whole number of days"
     elif key in ("document.max_size_bytes", "import.max_rows", "ai.research.max_pages"):
