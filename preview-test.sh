@@ -414,3 +414,17 @@ for agreement in "${RENEWING}" "${ENDED}" "${PROJECT}"; do
     expect 204 '' -X DELETE "${BASE}/agreements/${agreement}"
 done
 expect 204 '' -X DELETE "${BASE}/companies/${SCO}"
+
+# Settings (specs/016-settings/spec.md). A change is put back, so the preview keeps its values.
+expect 200 '"key":"digest.hour_local"' "${BASE}/settings"
+ROWS=$(jq -r '.items[] | select(.key == "import.max_rows") | .value' "${BODY}")
+PATCH=(-X PATCH -H 'Content-Type: application/json')
+expect 200 "\"value\":\"$((ROWS + 1))\"" "${PATCH[@]}" -d "{\"import.max_rows\":$((ROWS + 1))}" "${BASE}/settings"
+expect 200 "\"value\":\"${ROWS}\"" "${PATCH[@]}" -d "{\"import.max_rows\":\"${ROWS}\"}" "${BASE}/settings"
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"no.such.setting":"1"}' "${BASE}/settings"
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.hour_local":"25"}' "${BASE}/settings"
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.time_zone":"Mars/Olympus_Mons"}' "${BASE}/settings"
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"ai.default_scoring_model":"no-such-model"}' "${BASE}/settings"
+# One bad value refuses the whole change: the good one beside it is not stored.
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d "{\"import.max_rows\":$((ROWS + 7)),\"score.min_confidence\":101}" "${BASE}/settings"
+expect 200 "\"value\":\"${ROWS}\"" "${BASE}/settings"

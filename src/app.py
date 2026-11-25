@@ -17,6 +17,7 @@ AI models and runs: specs/009-ai-runs/spec.md.
 CSV import: specs/013-csv-import/spec.md.
 Machine methods: specs/014-machine-methods/spec.md.
 The scheduler and notifications: specs/015-scheduler-and-notifications/spec.md.
+Settings: specs/016-settings/spec.md.
 The renewal policy of an agreement: specs/024-renewal-policy/spec.md.
 Cross-Origin Resource Sharing (CORS): specs/017-cors/spec.md.
 
@@ -78,6 +79,7 @@ from records import (
     iso_date,
     local_date,
     renewal_problem,
+    setting_problem,
     slug,
 )
 from roles import ADMIN, DELETE, MACHINE, MACHINE_CALLER, MANAGE, PUBLIC, READ, WRITE, action, allowed
@@ -3629,3 +3631,59 @@ async def list_notifications(
     except Exception as e:
         return failed(request, "list_notifications", e)
     return page(result, limit, cursor)
+
+
+# ---- Settings ------------------------------------------------------------------------------------
+# Tunable values that code reads on every use. A setting is created by a migration, never here.
+# See specs/016-settings/spec.md.
+
+
+@app.get("/api/v1/settings")
+@action(READ)
+async def list_settings(request: Request) -> JSONResponse:
+    try:
+        result = await db(request).prepare("SELECT * FROM setting ORDER BY key").all()
+    except Exception as e:
+        return failed(request, "list_settings", e)
+    return JSONResponse({"items": result["results"]})
+
+
+@app.patch("/api/v1/settings")
+@action(MANAGE)
+async def update_settings(request: Request, body: dict[str, Any]) -> JSONResponse:
+    database = db(request)
+    try:
+        stored = await database.prepare("SELECT key, value FROM setting").all()
+        current: dict[str, str] = {row["key"]: row["value"] for row in stored["results"]}
+    except Exception as e:
+        return failed(request, "load_settings", e)
+    try:
+        changed: dict[str, str] = {}
+        for key, value in body.items():
+            if key not in current:
+                raise BadBody(f"there is no setting {key}")
+            if problem := setting_problem(key, value):
+                raise BadBody(problem)
+            if str(value).strip() != current[key]:
+                changed[key] = str(value).strip()
+        for key in ("ai.default_research_model", "ai.default_scoring_model"):
+            if key in changed and not await database.prepare("SELECT 1 AS found FROM ai_model WHERE id = ?").bind(changed[key]).first():
+                raise BadBody(f"{key} must be the id of an AI model")
+    except Exception as e:
+        return failed(request, "check_settings", e)
+
+    if changed:
+        try:
+            # A setting belongs to no company, so the Worker log is the record of the change. It is written first.
+            for key, value in changed.items():
+                audit(request, f"Setting {key}", None, {"value": current[key]}, {"value": value})
+            sql = f"UPDATE setting SET value = ?, updated_at = {NOW} WHERE key = ?"
+            await database.batch([database.prepare(sql).bind(value, key) for key, value in changed.items()])
+        except Exception as e:
+            return failed(request, "update_settings", e)
+        if any(key.startswith("score.") for key in changed):
+            try:
+                await rescore_all(request)  # a threshold moved, so stored recommendations may be out of date
+            except Exception as e:
+                return failed(request, "rescore_after_settings", e)
+    return await list_settings(request)

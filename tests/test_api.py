@@ -139,6 +139,52 @@ class MachineCaller(unittest.TestCase):
         self.assertEqual(answer["error"], "INTERNAL")  # no database here: the failure is an answer too
 
 
+class Settings(unittest.TestCase):
+    def test_a_value_its_setting_can_hold_is_accepted(self):
+        good = {
+            "score.min_confidence": 40,
+            "score.skip.max_fit": "0",
+            "score.reach_out.min_need": "100",
+            "digest.hour_local": "23",
+            "digest.time_zone": "Europe/Berlin",
+            "digest.days": "mon, wed ,FRI",
+            "digest.recipient": "someone@test.example",
+            "renewal.default_notice_days": 0,
+            "import.max_rows": "5000",
+            "document.max_size_bytes": 1,
+            "ai.research.max_pages": 8,
+            "some.future.setting": "any text",
+        }
+        for key, value in good.items():
+            self.assertIsNone(records.setting_problem(key, value), key)
+
+    def test_a_value_its_setting_cannot_hold_is_refused(self):
+        bad: list[tuple[str, object]] = [
+            ("score.min_confidence", 101),
+            ("score.min_confidence", "-1"),
+            ("score.min_confidence", "forty"),
+            ("digest.hour_local", 24),
+            ("digest.time_zone", "Mars/Olympus_Mons"),
+            ("digest.days", "MON,FUNDAY"),
+            ("digest.days", "MON,MON"),
+            ("digest.recipient", "not an address"),
+            ("digest.recipient", "a@test.example, b@test.example"),
+            ("renewal.default_notice_days", "1.5"),
+            ("import.max_rows", 0),
+            ("some.future.setting", ""),
+            ("some.future.setting", None),
+            ("score.min_confidence", True),
+            ("digest.days", ["MON"]),
+        ]
+        for key, value in bad:
+            self.assertIsNotNone(records.setting_problem(key, value), f"{key} = {value!r}")
+
+    def test_only_an_administrator_changes_settings(self):
+        actions = {(r.path, tuple(r.methods or ())): getattr(r.endpoint, "action") for r in api.app.routes if isinstance(r, APIRoute)}
+        self.assertEqual(actions[("/api/v1/settings", ("GET",))], READ)
+        self.assertEqual(actions[("/api/v1/settings", ("PATCH",))], MANAGE)
+
+
 class RenewalPolicy(unittest.TestCase):
     GOOD = {"status": "ACTIVE", "renewal_policy": "APPROVAL", "end_basis": "SIGNED_CONTRACT", "end_date": "2027-05-31", "term_months": 6}
 
