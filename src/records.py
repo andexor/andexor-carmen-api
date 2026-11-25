@@ -345,3 +345,60 @@ def add_months(day: str, months: int) -> str:
     start = date.fromisoformat(day)
     year, month = divmod(start.year * 12 + start.month - 1 + months, 12)
     return start.replace(year=year, month=month + 1, day=min(start.day, calendar.monthrange(year, month + 1)[1])).isoformat()
+
+
+# ---- Settings ------------------------------------------------------------------------------------
+# What the value of a setting may be, by key. See specs/016-settings/spec.md. A setting with no rule
+# here holds any text; a new setting comes with a migration, and its rule is added with it.
+
+DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+
+
+def _whole(text: str, low: int, high: int | None = None) -> bool:
+    return text.isdigit() and low <= int(text) and (high is None or int(text) <= high)
+
+
+def _zone(text: str) -> bool:
+    try:
+        ZoneInfo(text)
+    except Exception:  # an unknown or malformed name
+        return False
+    return True
+
+
+def _days(text: str) -> bool:
+    names = [name.strip().upper() for name in text.split(",")]
+    return all(name in DAYS for name in names) and len(set(names)) == len(names)
+
+
+def _email(text: str) -> bool:
+    # No regular expression: a pattern with two repeats around the dot backtracks on a long value.
+    local, _, domain = text.partition("@")
+    host, _, tail = domain.rpartition(".")
+    return bool(local and host and tail) and not any(c in "@,;" or c.isspace() for c in local + domain)
+
+
+def setting_problem(key: str, value: object) -> str | None:
+    """Why the setting may not hold the value, or None. The value is text, or a whole number."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return f"{key} must be text or a whole number"
+    text = str(value).strip()
+    if not text:
+        return f"{key} must not be empty"
+    if key.startswith("score."):
+        ok, wanted = _whole(text, 0, 100), "a whole number from 0 to 100"
+    elif key == "digest.hour_local":
+        ok, wanted = _whole(text, 0, 23), "an hour from 0 to 23"
+    elif key == "digest.time_zone":
+        ok, wanted = _zone(text), "a time zone name such as America/New_York"
+    elif key == "digest.days":
+        ok, wanted = _days(text), "day names such as MON,TUE,WED,THU,FRI"
+    elif key == "digest.recipient":
+        ok, wanted = _email(text), "one email address"
+    elif key == "renewal.default_notice_days":
+        ok, wanted = _whole(text, 0), "a whole number of days"
+    elif key in ("document.max_size_bytes", "import.max_rows", "ai.research.max_pages"):
+        ok, wanted = _whole(text, 1), "a whole number of at least 1"
+    else:
+        return None
+    return None if ok else f"{key} must be {wanted}"
