@@ -378,6 +378,20 @@ def _email(text: str) -> bool:
     return bool(local and host and tail) and not any(c in "@,;" or c.isspace() for c in local + domain)
 
 
+def mailbox(text: str) -> tuple[str, str]:
+    """The name and the address in "Name <address>". A bare address has no name."""
+    text = text.strip()
+    if text.endswith(">") and "<" in text:
+        name, _, address = text[:-1].rpartition("<")
+        return name.strip().strip('"').strip(), address.strip()
+    return "", text
+
+
+def _mailbox(text: str) -> bool:
+    name, address = mailbox(text)
+    return _email(address) and not any(c in '<>"' or not c.isprintable() for c in name)
+
+
 def setting_problem(key: str, value: object) -> str | None:
     """Why the setting may not hold the value, or None. The value is text, or a whole number."""
     if isinstance(value, bool) or not isinstance(value, (str, int)):
@@ -394,7 +408,7 @@ def setting_problem(key: str, value: object) -> str | None:
     elif key == "digest.days":
         ok, wanted = _days(text), "day names such as MON,TUE,WED,THU,FRI"
     elif key == "digest.recipient":
-        ok, wanted = _email(text), "one email address"
+        ok, wanted = _mailbox(text), "one email address, with or without a name: First Last <address>"
     elif key == "renewal.default_notice_days":
         ok, wanted = _whole(text, 0), "a whole number of days"
     elif key in ("document.max_size_bytes", "import.max_rows", "ai.research.max_pages", "proposal.max_tries") or key.startswith("uptime."):

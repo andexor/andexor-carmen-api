@@ -162,6 +162,12 @@ class Settings(unittest.TestCase):
         for key, value in good.items():
             self.assertIsNone(records.setting_problem(key, value), key)
 
+    def test_the_recipient_may_carry_a_name(self):
+        for value in ("Some One <someone@test.example>", '"One, Some" <someone@test.example>', "<someone@test.example>"):
+            self.assertIsNone(records.setting_problem("digest.recipient", value), value)
+        self.assertEqual(records.mailbox("Some One <someone@test.example>"), ("Some One", "someone@test.example"))
+        self.assertEqual(records.mailbox("someone@test.example"), ("", "someone@test.example"))
+
     def test_a_value_its_setting_cannot_hold_is_refused(self):
         bad: list[tuple[str, object]] = [
             ("score.min_confidence", 101),
@@ -173,6 +179,9 @@ class Settings(unittest.TestCase):
             ("digest.days", "MON,MON"),
             ("digest.recipient", "not an address"),
             ("digest.recipient", "a@test.example, b@test.example"),
+            ("digest.recipient", "Some One <not an address>"),
+            ("digest.recipient", "Some One <a@test.example> <b@test.example>"),
+            ("digest.recipient", "Some\nOne <a@test.example>"),
             ("renewal.default_notice_days", "1.5"),
             ("import.max_rows", 0),
             ("proposal.max_tries", 0),
