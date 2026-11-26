@@ -1,6 +1,6 @@
 {
-    "include": ["src", "tests"],
-    "extraPaths": ["src"],
+    "include": ["src", "tests", "tools"],
+    "extraPaths": ["src", "tools"],
     "venvPath": ".",
     "venv": ".venv",
     "typeCheckingMode": "strict"

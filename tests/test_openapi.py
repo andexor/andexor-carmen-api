@@ -16,11 +16,14 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 from fastapi.routing import APIRoute  # noqa: E402
 from openapi_spec_validator import OpenAPIV31SpecValidator  # noqa: E402
 
 import app as api  # noqa: E402
+import contract_check  # noqa: E402
+import gen_models  # noqa: E402
 from roles import READ, READER  # noqa: E402
 
 OWN = {api.OPENAPI_PATH, api.DOCS_PATH}
@@ -114,6 +117,42 @@ class Specification(unittest.TestCase):
                 self.assertNotIn("422", operation["responses"], route.path)
         self.assertEqual(spec["paths"][api.HEALTH_PATH]["get"]["security"], [])
         self.assertIn("403", spec["paths"]["/api/v1/me"]["get"]["responses"])
+
+    def test_every_operation_describes_its_answer_and_its_body(self):
+        spec = self.fetched()
+        for path, item in spec["paths"].items():
+            for method, operation in item.items():
+                where = f"{method.upper()} {path}"
+                successes = {status: answer for status, answer in operation["responses"].items() if status.startswith("2")}
+                self.assertTrue(successes, where)
+                for status, answer in successes.items():
+                    if status == "204":
+                        self.assertNotIn("content", answer, where)
+                        continue
+                    content = answer.get("content", {})
+                    schema = content.get("application/json", {}).get("schema") or content.get("application/octet-stream", {}).get("schema")
+                    self.assertTrue(schema, f"{where} answers {status} with nothing described")
+                    self.assertTrue("$ref" in json.dumps(schema) or schema.get("format") == "binary", f"{where} answers {status} with no model")
+                body = operation.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema")
+                if body is not None:
+                    self.assertIn("$ref", body, f"{where} takes a body with no model")
+
+    def test_the_models_are_what_the_schema_and_the_field_lists_give(self):
+        # The migrations are in andexor-carmen-main, found through CARMEN_MAIN as run.sh finds them.
+        self.assertEqual((ROOT / "src" / "models.py").read_text(), gen_models.generate(), "run python3 tools/gen_models.py")
+
+    def test_an_answer_that_does_not_fit_the_specification_is_found(self):
+        spec = self.fetched()
+        good = {"method": "GET", "url": "https://test.invalid/api/v1/health", "status": 200, "request": "", "response": '{"ok": true}'}
+        self.assertEqual(contract_check.problems_of(spec, [good])[0], [])
+        for wrong in ('{"ok": true, "extra": 1}', '{"ok": "yes"}', "{}", "not json"):
+            self.assertEqual(len(contract_check.problems_of(spec, [{**good, "response": wrong}])[0]), 1, wrong)
+        self.assertEqual(len(contract_check.problems_of(spec, [{**good, "status": 201}])[0]), 1)
+        sent = {"method": "PUT", "url": "https://test.invalid/api/v1/companies/c1/answers?x=1", "status": 200, "request": '{"answers": "all"}'}
+        scores = '{"fit_score": 1, "need_score": null, "confidence": 1, "recommendation": null, "services": []}'
+        found = contract_check.problems_of(spec, [{**sent, "response": scores}])[0]
+        self.assertEqual(len(found), 1)
+        self.assertIn("a body the API accepted does not fit", found[0])
 
     def test_a_request_with_no_credentials_is_refused(self):
         for path in (api.OPENAPI_PATH, api.DOCS_PATH):

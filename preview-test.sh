@@ -41,7 +41,10 @@ BASE="https://${HOST%%/*}/api/v1"
 BODY=$(mktemp)
 HEAD=$(mktemp)
 FILE=$(mktemp)
-trap 'rm -f "${BODY}" "${HEAD}" "${FILE}"' EXIT
+# Every call and its answer, and the specification the Worker serves: compared at the end.
+CALLS=$(mktemp)
+SPEC=$(mktemp)
+trap 'rm -f "${BODY}" "${HEAD}" "${FILE}" "${CALLS}" "${SPEC}"' EXIT
 
 # expect <status> <text the body must contain, or '' for any body> <curl arguments, the URL last>
 expect() {
@@ -56,7 +59,25 @@ expect() {
         echo
         exit 1
     fi
+    record "${status}" "$@"
     echo "ok: ${status} ${!#}"
+}
+
+# record <status> <curl arguments>: keep the call and its answer as one JSON line, for the contract check.
+record() {
+    local status=$1 method="" data="" url=${!#}
+    shift
+    while [[ $# -gt 1 ]]; do
+        case "$1" in
+            -X) method=$2; shift ;;
+            -d) data=$2; shift ;;
+            --data-binary) data="(file)"; shift ;;
+        esac
+        shift
+    done
+    [[ -n "${method}" ]] || method=$([[ -n "${data}" ]] && echo POST || echo GET)
+    jq -cn --arg method "${method}" --arg url "${url}" --arg status "${status}" --arg data "${data}" --rawfile body "${BODY}" \
+        '{method: $method, url: $url, status: ($status | tonumber), request: $data, response: $body}' >> "${CALLS}"
 }
 
 echo "Smoke test..."
@@ -69,11 +90,13 @@ expect 404 '"error":"NOT_FOUND"' "${BASE}/no-such-path"
 # behind Cloudflare Access like every other path.
 ROOT_URL="${BASE%/v1}"
 expect 200 '"openapi":"3.1' "${ROOT_URL}/openapi.json"
+cp "${BODY}" "${SPEC}"
 if [[ "$(jq -r '[.info.title, .info.version, (.paths | has("/api/v1/companies")), (.paths | has("/api/openapi.json"))] | @csv' "${BODY}")" != "\"$(jq -r '.name' wrangler.jsonc)\",\"$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)\",true,false" ]]; then
     echo "FAILED: the specification should carry the app's name and version and list the app's routes: $(jq -c '.info' "${BODY}")"
     exit 1
 fi
 echo "ok: the specification carries the app's name and version and lists the routes"
+expect 200 '"ok":true' "${BASE}/health"
 expect 200 'swagger-ui' "${ROOT_URL}/docs"
 expect 404 '"error":"NOT_FOUND"' "${ROOT_URL}/redoc"
 # With no credentials, Cloudflare Access answers before the Worker does, and never with the document.
@@ -113,11 +136,13 @@ expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"stage":"NO_SUCH_S
 # The database enforces foreign keys with no PRAGMA: an owner that does not exist is refused.
 expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"owner_id":"no-such-user"}' "${BASE}/companies/${ID}"
 expect 201 '"is_primary":1' -X POST "${JSON[@]}" -d "{\"name\":\"Smoke Contact ${RUN}\",\"is_primary\":true}" "${BASE}/companies/${ID}/contacts"
+expect 200 '"title":"Tester"' -X PATCH "${JSON[@]}" -d '{"title":"Tester"}' "${BASE}/contacts/$(jq -r '.id' "${BODY}")"
 expect 200 "\"name\":\"Smoke Contact ${RUN}\"" "${BASE}/companies/${ID}"
 expect 200 '"next_cursor":null' "${BASE}/companies?q=smoke+contact+${RUN}"
 
 # The timeline and tasks (specs/003-activities-and-tasks/spec.md). Both hang off the test company.
 expect 201 '"kind":"NOTE"' -X POST "${JSON[@]}" -d '{"body":"Smoke note"}' "${BASE}/companies/${ID}/activities"
+expect 200 '"body":"Smoke note, edited"' -X PATCH "${JSON[@]}" -d '{"body":"Smoke note, edited"}' "${BASE}/activities/$(jq -r '.id' "${BODY}")"
 expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"kind":"SYSTEM"}' "${BASE}/companies/${ID}/activities"
 # The stage change above wrote an automatic entry, and it is permanent.
 expect 200 '"kind":"STAGE_CHANGE"' "${BASE}/companies/${ID}/activities?kind=STAGE_CHANGE"
@@ -212,6 +237,8 @@ if ! grep -qi '^content-disposition: attachment; filename="smoke.txt"' "${HEAD}"
     exit 1
 fi
 expect 200 '"file_name":"smoke.txt"' "${BASE}/agreements/${AGREEMENT}"
+expect 200 '"file_name":"smoke.txt"' "${BASE}/documents/${DOCUMENT}"
+expect 200 '"file_name":"smoke.txt"' "${BASE}/companies/${ID}/documents"
 # When the last active agreement ends, the customer becomes a former customer.
 expect 200 '"status":"DRAFT"' -X PATCH "${JSON[@]}" -d '{"status":"DRAFT"}' "${BASE}/agreements/${AGREEMENT}"
 expect 200 '"stage":"FORMER"' "${BASE}/companies/${ID}"
@@ -462,3 +489,11 @@ expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"ai.default_scoring_model"
 # One bad value refuses the whole change: the good one beside it is not stored.
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d "{\"import.max_rows\":$((ROWS + 7)),\"score.min_confidence\":101}" "${BASE}/settings"
 expect 200 "\"value\":\"${ROWS}\"" "${BASE}/settings"
+
+# Archiving hides a company and unarchiving brings it back; neither removes anything.
+expect 200 '"archived_at":"2' -X POST "${BASE}/companies/${SOLO_ID}/archive"
+expect 200 '"archived_at":null' -X POST "${BASE}/companies/${SOLO_ID}/unarchive"
+
+# The contract (specs/032-openapi-models/spec.md): every successful answer above, and every body
+# that was accepted, must fit the specification this Worker serves.
+uv run python tools/contract_check.py "${SPEC}" "${CALLS}"
