@@ -141,6 +141,11 @@ class Messages(unittest.TestCase):
 
 
 class Providers(unittest.TestCase):
+    def test_a_subject_gets_the_prefix_of_its_environment_and_none_where_there_is_none(self):
+        self.assertEqual(notify.subject_line("PREV", "Carmen digest for 2026-11-25"), "PREV: Carmen digest for 2026-11-25")
+        for prefix in (None, ""):
+            self.assertEqual(notify.subject_line(prefix, "Carmen digest for 2026-11-25"), "Carmen digest for 2026-11-25")
+
     def test_a_side_of_a_message_carries_its_name_and_a_bare_address_stays_bare(self):
         self.assertEqual(notify.party("Carmen PREV <carmen@test.example>"), {"email": "carmen@test.example", "name": "Carmen PREV"})
         self.assertEqual(notify.party('"Last, First" <someone@test.example>'), {"email": "someone@test.example", "name": "Last, First"})

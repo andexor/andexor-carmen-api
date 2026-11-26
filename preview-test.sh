@@ -413,7 +413,7 @@ for wanted in 1 2; do
         sleep 2
     done
     echo "ok: proposals email ${wanted} was stored after ${attempt} checks"
-    expect 200 "\"subject\":\"Proposals for Scheduler ${STAG}\"" "${PROPOSALS}"
+    expect 200 "\"subject\":\"PREV: Proposals for Scheduler ${STAG}\"" "${PROPOSALS}"
     if [[ "$(jq -c '[.items[] | (.status == "STUBBED" and (.body | contains("failed") | not) and (.body | contains("Research with")) and (.body | contains("Scoring with")))] | all' "${BODY}")" != "true" ]]; then
         echo "FAILED: a proposals email should be stubbed, list its runs, and say nothing of a failed run: $(cat "${BODY}")"
         exit 1
@@ -427,7 +427,7 @@ expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/00000000-0000-4000-8000-0000
 expect 404 '"error":"NOT_FOUND"' -X POST "${BASE}/agreements/00000000-0000-4000-8000-00000000dead/proposals"
 expect 409 '"error":"CONFLICT"' -X POST "${BASE}/agreements/${ENDED}/renewal"
 expect 200 "It ended on" "${BASE}/companies/${SCO}/activities?kind=SYSTEM"
-expect 200 "\"subject\":\"Renewal: Renewing ${STAG} ends" "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
+expect 200 "\"subject\":\"PREV: Renewal: Renewing ${STAG} ends" "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
 expect 200 '"status":"STUBBED"' "${BASE}/notifications?kind=RENEWAL_ALERT&agreement_id=${RENEWING}"
 expect 200 "\"title\":\"Renewal: Renewing ${STAG}\"" "${BASE}/tasks?company_id=${SCO}"
 # A second run makes no second alert and no second task.

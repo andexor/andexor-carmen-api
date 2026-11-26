@@ -58,7 +58,8 @@
                 "SERVICE_TOKENS_ARE_ADMIN": "true",
                 "EMAIL_PROVIDER": "STUB",
             "PROPOSAL_MODELS": "STUB",
-                "EMAIL_FROM": "Carmen PREV <carmen@carmen.andexor.net>"
+                "EMAIL_FROM": "Carmen PREV <carmen@carmen.andexor.net>",
+                "EMAIL_SUBJECT_PREFIX": "PREV"
             },
             "routes": [
                 {

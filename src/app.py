@@ -3464,6 +3464,8 @@ async def notification(
 ) -> Any:
     """Send one message and return the statement that stores it. A message that could not be sent is
     stored as FAILED with the reason, and is not tried again: the row says what happened."""
+    # The preview marks its subjects, so its messages are told from production's (specs/029-email-subject-prefix/spec.md).
+    subject = notify.subject_line(env_var(env, "EMAIL_SUBJECT_PREFIX"), subject)
     values: Values = {
         "id": str(uuid.uuid4()),
         "kind": kind,
