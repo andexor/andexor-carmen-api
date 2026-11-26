@@ -412,6 +412,17 @@ class Pages(unittest.TestCase):
         self.assertEqual(pages.pick_links("https://acme.com/", pages.read(HOME)[1], 2), picked[:2])
         self.assertEqual(pages.pick_links("https://acme.com/", pages.read(HOME)[1], 0), [])
 
+    def test_a_site_is_up_when_it_answers_below_500(self):
+        for status in (200, 301, 403, 404, 499):
+            self.assertTrue(pages.is_up(status), status)
+        for status in (None, 500, 503):
+            self.assertFalse(pages.is_up(status), status)
+
+    def test_the_share_of_successful_checks_has_one_decimal(self):
+        self.assertEqual(pages.percent_up(14, 14), 100.0)
+        self.assertEqual(pages.percent_up(13, 14), 92.9)
+        self.assertEqual(pages.percent_up(0, 1), 0.0)
+
     def test_only_a_public_web_address_is_fetched(self):
         self.assertEqual(pages.site_url("acme.com"), "https://acme.com")
         self.assertEqual(pages.site_url(" http://acme.com/x "), "http://acme.com/x")

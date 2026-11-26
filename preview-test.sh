@@ -378,12 +378,27 @@ ENDED=$(jq -r '.id' "${BODY}")
 expect 201 '"status":"ACTIVE"' "${JSON[@]}" \
     -d "{\"company_id\":\"${SCO}\",\"type\":\"SOW\",\"title\":\"Project ${STAG}\",\"status\":\"ACTIVE\",\"end_date\":\"$(date -u -d '-3 days' +%F)\",\"renewal_policy\":\"ONE_TIME\",\"end_basis\":\"SIGNED_CONTRACT\"}" "${BASE}/agreements"
 PROJECT=$(jq -r '.id' "${BODY}")
+# The uptime checker (specs/026-uptime-checker/spec.md). A name under .example never resolves, so
+# the check is down whatever the network does, and no real site is called.
+expect 201 '"stage":"LEAD"' "${JSON[@]}" -d "{\"name\":\"Uptime ${STAG}\",\"website\":\"https://www.up-${STAG}.example\"}" "${BASE}/companies"
+UPCO=$(jq -r '.id' "${BODY}")
+expect 200 '"checks":0' "${BASE}/companies/${UPCO}/uptime"
 expect 200 '"failed":\[\]' -X POST "${BASE}/scheduler/run"
 if [[ "$(jq -c '[.expired >= 1, .completed >= 1, .alerts >= 1]' "${BODY}")" != "[true,true,true]" ]]; then
     echo "FAILED: the run should expire one agreement, complete another, and alert for a third: $(cat "${BODY}")"
     exit 1
 fi
 echo "ok: the run expired an agreement, completed another, and made an alert"
+# The run checked the new lead's site once, and stored the share of successful checks as a fact.
+expect 200 '"checks":1' "${BASE}/companies/${UPCO}/uptime"
+if [[ "$(jq -c '[.percent == 0, .up, .measuring, .items[0].up, (.items[0].detail | length > 0)]' "${BODY}")" != "[true,0,true,0,true]" ]]; then
+    echo "FAILED: one failed check, still measuring, was expected: $(cat "${BODY}")"
+    exit 1
+fi
+expect 200 '"source":"UPTIME_CHECK"' "${BASE}/companies/${UPCO}/facts?key=uptime_percent"
+# A company with no website cannot be measured, and an unknown company is not found.
+expect 409 '"error":"CONFLICT"' -X POST "${BASE}/companies/${SCO}/uptime"
+expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/00000000-0000-4000-8000-00000000dead/uptime"
 expect 200 '"status":"EXPIRED"' "${BASE}/agreements/${ENDED}"
 expect 200 '"status":"COMPLETED"' "${BASE}/agreements/${PROJECT}"
 # Service proposals (specs/025-service-proposals/spec.md). Completing the one-time agreement queued
@@ -423,6 +438,17 @@ if [[ "$(jq -c '.items | length' "${BODY}")" != "1" ]]; then
     exit 1
 fi
 echo "ok: the second run made no second alert"
+# The second run made no second uptime check: a site is checked once a day. A person starts a new
+# measurement, which replaces the checks with one made now.
+expect 200 '"checks":1' "${BASE}/companies/${UPCO}/uptime"
+FIRST_CHECK=$(jq -r '.items[0].id' "${BODY}")
+expect 200 '"checks":1' -X POST "${BASE}/companies/${UPCO}/uptime"
+if [[ "$(jq -r '.items[0].id' "${BODY}")" == "${FIRST_CHECK}" ]]; then
+    echo "FAILED: a new measurement should replace the earlier check: $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: a new uptime measurement replaced the earlier check"
+# The company and its checks are left on the preview, to be looked at.
 # Approving the renewal moves the end date forward by the term, records it, and closes the task.
 expect 200 '"status":"ACTIVE"' -X POST "${BASE}/agreements/${RENEWING}/renewal"
 if [[ "$(jq -r '.end_date' "${BODY}")" < "$(date -u -d '+5 months' +%F)" ]]; then

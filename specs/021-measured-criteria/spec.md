@@ -10,7 +10,7 @@ Author: Ed Jenkins
 
 **Created**: 2026-11-24
 
-**Status**: Implemented. The rule is in the preview database. It is not in the production database yet; see Manual steps.
+**Status**: Implemented. The rule is in the preview database. It is not in the production database yet; see Manual steps. Changed by `specs/026-uptime-checker/spec.md`: "Is the site reliably up?" is measured from the fact `uptime_percent`.
 
 **Input**: Issue #37, asked for on 2026-11-24: "If 'Is the site fast?' is measured by pagespeed_mobile, then we need some criteria for judging the results to arrive at a YES or NO answer. What is the latest guidance from Google? Find out and go with that." It adds to `specs/004-services-rubric-and-scoring/spec.md` and `specs/009-ai-runs/spec.md`. Where this spec and an earlier document differ, this spec governs.
 

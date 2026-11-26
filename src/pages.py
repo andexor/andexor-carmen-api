@@ -12,6 +12,7 @@ import importlib
 import json
 import logging
 import re
+import time
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urldefrag, urljoin, urlsplit
@@ -156,6 +157,43 @@ async def fetch_page(url: str) -> tuple[str, str] | str:
         name = type(e).__name__
         shown = f"no answer in {FETCH_MS // 1000} seconds" if "Timeout" in name or "Abort" in name else f"could not be fetched ({name})"
         return _skipped(url, shown, f"{name}: {str(e)[:200]}")
+
+
+def is_up(status: int | None) -> bool:
+    """A site is up when it answered with a status below 500. A refusal (403) or a missing page (404)
+    still shows a server that works; no answer, and 500 and above, do not."""
+    return status is not None and status < 500
+
+
+def percent_up(ups: int, checks: int) -> float:
+    """The share of successful uptime checks, 0 to 100, with one decimal."""
+    return round(100 * ups / checks, 1)
+
+
+async def check_site(url: str) -> dict[str, Any]:
+    """One uptime check of a site, as the columns of an uptime_check row. A site that fails is tried
+    a second time before it counts as down. Never raises."""
+    # Loaded by name: the module exists only inside a Worker.
+    workers: Any = importlib.import_module("workers")
+    check: dict[str, Any] = {}
+    for _ in range(2):
+        started = time.monotonic()
+        status: int | None = None
+        detail: str | None = None
+        try:
+            response: Any = await workers.fetch(url, headers=FETCH_HEADERS, signal=js_module().AbortSignal.timeout(FETCH_MS))
+            status = int(response.status)
+            if not is_up(status):
+                # 530 is not the site speaking: the Workers runtime answers it when the name does not resolve.
+                detail = "the site could not be reached (530)" if status == 530 else f"the site answered {status}"
+        except Exception as e:
+            name = type(e).__name__
+            detail = f"no answer in {FETCH_MS // 1000} seconds" if "Timeout" in name or "Abort" in name else f"could not be reached ({name})"
+            logger.warning(json.dumps({"event": "carmen_uptime_down", "url": url[:300], "why": f"{name}: {str(e)[:200]}"}))
+        check = {"up": int(is_up(status)), "status": status, "duration_ms": int((time.monotonic() - started) * 1000), "detail": detail}
+        if check["up"]:
+            break
+    return check
 
 
 async def read_site(website: object, max_pages: int, fetch: Any = fetch_page) -> tuple[list[tuple[str, str]], list[str]]:

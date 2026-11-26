@@ -154,6 +154,9 @@ class Settings(unittest.TestCase):
             "document.max_size_bytes": 1,
             "ai.research.max_pages": 8,
             "proposal.max_tries": 3,
+            "uptime.window_days": "14",
+            "uptime.sites_per_run": 25,
+            "uptime.hours_between_checks": "23",
             "some.future.setting": "any text",
         }
         for key, value in good.items():
@@ -173,6 +176,9 @@ class Settings(unittest.TestCase):
             ("renewal.default_notice_days", "1.5"),
             ("import.max_rows", 0),
             ("proposal.max_tries", 0),
+            ("uptime.window_days", "0"),
+            ("uptime.sites_per_run", "many"),
+            ("uptime.hours_between_checks", 0),
             ("some.future.setting", ""),
             ("some.future.setting", None),
             ("score.min_confidence", True),
@@ -234,6 +240,44 @@ class Routes(unittest.TestCase):
         for route in routes:
             self.assertIn(getattr(route.endpoint, "action", None), roles.ACTIONS, f"{route.path} declares no action")
 
+    def test_an_uptime_check_stores_the_fact_only_when_the_share_changed(self):
+        class Database:
+            def __init__(self):
+                self.sent: list[tuple[str, tuple[object, ...]]] = []
+
+            def prepare(self, sql: str) -> "Database":
+                self.sql = sql
+                return self
+
+            def bind(self, *values: object) -> None:
+                self.sent.append((self.sql, values))
+
+        company = {"id": "c1", "checks": 3, "ups": 3, "stored": "100"}
+        up = {"up": 1, "status": 200, "duration_ms": 5, "detail": None}
+        down = {"up": 0, "status": None, "duration_ms": 5, "detail": "no answer in 10 seconds"}
+        same, changed = Database(), Database()
+        self.assertEqual(len(api.uptime_writes(same, company, up)), 1)  # still 100: the check alone
+        self.assertIn("uptime_check", same.sent[0][0])
+        self.assertEqual(len(api.uptime_writes(changed, company, down)), 2)  # 3 of 4: the check and the fact
+        self.assertIn("enrichment_fact", changed.sent[1][0])
+        self.assertIn("75", changed.sent[1][1])
+        self.assertIn("UPTIME_CHECK", changed.sent[1][1])
+
+    def test_only_a_lead_or_a_prospect_with_a_public_website_is_measured(self):
+        lead = {"stage": "LEAD", "archived_at": None, "website": "acme.com"}
+        self.assertTrue(api.may_measure(lead))
+        self.assertTrue(api.may_measure({**lead, "stage": "PROSPECT"}))
+        for change in ({"stage": "CUSTOMER"}, {"stage": "DISQUALIFIED"}, {"archived_at": "2026-11-26T00:00:00Z"}, {"website": None}, {"website": "localhost"}):
+            self.assertFalse(api.may_measure({**lead, **change}), change)
+
+    def test_a_setting_of_the_uptime_checker_is_used_first_and_falls_back_to_its_constant(self):
+        self.assertEqual(api.uptime_setting({"uptime.window_days": "7"}, "uptime.window_days"), 7)
+        self.assertEqual(api.uptime_setting({}, "uptime.window_days"), 14)
+        self.assertEqual(api.uptime_setting({"uptime.window_days": "many"}, "uptime.window_days"), 14)
+        self.assertEqual(api.uptime_setting({"uptime.sites_per_run": "5"}, "uptime.sites_per_run"), 5)
+        self.assertEqual(api.uptime_setting({}, "uptime.sites_per_run"), 25)
+        self.assertEqual(api.uptime_setting({"uptime.hours_between_checks": "0"}, "uptime.hours_between_checks"), 23)
+
     def test_proposals_are_read_by_anyone_and_started_by_an_administrator(self):
         routes = {r.path: r for r in api.app.routes if isinstance(r, APIRoute)}
         self.assertEqual(getattr(routes["/api/v1/companies/{company_id}/proposals"].endpoint, "action"), roles.READ)
@@ -260,7 +304,7 @@ class Routes(unittest.TestCase):
 
     def test_a_scheduler_run_with_no_database_fails_as_an_answer(self):
         answer = asyncio.run(api.run_scheduler(SimpleNamespace(DB=None)))
-        self.assertEqual(answer, {"completed": 0, "expired": 0, "alerts": 0, "digest": None, "failed": ["load_settings"]})
+        self.assertEqual(answer, {"completed": 0, "expired": 0, "uptime": 0, "alerts": 0, "digest": None, "failed": ["load_settings"]})
 
     def test_only_health_is_public(self):
         routes = [r for r in api.app.routes if isinstance(r, APIRoute)]
