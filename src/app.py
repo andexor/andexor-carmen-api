@@ -3671,7 +3671,12 @@ UPTIME_SETTINGS = {
     "uptime.sites_per_run": 25,  # sites checked in one run of the scheduler; the rest wait for the next hour
     "uptime.hours_between_checks": 23,  # hours before a site is checked again
 }
-UPTIME_SCAN = 8  # shortcut: 8 times sites_per_run companies are read, because a website that is not a public address is skipped only after it is read; filter in SQL when such companies hold the others back
+# The due companies are a queue, and the query cannot tell whether a website can be checked: only
+# pages.site_url can ("localhost" or an address in numbers cannot). So one run reads UPTIME_SCAN
+# times as many companies as it checks, drops the ones whose website cannot be checked, and checks
+# the first sites_per_run of the rest. With 25 sites per run it reads 50.
+# shortcut: a company whose website cannot be checked stays at the front of the queue, so when one run reads more than sites_per_run of them, fewer sites are checked per run; leave them out in the query then
+UPTIME_SCAN = 2
 UPTIME_COUNTS = (
     "SELECT c.id, c.website, c.stage, c.archived_at, COUNT(u.id) AS checks, COALESCE(SUM(u.up), 0) AS ups,"
     " (SELECT f.value FROM enrichment_fact f WHERE f.company_id = c.id AND f.key = 'uptime_percent'"
