@@ -3588,7 +3588,7 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     """
     provider = notify.PROVIDERS["CLOUDFLARE"] if email else notify.provider(getattr(env, "EMAIL_PROVIDER", None))
     summary: Row = {"completed": 0, "expired": 0, "uptime": 0, "alerts": 0, "digest": None, "failed": []}
-    sql = "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key IN ('renewal.default_notice_days', 'uptime.window_days')"
+    sql = "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key = 'renewal.default_notice_days' OR key LIKE 'uptime.%'"
     try:
         found = await env.DB.prepare(sql).all()
         settings: dict[str, str] = {row["key"]: row["value"] for row in found["results"]}
@@ -3607,7 +3607,7 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
         scheduler_log("failed", f"end_agreements: {type(e).__name__}: {e}")
         summary["failed"].append("end_agreements")
     try:
-        summary["uptime"] = await uptime_checks(env, uptime_days(settings))
+        summary["uptime"] = await uptime_checks(env, settings)
     except Exception as e:
         scheduler_log("failed", f"uptime_checks: {type(e).__name__}: {e}")
         summary["failed"].append("uptime_checks")
@@ -3665,9 +3665,13 @@ async def list_notifications(
 # a day until the company has uptime.window_days checks, and keeps the share of successful checks
 # as the fact uptime_percent. A scoring run answers "Is the site reliably up?" from that fact.
 
-UPTIME_DAYS = 14  # the fallback for a missing setting uptime.window_days
-UPTIME_BATCH = 25  # sites checked in one run of the scheduler; the rest wait for the next hour
-UPTIME_SCAN = 200  # shortcut: a company whose website is not a public address is skipped only after it is read, so more than 175 such companies would hold the others back; filter in SQL then
+# The settings of the checker, each with the value that is used when the setting is missing.
+UPTIME_SETTINGS = {
+    "uptime.window_days": 14,  # checks a company gets, one a day
+    "uptime.sites_per_run": 25,  # sites checked in one run of the scheduler; the rest wait for the next hour
+    "uptime.hours_between_checks": 23,  # hours before a site is checked again
+}
+UPTIME_SCAN = 8  # shortcut: 8 times sites_per_run companies are read, because a website that is not a public address is skipped only after it is read; filter in SQL when such companies hold the others back
 UPTIME_COUNTS = (
     "SELECT c.id, c.website, c.stage, c.archived_at, COUNT(u.id) AS checks, COALESCE(SUM(u.up), 0) AS ups,"
     " (SELECT f.value FROM enrichment_fact f WHERE f.company_id = c.id AND f.key = 'uptime_percent'"
@@ -3679,14 +3683,15 @@ UPTIME_COUNTS = (
 UPTIME_DUE = (
     f"{UPTIME_COUNTS} WHERE c.stage IN ('LEAD', 'PROSPECT') AND c.archived_at IS NULL AND c.website IS NOT NULL"
     " GROUP BY c.id HAVING COUNT(u.id) < ?"
-    " AND (MAX(u.checked_at) IS NULL OR MAX(u.checked_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-23 hours'))"
+    " AND (MAX(u.checked_at) IS NULL OR MAX(u.checked_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?))"
     " ORDER BY MAX(u.checked_at) IS NOT NULL, MAX(u.checked_at), c.created_at DESC LIMIT ?"
 )
 
 
-def uptime_days(settings: dict[str, str]) -> int:
-    wanted = settings.get("uptime.window_days", "")
-    return int(wanted) if wanted.isdecimal() and int(wanted) > 0 else UPTIME_DAYS
+def uptime_setting(settings: dict[str, str], key: str) -> int:
+    """A setting of the checker: the stored value first, and the fallback when it is missing or not a whole number of at least 1."""
+    wanted = settings.get(key, "")
+    return int(wanted) if wanted.isdecimal() and int(wanted) > 0 else UPTIME_SETTINGS[key]
 
 
 def uptime_writes(database: Any, company: Row, check: Row) -> list[Any]:
@@ -3709,12 +3714,14 @@ def uptime_writes(database: Any, company: Row, check: Row) -> list[Any]:
     return statements
 
 
-async def uptime_checks(env: Any, days: int) -> int:
+async def uptime_checks(env: Any, settings: dict[str, str]) -> int:
     """The scheduler's step: check every site that is due, and store the checks in one batch.
     Returns how many sites were checked."""
     database = env.DB
-    found = await database.prepare(UPTIME_DUE).bind(days, UPTIME_SCAN).all()
-    due = [(company, url) for company in found["results"] if (url := pages.site_url(company["website"]))][:UPTIME_BATCH]
+    days, sites = uptime_setting(settings, "uptime.window_days"), uptime_setting(settings, "uptime.sites_per_run")
+    wait = f"-{uptime_setting(settings, 'uptime.hours_between_checks')} hours"
+    found = await database.prepare(UPTIME_DUE).bind(days, wait, sites * UPTIME_SCAN).all()
+    due = [(company, url) for company in found["results"] if (url := pages.site_url(company["website"]))][:sites]
     if not due:
         return 0
     checks = await asyncio.gather(*(pages.check_site(url) for _, url in due))  # check_site never raises
@@ -3750,7 +3757,7 @@ async def read_uptime(request: Request, company_id: str) -> JSONResponse:
         )
     except Exception as e:
         return failed(request, "read_uptime", e)
-    days = uptime_days({"uptime.window_days": row["value"] for row in setting["results"]})
+    days = uptime_setting({"uptime.window_days": row["value"] for row in setting["results"]}, "uptime.window_days")
     count, ups = int(company["checks"]), int(company["ups"])
     answer: Row = {
         "percent": pages.percent_up(ups, count) if count else None,

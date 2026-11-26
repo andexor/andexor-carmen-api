@@ -20,7 +20,7 @@ Author: Ed Jenkins
    Cron Trigger, every hour  ->  run_scheduler  ->  step "uptime"
                                                         |
         every lead and prospect with a public website, fewer than 14 checks,
-        and no check in the last 23 hours (at most 25 sites in one run)
+        and no check in the last 23 hours (at most 25 sites in one run; both are settings)
                                                         |
                                                         v
         one request to the website; a failure is tried a second time
@@ -85,11 +85,11 @@ Author: Ed Jenkins
 
 ### Edge Cases
 
-- Up means the site answered with a status below 500. A refusal (403) or a missing page (404) still shows a server that works. No answer in 10 seconds, a name that does not resolve, and 500 and above are down.
+- Up means the site answered with a status below 500. A refusal (403) or a missing page (404) still shows a server that works. No answer in 10 seconds, a name that does not resolve, and 500 and above are down. For a name that does not resolve the Workers runtime answers 530 and raises nothing; the check says "the site could not be reached (530)".
 - With one check a day, one failed check in 14 is 92.9 percent, which is `NO` at the limit of 99. The limit is data, in the criterion's `config_json`.
 - The days are counted in checks: a company is done when it has `uptime.window_days` checks. A day that was missed is made up, so the measurement takes longer and is not shorter.
 - A company that becomes a customer, is disqualified, or is archived is no longer checked. Its checks and its fact stay.
-- A company that was never checked comes first, the newest first. One run checks at most 25 sites; the rest wait for the next hour.
+- A company that was never checked comes first, the newest first. One run checks at most `uptime.sites_per_run` sites (25); the rest wait for the next hour.
 - The answer to the question changes at the next scoring run, not when the fact is stored (`specs/021-measured-criteria/spec.md`, "Not in this feature").
 - The checks of a company are deleted with the company.
 - A website that is not a public web address is never fetched (`pages.site_url`).
@@ -99,14 +99,14 @@ Author: Ed Jenkins
 ### Functional Requirements
 
 - **FR-001**: The scheduler has a step `uptime`, after the agreements end and before anything is sent. It runs with no `digest.recipient` too. A failure of the step is named in `failed` and stops no other step. The run answers `uptime`: the number of sites checked.
-- **FR-002**: A company is due when its stage is `LEAD` or `PROSPECT`, it is not archived, it has a public website, it has fewer checks than `uptime.window_days` (14 when the setting is missing), and its last check is more than 23 hours old or it has none.
+- **FR-002**: A company is due when its stage is `LEAD` or `PROSPECT`, it is not archived, it has a public website, it has fewer checks than `uptime.window_days`, and its last check is more than `uptime.hours_between_checks` hours old or it has none. One run checks at most `uptime.sites_per_run` sites.
 - **FR-003**: A check is one request for the website's address, with the headers and the 10 seconds of the page reader. It never raises. A check that fails is made a second time at once.
 - **FR-004**: A check is stored as an `uptime_check` row: `up`, `status`, `duration_ms`, and for a failure `detail`, a reason that is safe to show. The detail of an error goes to the Worker log.
 - **FR-005**: With each check, the share of successful checks of the company, 0 to 100 with one decimal, is stored as a new fact `uptime_percent` when it differs from the latest one. Its source is `UPTIME_CHECK`, and its note says how many checks succeeded. All checks and facts of one run are stored in one batch.
 - **FR-006**: `GET /api/v1/companies/{id}/uptime` answers the company's uptime as in User Story 3. `measuring` says whether the scheduler will check the site again.
 - **FR-007**: `POST /api/v1/companies/{id}/uptime` starts a new measurement. The delete of the earlier checks is recorded as every delete is: the Worker log first, then the company's timeline, in the same batch as the delete and the new check.
 - **FR-008**: The rule for the answer is data: migration `0015_uptime_checks` gives "Is the site reliably up?" the fact `uptime_percent` and `{"yes_at": 99}`. The code of `specs/021-measured-criteria/spec.md` answers it.
-- **FR-009**: `uptime.window_days` MUST be a whole number of at least 1.
+- **FR-009**: The checker has three settings: `uptime.window_days` (14), `uptime.sites_per_run` (25), and `uptime.hours_between_checks` (23). The stored setting is used first. The value in brackets is a constant in code, used only when the setting is missing or cannot be read as a whole number of at least 1. `PATCH /api/v1/settings` refuses any other value for a setting whose key begins with `uptime.`.
 
 ### Endpoints
 
@@ -117,7 +117,7 @@ Author: Ed Jenkins
 
 ### Data model
 
-Migration `0015_uptime_checks` in `andexor-carmen-main`: the table `uptime_check`, the fact key `uptime_percent`, the fact source `UPTIME_CHECK`, the setting `uptime.window_days` (14), and the measured rule of the question.
+Migration `0015_uptime_checks` in `andexor-carmen-main`: the table `uptime_check`, the fact key `uptime_percent`, the fact source `UPTIME_CHECK`, the setting `uptime.window_days` (14), and the measured rule of the question. Migration `0016_uptime_settings`: the settings `uptime.sites_per_run` (25) and `uptime.hours_between_checks` (23).
 
 ### Not in this feature
 
@@ -125,16 +125,15 @@ Migration `0015_uptime_checks` in `andexor-carmen-main`: the table `uptime_check
 - A check more often than once a day, or from more than one place.
 - Third-party uptime sources, PageSpeed Insights, and the Chrome UX Report. They stay parked in `NOTES.md`.
 - Applying the answer to the company's scores when the fact changes, outside a scoring run.
-- A setting for the number of sites in one run (25) and for the hours between two checks (23).
 
 ### What is not tested
 
 - 14 days of checks, and so the stop at the last one. The rule is one condition in the query of FR-002.
 - A scoring run that answers the question from the fact. The code is that of feature 021 and has its unit tests; only the criterion's data changed.
-- More than 25 sites due in one run.
-- A site that is down in the smoke test only: a name under `.example`. A site that is up (`www.mozilla.org`, status 200, 100 percent) was checked once by hand on the preview on 2026-11-26.
+- More sites due in one run than `uptime.sites_per_run`.
+- A site that is up, in the smoke test: it checks only a name under `.example`, so that no real site is called. By hand on the preview on 2026-11-26: `www.mozilla.org` and `www.cloudflare.com` answered 200 and gave 100 percent, and `no-such-site-zz9.example` gave 0 percent. Those three companies, named "Uptime review", are left on the preview.
 
 ## Success Criteria
 
 - **SC-001**: `./unit-test.sh` passes, with no type errors.
-- **SC-002**: `./preview-test.sh` passes: a scheduler run checks a new lead's site once and stores the fact, a second run makes no second check, a new measurement replaces the earlier check, and a company with no website and an unknown company are refused.
+- **SC-002**: `./preview-test.sh` passes: a scheduler run checks a new lead's site once and stores the fact, a second run makes no second check, a new measurement replaces the earlier check (the company and its checks stay on the preview, to be looked at), and a company with no website and an unknown company are refused.

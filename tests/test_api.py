@@ -155,6 +155,8 @@ class Settings(unittest.TestCase):
             "ai.research.max_pages": 8,
             "proposal.max_tries": 3,
             "uptime.window_days": "14",
+            "uptime.sites_per_run": 25,
+            "uptime.hours_between_checks": "23",
             "some.future.setting": "any text",
         }
         for key, value in good.items():
@@ -175,6 +177,8 @@ class Settings(unittest.TestCase):
             ("import.max_rows", 0),
             ("proposal.max_tries", 0),
             ("uptime.window_days", "0"),
+            ("uptime.sites_per_run", "many"),
+            ("uptime.hours_between_checks", 0),
             ("some.future.setting", ""),
             ("some.future.setting", None),
             ("score.min_confidence", True),
@@ -266,10 +270,13 @@ class Routes(unittest.TestCase):
         for change in ({"stage": "CUSTOMER"}, {"stage": "DISQUALIFIED"}, {"archived_at": "2026-11-26T00:00:00Z"}, {"website": None}, {"website": "localhost"}):
             self.assertFalse(api.may_measure({**lead, **change}), change)
 
-    def test_the_days_of_uptime_checks_fall_back_to_14(self):
-        self.assertEqual(api.uptime_days({"uptime.window_days": "7"}), 7)
-        self.assertEqual(api.uptime_days({}), 14)
-        self.assertEqual(api.uptime_days({"uptime.window_days": "many"}), 14)
+    def test_a_setting_of_the_uptime_checker_is_used_first_and_falls_back_to_its_constant(self):
+        self.assertEqual(api.uptime_setting({"uptime.window_days": "7"}, "uptime.window_days"), 7)
+        self.assertEqual(api.uptime_setting({}, "uptime.window_days"), 14)
+        self.assertEqual(api.uptime_setting({"uptime.window_days": "many"}, "uptime.window_days"), 14)
+        self.assertEqual(api.uptime_setting({"uptime.sites_per_run": "5"}, "uptime.sites_per_run"), 5)
+        self.assertEqual(api.uptime_setting({}, "uptime.sites_per_run"), 25)
+        self.assertEqual(api.uptime_setting({"uptime.hours_between_checks": "0"}, "uptime.hours_between_checks"), 23)
 
     def test_proposals_are_read_by_anyone_and_started_by_an_administrator(self):
         routes = {r.path: r for r in api.app.routes if isinstance(r, APIRoute)}

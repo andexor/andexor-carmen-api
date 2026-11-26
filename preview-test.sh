@@ -448,7 +448,7 @@ if [[ "$(jq -r '.items[0].id' "${BODY}")" == "${FIRST_CHECK}" ]]; then
     exit 1
 fi
 echo "ok: a new uptime measurement replaced the earlier check"
-expect 204 '' -X DELETE "${BASE}/companies/${UPCO}"
+# The company and its checks are left on the preview, to be looked at.
 # Approving the renewal moves the end date forward by the term, records it, and closes the task.
 expect 200 '"status":"ACTIVE"' -X POST "${BASE}/agreements/${RENEWING}/renewal"
 if [[ "$(jq -r '.end_date' "${BODY}")" < "$(date -u -d '+5 months' +%F)" ]]; then

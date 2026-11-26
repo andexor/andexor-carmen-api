@@ -184,7 +184,8 @@ async def check_site(url: str) -> dict[str, Any]:
             response: Any = await workers.fetch(url, headers=FETCH_HEADERS, signal=js_module().AbortSignal.timeout(FETCH_MS))
             status = int(response.status)
             if not is_up(status):
-                detail = f"the site answered {status}"
+                # 530 is not the site speaking: the Workers runtime answers it when the name does not resolve.
+                detail = "the site could not be reached (530)" if status == 530 else f"the site answered {status}"
         except Exception as e:
             name = type(e).__name__
             detail = f"no answer in {FETCH_MS // 1000} seconds" if "Timeout" in name or "Abort" in name else f"could not be reached ({name})"
