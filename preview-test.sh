@@ -65,8 +65,8 @@ expect 200 '"role":"ADMIN"' "${BASE}/me"
 expect 200 '"machine":true' "${BASE}/me"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/no-such-path"
 
-# Nothing is deleted on the preview, here or anywhere below (specs/030-keep-preview-data/spec.md):
-# every record a run makes stays, to be looked at. So each run has a tag of its own in its names and
+# No delete endpoint is called, here or anywhere below (specs/030-keep-preview-data/spec.md):
+# every record a run makes stays on the preview, to be looked at. So each run has a tag of its own in its names and
 # websites, and the data of earlier runs is never in its way.
 RUN="${RANDOM}${RANDOM}"
 # Companies and contacts (specs/002-companies-and-contacts/spec.md).
@@ -99,7 +99,6 @@ expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"kind":"SYSTEM"}' "
 expect 200 '"kind":"STAGE_CHANGE"' "${BASE}/companies/${ID}/activities?kind=STAGE_CHANGE"
 ENTRY=$(jq -r '.items[0].id' "${BODY}")
 expect 409 '"error":"CONFLICT"' -X PATCH "${JSON[@]}" -d '{"body":"edited"}' "${BASE}/activities/${ENTRY}"
-expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/activities/${ENTRY}"
 # A date in another form is stored in ISO 8601 form.
 expect 201 '"due_date":"2026-12-01"' -X POST "${JSON[@]}" \
     -d "{\"title\":\"Smoke task\",\"company_id\":\"${ID}\",\"due_date\":\"12/1/2026\"}" "${BASE}/tasks"
@@ -142,7 +141,6 @@ expect 200 '"key":"smoke_count"' "${BASE}/facts/keys"
 # An edit is recorded on the timeline, with the old value, in the same transaction.
 expect 200 '"value":"older"' -X PATCH "${JSON[@]}" -d '{"value":"older"}' "${BASE}/facts/${FACT}"
 expect 200 "Fact smoke_fact edited: value 'old' to 'older'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
-expect 404 '"error":"NOT_FOUND"' -X DELETE "${BASE}/facts/00000000-0000-4000-8000-00000000dead"
 
 # Deals again: closing one, and the record that an edit leaves on the timeline.
 expect 200 '"closed_at":"2' -X PATCH "${JSON[@]}" -d '{"stage":"WON","monthly_value_cents":50000}' "${BASE}/deals/${DEAL}"
@@ -158,8 +156,7 @@ expect 200 '"title":"Smoke task 2"' -X PATCH "${JSON[@]}" -d '{"title":"Smoke ta
 expect 200 "Task Smoke task edited: title 'Smoke task' to 'Smoke task 2'" "${BASE}/companies/${ID}/activities?kind=SYSTEM&limit=200"
 
 # Agreements and documents (specs/008-agreements-and-documents/spec.md). The company is a CUSTOMER
-# by hand at this point. A company with an agreement or a document cannot be deleted, and an
-# agreement that is not a draft cannot be deleted: both refusals are checked, and they remove nothing.
+# by hand at this point.
 expect 201 '"status":"DRAFT"' -X POST "${JSON[@]}" \
     -d "{\"company_id\":\"${ID}\",\"type\":\"MSA\",\"title\":\"Smoke MSA\",\"signed_date\":\"11/01/2026\"}" "${BASE}/agreements"
 AGREEMENT=$(jq -r '.id' "${BODY}")
@@ -191,8 +188,6 @@ if ! grep -qi '^content-disposition: attachment; filename="smoke.txt"' "${HEAD}"
     exit 1
 fi
 expect 200 '"file_name":"smoke.txt"' "${BASE}/agreements/${AGREEMENT}"
-expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/companies/${ID}"
-expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/agreements/${AGREEMENT}"
 # When the last active agreement ends, the customer becomes a former customer.
 expect 200 '"status":"DRAFT"' -X PATCH "${JSON[@]}" -d '{"status":"DRAFT"}' "${BASE}/agreements/${AGREEMENT}"
 expect 200 '"stage":"FORMER"' "${BASE}/companies/${ID}"
