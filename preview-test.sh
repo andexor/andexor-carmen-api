@@ -65,32 +65,21 @@ expect 200 '"role":"ADMIN"' "${BASE}/me"
 expect 200 '"machine":true' "${BASE}/me"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/no-such-path"
 
-# Companies and contacts (specs/002-companies-and-contacts/spec.md). The test company is deleted at
-# the end, and at the start if an earlier run failed and left it behind.
+# No delete endpoint is called, here or anywhere below (specs/030-keep-preview-data/spec.md):
+# every record a run makes stays on the preview, to be looked at. So each run has a tag of its own in its names and
+# websites, and the data of earlier runs is never in its way.
+RUN="${RANDOM}${RANDOM}"
+# Companies and contacts (specs/002-companies-and-contacts/spec.md).
 JSON=(-H "Content-Type: application/json")
 expect 200 '"domain":"COMPANY_STAGE"' "${BASE}/srt"
-expect 200 '"items"' "${BASE}/companies?q=smoke-test.invalid"
-# A company with agreements or documents cannot be deleted, so those go first. An agreement must
-# be a draft to be deleted.
-for id in $(jq -r '.items[].id' "${BODY}"); do
-    expect 200 '"items"' "${BASE}/companies/${id}/documents"
-    for document in $(jq -r '.items[].id' "${BODY}"); do
-        expect 204 '' -X DELETE "${BASE}/documents/${document}"
-    done
-    expect 200 '"items"' "${BASE}/agreements?company_id=${id}"
-    for agreement in $(jq -r '.items[].id' "${BODY}"); do
-        expect 200 '"status":"DRAFT"' -X PATCH "${JSON[@]}" -d '{"status":"DRAFT"}' "${BASE}/agreements/${agreement}"
-        expect 204 '' -X DELETE "${BASE}/agreements/${agreement}"
-    done
-    expect 204 '' -X DELETE "${BASE}/companies/${id}"
-done
-expect 201 '"domain":"smoke-test.invalid"' -X POST "${JSON[@]}" \
-    -d '{"name":"Smoke Test","website":"https://www.Smoke-Test.invalid/about"}' "${BASE}/companies"
+expect 200 '"items":\[\]' "${BASE}/companies?q=smoke-${RUN}.invalid"
+expect 201 "\"domain\":\"smoke-${RUN}.invalid\"" -X POST "${JSON[@]}" \
+    -d "{\"name\":\"Smoke Test ${RUN}\",\"website\":\"https://www.Smoke-${RUN}.invalid/about\"}" "${BASE}/companies"
 ID=$(jq -r '.id' "${BODY}")
 # A second company with the same domain is refused, and the answer names the first.
-expect 409 "\"company_id\":\"${ID}\"" -X POST "${JSON[@]}" -d '{"website":"smoke-test.invalid"}' "${BASE}/companies"
+expect 409 "\"company_id\":\"${ID}\"" -X POST "${JSON[@]}" -d "{\"website\":\"smoke-${RUN}.invalid\"}" "${BASE}/companies"
 # Deals (specs/007-deals/spec.md). The first deal moves the lead to PROSPECT by itself.
-expect 201 '"name":"Smoke Test deal"' -X POST "${JSON[@]}" \
+expect 201 "\"name\":\"Smoke Test ${RUN} deal\"" -X POST "${JSON[@]}" \
     -d "{\"company_id\":\"${ID}\",\"service_ids\":[\"web-development\"]}" "${BASE}/deals"
 DEAL=$(jq -r '.id' "${BODY}")
 expect 200 '"stage":"PROSPECT"' "${BASE}/companies/${ID}"
@@ -99,19 +88,17 @@ expect 200 '"stage":"CUSTOMER"' -X PATCH "${JSON[@]}" -d '{"stage":"CUSTOMER"}' 
 expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"stage":"NO_SUCH_STAGE"}' "${BASE}/companies/${ID}"
 # The database enforces foreign keys with no PRAGMA: an owner that does not exist is refused.
 expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"owner_id":"no-such-user"}' "${BASE}/companies/${ID}"
-expect 201 '"is_primary":1' -X POST "${JSON[@]}" -d '{"name":"Smoke Contact","is_primary":true}' "${BASE}/companies/${ID}/contacts"
-expect 200 '"name":"Smoke Contact"' "${BASE}/companies/${ID}"
-expect 200 '"next_cursor":null' "${BASE}/companies?q=smoke+contact"
+expect 201 '"is_primary":1' -X POST "${JSON[@]}" -d "{\"name\":\"Smoke Contact ${RUN}\",\"is_primary\":true}" "${BASE}/companies/${ID}/contacts"
+expect 200 "\"name\":\"Smoke Contact ${RUN}\"" "${BASE}/companies/${ID}"
+expect 200 '"next_cursor":null' "${BASE}/companies?q=smoke+contact+${RUN}"
 
-# The timeline and tasks (specs/003-activities-and-tasks/spec.md). Both hang off the test company,
-# so deleting it below removes them.
+# The timeline and tasks (specs/003-activities-and-tasks/spec.md). Both hang off the test company.
 expect 201 '"kind":"NOTE"' -X POST "${JSON[@]}" -d '{"body":"Smoke note"}' "${BASE}/companies/${ID}/activities"
 expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"kind":"SYSTEM"}' "${BASE}/companies/${ID}/activities"
 # The stage change above wrote an automatic entry, and it is permanent.
 expect 200 '"kind":"STAGE_CHANGE"' "${BASE}/companies/${ID}/activities?kind=STAGE_CHANGE"
 ENTRY=$(jq -r '.items[0].id' "${BODY}")
 expect 409 '"error":"CONFLICT"' -X PATCH "${JSON[@]}" -d '{"body":"edited"}' "${BASE}/activities/${ENTRY}"
-expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/activities/${ENTRY}"
 # A date in another form is stored in ISO 8601 form.
 expect 201 '"due_date":"2026-12-01"' -X POST "${JSON[@]}" \
     -d "{\"title\":\"Smoke task\",\"company_id\":\"${ID}\",\"due_date\":\"12/1/2026\"}" "${BASE}/tasks"
@@ -124,7 +111,7 @@ expect 200 '"completed_at":"2' -X PATCH "${JSON[@]}" -d '{"status":"DONE"}' "${B
 expect 200 '"title":"Smoke task"' "${BASE}/tasks?status=DONE&company_id=${ID}"
 
 # Services, the rubric, and scores (specs/004-services-rubric-and-scoring/spec.md). The catalog and
-# the rubric cannot be deleted, so nothing is added to them here; only the test company is answered.
+# the rubric are shared, so nothing is added to them here; only the test company is answered.
 expect 200 '"offered":' "${BASE}/services"
 expect 200 '"section":"FIT"' "${BASE}/rubric"
 CRITERION=$(jq -r '[.items[] | select(.active == 1 and .section == "FIT" and .answer_type == "YES_NO")][0].id' "${BODY}")
@@ -138,7 +125,7 @@ expect 200 '"fit_score":null' -X PUT "${JSON[@]}" -d "$(answer null)" "${BASE}/c
 expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"prompt":"Smoke","config_json":"{not json"}' "${BASE}/rubric"
 expect 200 '"companies":' -X POST "${BASE}/rubric/recompute"
 
-# Enrichment facts (specs/005-enrichment-facts/spec.md). They go with the test company.
+# Enrichment facts (specs/005-enrichment-facts/spec.md).
 expect 201 '"key":"smoke_fact"' -X POST "${JSON[@]}" -d '{"key":"Smoke Fact","value":"old","observed_at":"2026-01-01"}' "${BASE}/companies/${ID}/facts"
 FACT=$(jq -r '.items[0].id' "${BODY}")
 expect 201 '"source":"MANUAL"' -X POST "${JSON[@]}" \
@@ -151,30 +138,25 @@ if grep -q '"value":"old"' "${BODY}"; then
     exit 1
 fi
 expect 200 '"key":"smoke_count"' "${BASE}/facts/keys"
-# An edit and a delete are each recorded on the timeline, with the old value, in the same transaction.
+# An edit is recorded on the timeline, with the old value, in the same transaction.
 expect 200 '"value":"older"' -X PATCH "${JSON[@]}" -d '{"value":"older"}' "${BASE}/facts/${FACT}"
 expect 200 "Fact smoke_fact edited: value 'old' to 'older'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
-expect 204 '' -X DELETE "${BASE}/facts/${FACT}"
-expect 200 "Fact smoke_fact deleted. It held: value 'older'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
-expect 404 '"error":"NOT_FOUND"' -X DELETE "${BASE}/facts/${FACT}"
 
-# Deals again: closing one, and the records that an edit and a delete leave on the timeline.
+# Deals again: closing one, and the record that an edit leaves on the timeline.
 expect 200 '"closed_at":"2' -X PATCH "${JSON[@]}" -d '{"stage":"WON","monthly_value_cents":50000}' "${BASE}/deals/${DEAL}"
-expect 200 'Deal Smoke Test deal: stage changed from QUALIFYING to WON' "${BASE}/companies/${ID}/activities?kind=STAGE_CHANGE"
-expect 200 'Deal Smoke Test deal edited: monthly_value_cents None to 50000' "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+expect 200 "Deal Smoke Test ${RUN} deal: stage changed from QUALIFYING to WON" "${BASE}/companies/${ID}/activities?kind=STAGE_CHANGE"
+expect 200 "Deal Smoke Test ${RUN} deal edited: monthly_value_cents None to 50000" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
 expect 200 '"items":\[\]' "${BASE}/deals?company_id=${ID}&open=true"
 expect 200 '"service_ids":\["web-development"\]' "${BASE}/deals/${DEAL}"
-expect 204 '' -X DELETE "${BASE}/deals/${DEAL}"
-expect 200 'Deal Smoke Test deal deleted' "${BASE}/companies/${ID}/activities?kind=SYSTEM"
 
 # The change log (specs/018-change-log/spec.md): an edit of any record leaves the old value on the timeline.
 expect 200 '"city":"Atlanta"' -X PATCH "${JSON[@]}" -d '{"city":"Atlanta"}' "${BASE}/companies/${ID}"
-expect 200 "Company Smoke Test edited: city None to 'Atlanta'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+expect 200 "Company Smoke Test ${RUN} edited: city None to 'Atlanta'" "${BASE}/companies/${ID}/activities?kind=SYSTEM"
 expect 200 '"title":"Smoke task 2"' -X PATCH "${JSON[@]}" -d '{"title":"Smoke task 2"}' "${BASE}/tasks/${TASK}"
 expect 200 "Task Smoke task edited: title 'Smoke task' to 'Smoke task 2'" "${BASE}/companies/${ID}/activities?kind=SYSTEM&limit=200"
 
 # Agreements and documents (specs/008-agreements-and-documents/spec.md). The company is a CUSTOMER
-# by hand at this point. Both are removed again here, because they block deleting the company.
+# by hand at this point.
 expect 201 '"status":"DRAFT"' -X POST "${JSON[@]}" \
     -d "{\"company_id\":\"${ID}\",\"type\":\"MSA\",\"title\":\"Smoke MSA\",\"signed_date\":\"11/01/2026\"}" "${BASE}/agreements"
 AGREEMENT=$(jq -r '.id' "${BODY}")
@@ -206,17 +188,12 @@ if ! grep -qi '^content-disposition: attachment; filename="smoke.txt"' "${HEAD}"
     exit 1
 fi
 expect 200 '"file_name":"smoke.txt"' "${BASE}/agreements/${AGREEMENT}"
-expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/companies/${ID}"
-expect 409 '"error":"CONFLICT"' -X DELETE "${BASE}/agreements/${AGREEMENT}"
-expect 204 '' -X DELETE "${BASE}/documents/${DOCUMENT}"
-expect 404 '"error":"NOT_FOUND"' "${BASE}/documents/${DOCUMENT}/content"
 # When the last active agreement ends, the customer becomes a former customer.
 expect 200 '"status":"DRAFT"' -X PATCH "${JSON[@]}" -d '{"status":"DRAFT"}' "${BASE}/agreements/${AGREEMENT}"
 expect 200 '"stage":"FORMER"' "${BASE}/companies/${ID}"
-expect 204 '' -X DELETE "${BASE}/agreements/${AGREEMENT}"
 
 # AI runs (specs/009-ai-runs/spec.md). The stub model is enabled on the preview only; it returns
-# fixed results, so no outside service is called. The runs go with the test company.
+# fixed results, so no outside service is called.
 expect 200 '"provider":"STUB"' "${BASE}/ai/models?can_research=true"
 STUB=$(jq -r '[.items[] | select(.provider == "STUB")][0].id' "${BODY}")
 expect 200 '"active":1' -X PATCH "${JSON[@]}" -d '{"active":true}' "${BASE}/ai/models/${STUB}"
@@ -261,9 +238,11 @@ expect 200 'Measured, not judged: the fact pagespeed_mobile is 95, and 90 or mor
 # from production's because a test ran.
 expect 200 '"active":0' -X PATCH "${JSON[@]}" -d '{"active":false}' "${BASE}/ai/models/${STUB}"
 
-# The Today view (specs/006-today/spec.md). The overdue task goes with the test company.
+# The Today view (specs/006-today/spec.md). The overdue task is marked done at the end, so the
+# tasks of earlier runs do not fill the list.
 expect 201 '"due_date":"2020-01-01"' -X POST "${JSON[@]}" \
     -d "{\"title\":\"Smoke overdue\",\"company_id\":\"${ID}\",\"due_date\":\"2020-01-01\"}" "${BASE}/tasks"
+OVERDUE=$(jq -r '.id' "${BODY}")
 expect 200 '"title":"Smoke overdue"' "${BASE}/today"
 for name in tasks_overdue tasks_due leads_unscored top_leads deals_without_task agreements_renewing runs_in_progress; do
     jq -e --arg name "${name}" '.[$name] | type == "array"' "${BODY}" > /dev/null || { echo "FAILED: /today has no list ${name}"; exit 1; }
@@ -275,10 +254,7 @@ if [[ "${ZONE}" == "UTC" || "$(jq -r '.date' "${BODY}")" != "$(TZ=${ZONE} date +
     exit 1
 fi
 echo "ok: today is $(jq -r '.date' "${BODY}") in ${ZONE}"
-
-expect 204 '' -X DELETE "${BASE}/companies/${ID}"
-expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${ID}"
-expect 200 '"items":\[\]' "${BASE}/tasks?company_id=${ID}"
+expect 200 '"status":"DONE"' -X PATCH "${JSON[@]}" -d '{"status":"DONE"}' "${BASE}/tasks/${OVERDUE}"
 
 # Cross-Origin Resource Sharing (specs/017-cors/spec.md): only an origin in ALLOWED_ORIGINS is echoed.
 # header <yes|no> <text>: the response headers of the last call must, or must not, contain the text.
@@ -325,8 +301,6 @@ expect 200 '"source":"CSV"' "${BASE}/companies?q=${TAG}"
 IMPORTED=$(jq -r --arg d "${TAG}.example" '.items[] | select(.domain == $d) | .id' "${BODY}")
 expect 200 '"name":"Ann Lee"' "${BASE}/companies/${IMPORTED}/contacts"
 expect 200 '"key":"founded"' "${BASE}/companies/${IMPORTED}/facts"
-expect 200 '"deleted":1,"kept":0' -X DELETE "${BASE}/imports/${IMPORT}"
-expect 404 '"error":"NOT_FOUND"' "${BASE}/companies/${IMPORTED}"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/imports/00000000-0000-4000-8000-00000000dead"
 
 # Machine methods (specs/014-machine-methods/spec.md), through the endpoint door. The Service Binding
@@ -360,8 +334,6 @@ expect 400 '"error":"BAD_REQUEST"' "${JSON[@]}" -d '{"source":"NO_SUCH_SOURCE","
 expect 201 '"created":true' "${JSON[@]}" -d "{\"source\":\"CONTACT_US\",\"contact\":{\"name\":\"Solo ${MTAG}\"}}" "${BASE}/machine/leads"
 SOLO_ID=$(jq -r '.company_id' "${BODY}")
 expect 200 "\"name\":\"Solo ${MTAG}\"" "${BASE}/companies/${SOLO_ID}"
-expect 204 '' -X DELETE "${BASE}/companies/${SOLO_ID}"
-expect 204 '' -X DELETE "${BASE}/companies/${LEAD_ID}"
 
 # The scheduler and notifications (specs/015-scheduler-and-notifications/spec.md). The preview's
 # provider is the stub, so no email is sent. The dates leave a margin of days, so the time zone
@@ -403,8 +375,7 @@ expect 200 '"status":"EXPIRED"' "${BASE}/agreements/${ENDED}"
 expect 200 '"status":"COMPLETED"' "${BASE}/agreements/${PROJECT}"
 # Service proposals (specs/025-service-proposals/spec.md). Completing the one-time agreement queued
 # its job. On the preview the job uses the stub model and the stub provider: no model is paid and
-# no email is sent. The job is then started once more by hand, and both must finish before the
-# company is deleted.
+# no email is sent. The job is then started once more by hand.
 PROPOSALS="${BASE}/notifications?kind=SERVICE_PROPOSALS&agreement_id=${PROJECT}"
 for wanted in 1 2; do
     for attempt in $(seq 1 60); do
@@ -438,17 +409,11 @@ if [[ "$(jq -c '.items | length' "${BODY}")" != "1" ]]; then
     exit 1
 fi
 echo "ok: the second run made no second alert"
-# The second run made no second uptime check: a site is checked once a day. A person starts a new
-# measurement, which replaces the checks with one made now.
+# The second run made no second uptime check: a site is checked once a day.
 expect 200 '"checks":1' "${BASE}/companies/${UPCO}/uptime"
-FIRST_CHECK=$(jq -r '.items[0].id' "${BODY}")
-expect 200 '"checks":1' -X POST "${BASE}/companies/${UPCO}/uptime"
-if [[ "$(jq -r '.items[0].id' "${BODY}")" == "${FIRST_CHECK}" ]]; then
-    echo "FAILED: a new measurement should replace the earlier check: $(cat "${BODY}")"
-    exit 1
-fi
-echo "ok: a new uptime measurement replaced the earlier check"
-# The company and its checks are left on the preview, to be looked at.
+# A person starts a measurement. It is started on a new company with no checks yet, so nothing is replaced.
+expect 201 '"stage":"LEAD"' "${JSON[@]}" -d "{\"name\":\"Uptime by hand ${STAG}\",\"website\":\"https://www.hand-${STAG}.example\"}" "${BASE}/companies"
+expect 200 '"checks":1' -X POST "${BASE}/companies/$(jq -r '.id' "${BODY}")/uptime"
 # Approving the renewal moves the end date forward by the term, records it, and closes the task.
 expect 200 '"status":"ACTIVE"' -X POST "${BASE}/agreements/${RENEWING}/renewal"
 if [[ "$(jq -r '.end_date' "${BODY}")" < "$(date -u -d '+5 months' +%F)" ]]; then
@@ -458,12 +423,6 @@ fi
 echo "ok: the renewal moved the end date forward by the term"
 expect 200 "renewal approved for 6 months" "${BASE}/companies/${SCO}/activities?kind=SYSTEM"
 expect 200 '"status":"DONE"' "${BASE}/tasks?company_id=${SCO}"
-# Only a draft can be deleted.
-for agreement in "${RENEWING}" "${ENDED}" "${PROJECT}"; do
-    expect 200 '"status":"DRAFT"' -X PATCH -H 'Content-Type: application/json' -d '{"status":"DRAFT"}' "${BASE}/agreements/${agreement}"
-    expect 204 '' -X DELETE "${BASE}/agreements/${agreement}"
-done
-expect 204 '' -X DELETE "${BASE}/companies/${SCO}"
 
 # Settings (specs/016-settings/spec.md). A change is put back, so the preview keeps its values.
 expect 200 '"key":"digest.hour_local"' "${BASE}/settings"
