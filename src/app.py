@@ -37,7 +37,10 @@ from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
+from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
 import access
@@ -142,8 +145,120 @@ async def authorize(request: Request) -> None:
         raise HTTPException(403)
 
 
-# The documentation pages and /openapi.json are not served: they would be routes with no action.
-app = FastAPI(dependencies=[Depends(authorize)], docs_url=None, redoc_url=None, openapi_url=None)
+# ---- The contract --------------------------------------------------------------------------------
+# The OpenAPI 3.1 specification that FastAPI generates from the routes below is the API's contract.
+# It and the Swagger UI are served like every other route: behind Cloudflare Access, with an action.
+# See specs/031-openapi/spec.md.
+
+# The name and the version in pyproject.toml, which is not packaged with the Worker. A unit test compares them.
+APP_NAME = "andexor-carmen-api"
+APP_VERSION = "1.0.0"
+OPENAPI_PATH = "/api/openapi.json"
+DOCS_PATH = "/api/docs"
+ACCESS_SCHEME = "cloudflareAccess"
+
+
+class ErrorBody(BaseModel):
+    """What every refusal and failure answers."""
+
+    ok: bool
+    error: str
+    request_id: str
+
+
+class HealthBody(BaseModel):
+    ok: bool
+
+
+class PageBody(BaseModel):
+    """One page of a list. next_cursor is passed as cursor to read the next page, and is null on the last one."""
+
+    items: list[dict[str, Any]]
+    next_cursor: str | None
+
+
+class IdentityBody(BaseModel):
+    """The caller: the user's row, or a machine caller, which has no row."""
+
+    id: str | None
+    email: str | None
+    display_name: str | None
+    role: str
+    active: int
+    created_at: str | None
+    machine: bool
+
+
+def describe(schema: dict[str, Any], routes: list[Any]) -> None:
+    """Make the generated specification say what the app does: the action each route needs, the
+    errors it really answers, and that Cloudflare Access stands in front of all but the health check."""
+    refusal = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}}}}
+    reasons = {"400": "The request is not valid", "401": "No valid Cloudflare Access token", "403": "The caller's role may not do this", "404": "No such record"}
+    for route in routes:
+        if not isinstance(route, APIRoute) or not route.include_in_schema:
+            continue
+        needed = str(getattr(route.endpoint, "action", ""))
+        for method in route.methods or ():
+            operation: dict[str, Any] | None = schema["paths"].get(route.path, {}).get(method.lower())
+            if operation is None:
+                continue
+            operation["tags"] = [route.path.removeprefix("/api/v1/").split("/")[0]]
+            operation["x-carmen-action"] = needed
+            operation["description"] = (operation.get("description", "") + f"\n\nNeeds the action {needed}.").strip()
+            # A request that fails validation is answered 400 with the error body, never FastAPI's 422.
+            invalid = operation["responses"].pop("422", None) is not None or "requestBody" in operation
+            if needed == PUBLIC:
+                operation["security"] = []
+                continue
+            wanted = ["401", "403"] + (["400"] if invalid else []) + (["404"] if "{" in route.path else [])
+            for status in sorted(wanted):
+                operation["responses"][status] = {"description": reasons[status], **refusal}
+    components: dict[str, Any] = schema.setdefault("components", {})
+    schemas: dict[str, Any] = components.setdefault("schemas", {})
+    for unused in ("HTTPValidationError", "ValidationError"):
+        schemas.pop(unused, None)
+    schemas["ErrorBody"] = ErrorBody.model_json_schema()
+    about = "The cookie that Cloudflare Access sets after sign-in. A service sends a service token instead."
+    components["securitySchemes"] = {ACCESS_SCHEME: {"type": "apiKey", "in": "cookie", "name": "CF_Authorization", "description": about}}
+    schema["security"] = [{ACCESS_SCHEME: []}]
+
+
+@action(READ)
+async def openapi_document(request: Request) -> JSONResponse:
+    return JSONResponse(request.app.openapi())
+
+
+@action(READ)
+async def swagger_ui(request: Request) -> HTMLResponse:
+    # No favicon is fetched from another site.
+    return get_swagger_ui_html(openapi_url=request.app.openapi_url, title=f"{request.app.title}: Swagger UI", swagger_favicon_url="data:,")
+
+
+class Api(FastAPI):
+    def setup(self) -> None:
+        """FastAPI adds the specification and the Swagger UI as plain routes, which skip the app's
+        dependencies and so would skip authorize. Here they are routes like the others, with an action."""
+        if self.openapi_url:
+            self.add_api_route(self.openapi_url, openapi_document, include_in_schema=False)
+            if self.docs_url:
+                self.add_api_route(self.docs_url, swagger_ui, include_in_schema=False, response_class=HTMLResponse)
+
+    def openapi(self) -> dict[str, Any]:
+        if self.openapi_schema is None:
+            describe(super().openapi(), self.routes)
+        return cast(dict[str, Any], self.openapi_schema)
+
+
+# The same paths in every environment: only /api/* reaches the Worker. ReDoc is not served.
+app = Api(
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="The Carmen API. Every path but the health check is behind Cloudflare Access, and each needs an action that the caller's role allows.",
+    dependencies=[Depends(authorize)],
+    openapi_url=OPENAPI_PATH,
+    docs_url=DOCS_PATH,
+    redoc_url=None,
+)
 
 
 @app.exception_handler(HTTPException)
@@ -270,14 +385,14 @@ async def identify(request: Request, call_next: Callable[[Request], Awaitable[Re
     return response
 
 
-@app.get(HEALTH_PATH)
+@app.get(HEALTH_PATH, response_model=HealthBody)
 @action(PUBLIC)
 async def health() -> dict[str, bool]:
     # Liveness only: touches no dependency.
     return {"ok": True}
 
 
-@app.get("/api/v1/me")
+@app.get("/api/v1/me", response_model=IdentityBody)
 @action(READ)
 async def me(request: Request) -> Identity:
     return request.state.identity
@@ -387,7 +502,7 @@ SORTS = {
 }
 
 
-@app.get("/api/v1/companies")
+@app.get("/api/v1/companies", response_model=PageBody)
 @action(READ)
 async def list_companies(
     request: Request,
@@ -422,7 +537,7 @@ async def list_companies(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/companies")
+@app.post("/api/v1/companies", status_code=201)
 @action(WRITE)
 async def create_company(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -533,7 +648,7 @@ def company_label(company: Row) -> str:
     return f"Company {company['name'] or company['domain'] or company['id']}"
 
 
-@app.delete("/api/v1/companies/{company_id}")
+@app.delete("/api/v1/companies/{company_id}", status_code=204)
 @action(DELETE)
 async def delete_company(request: Request, company_id: str) -> Response:
     sql = (
@@ -622,7 +737,7 @@ async def list_contacts(request: Request, company_id: str) -> JSONResponse:
     return JSONResponse({"items": contacts["results"]})
 
 
-@app.post("/api/v1/companies/{company_id}/contacts")
+@app.post("/api/v1/companies/{company_id}/contacts", status_code=201)
 @action(WRITE)
 async def create_contact(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -697,7 +812,7 @@ def contact_label(contact: Row) -> str:
     return f"Contact {contact['name'] or contact['email']}"
 
 
-@app.delete("/api/v1/contacts/{contact_id}")
+@app.delete("/api/v1/contacts/{contact_id}", status_code=204)
 @action(DELETE)
 async def delete_contact(request: Request, contact_id: str) -> Response:
     try:
@@ -734,7 +849,7 @@ async def outside_company(database: Any, values: Values, company_id: str) -> str
     return None
 
 
-@app.get("/api/v1/companies/{company_id}/activities")
+@app.get("/api/v1/companies/{company_id}/activities", response_model=PageBody)
 @action(READ)
 async def list_activities(
     request: Request,
@@ -758,7 +873,7 @@ async def list_activities(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/companies/{company_id}/activities")
+@app.post("/api/v1/companies/{company_id}/activities", status_code=201)
 @action(WRITE)
 async def create_activity(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -834,7 +949,7 @@ async def update_activity(request: Request, activity_id: str, body: dict[str, An
 
 
 # WRITE, not DELETE: a MEMBER may delete an entry they logged. may_delete decides.
-@app.delete("/api/v1/activities/{activity_id}")
+@app.delete("/api/v1/activities/{activity_id}", status_code=204)
 @action(WRITE)
 async def delete_activity(request: Request, activity_id: str) -> Response:
     sql = "SELECT * FROM activity WHERE id = ?"
@@ -870,7 +985,7 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-@app.get("/api/v1/tasks")
+@app.get("/api/v1/tasks", response_model=PageBody)
 @action(READ)
 async def list_tasks(
     request: Request,
@@ -900,7 +1015,7 @@ async def list_tasks(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/tasks")
+@app.post("/api/v1/tasks", status_code=201)
 @action(WRITE)
 async def create_task(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -972,7 +1087,7 @@ async def update_task(request: Request, task_id: str, body: dict[str, Any]) -> J
 
 
 # WRITE, not DELETE: a MEMBER may delete a task they own. may_delete decides.
-@app.delete("/api/v1/tasks/{task_id}")
+@app.delete("/api/v1/tasks/{task_id}", status_code=204)
 @action(WRITE)
 async def delete_task(request: Request, task_id: str) -> Response:
     try:
@@ -1120,7 +1235,7 @@ async def list_services(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.post("/api/v1/services")
+@app.post("/api/v1/services", status_code=201)
 @action(MANAGE)
 async def create_service(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -1216,7 +1331,7 @@ async def recompute_scores(request: Request) -> JSONResponse:
     return JSONResponse({"companies": count})
 
 
-@app.post("/api/v1/rubric")
+@app.post("/api/v1/rubric", status_code=201)
 @action(MANAGE)
 async def create_criterion(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -1461,7 +1576,7 @@ async def list_fact_keys(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.get("/api/v1/companies/{company_id}/facts")
+@app.get("/api/v1/companies/{company_id}/facts", response_model=PageBody)
 @action(READ)
 async def list_facts(
     request: Request,
@@ -1505,7 +1620,7 @@ def fact_inserts(database: Any, company_id: str, given: object, source: str, typ
     return statements
 
 
-@app.post("/api/v1/companies/{company_id}/facts")
+@app.post("/api/v1/companies/{company_id}/facts", status_code=201)
 @action(WRITE)
 async def create_facts(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -1575,7 +1690,7 @@ async def update_fact(request: Request, fact_id: str, body: dict[str, Any]) -> J
     return JSONResponse(row)
 
 
-@app.delete("/api/v1/facts/{fact_id}")
+@app.delete("/api/v1/facts/{fact_id}", status_code=204)
 @action(WRITE)
 async def delete_fact(request: Request, fact_id: str) -> Response:
     sql = "SELECT company_id, key, value, source, source_detail, notes, observed_at FROM enrichment_fact WHERE id = ?"
@@ -1704,7 +1819,7 @@ async def contact_outside(database: Any, values: Values, company_id: str) -> boo
     return not await database.prepare(sql).bind(values["primary_contact_id"], company_id).first()
 
 
-@app.get("/api/v1/deals")
+@app.get("/api/v1/deals", response_model=PageBody)
 @action(READ)
 async def list_deals(
     request: Request,
@@ -1730,7 +1845,7 @@ async def list_deals(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/deals")
+@app.post("/api/v1/deals", status_code=201)
 @action(WRITE)
 async def create_deal(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -1858,7 +1973,7 @@ async def update_deal(request: Request, deal_id: str, body: dict[str, Any]) -> J
 
 
 # WRITE, not DELETE: a MEMBER may delete a deal they own. may_delete decides.
-@app.delete("/api/v1/deals/{deal_id}")
+@app.delete("/api/v1/deals/{deal_id}", status_code=204)
 @action(WRITE)
 async def delete_deal(request: Request, deal_id: str) -> Response:
     database = db(request)
@@ -1939,7 +2054,7 @@ def company_stage_move(request: Request, company_id: str, old: str, new: str, wh
     return [db(request).prepare(sql).bind(new, company_id), insert(db(request), "activity", entry)]
 
 
-@app.get("/api/v1/agreements")
+@app.get("/api/v1/agreements", response_model=PageBody)
 @action(READ)
 async def list_agreements(
     request: Request,
@@ -1976,7 +2091,7 @@ async def list_agreements(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/agreements")
+@app.post("/api/v1/agreements", status_code=201)
 @action(WRITE)
 async def create_agreement(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -2154,7 +2269,7 @@ async def approve_renewal(request: Request, agreement_id: str) -> JSONResponse:
 
 
 # WRITE, not DELETE: a MEMBER may delete an agreement they own. may_delete decides.
-@app.delete("/api/v1/agreements/{agreement_id}")
+@app.delete("/api/v1/agreements/{agreement_id}", status_code=204)
 @action(WRITE)
 async def delete_agreement(request: Request, agreement_id: str) -> Response:
     database = db(request)
@@ -2210,7 +2325,12 @@ async def list_documents(request: Request, company_id: str) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.post("/api/v1/companies/{company_id}/documents")
+@app.post(
+    "/api/v1/companies/{company_id}/documents",
+    status_code=201,
+    # The body is the file itself, read as a stream, so FastAPI cannot see it.
+    openapi_extra={"requestBody": {"required": True, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}},
+)
 @action(WRITE)
 async def upload_document(
     request: Request, company_id: str, file_name: str | None = None, agreement_id: str | None = None
@@ -2326,7 +2446,7 @@ async def download_document(request: Request, document_id: str) -> Response:
 
 
 # WRITE, not DELETE: a MEMBER may delete a document they uploaded. may_delete decides.
-@app.delete("/api/v1/documents/{document_id}")
+@app.delete("/api/v1/documents/{document_id}", status_code=204)
 @action(WRITE)
 async def delete_document(request: Request, document_id: str) -> Response:
     database = db(request)
@@ -2401,7 +2521,7 @@ async def model_stats(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.post("/api/v1/ai/models")
+@app.post("/api/v1/ai/models", status_code=201)
 @action(MANAGE)
 async def create_model(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
@@ -2751,7 +2871,7 @@ async def process_run(env: Any, run_id: str) -> None:
 # ---- AI runs: reading and deciding ---------------------------------------------------------------
 
 
-@app.get("/api/v1/companies/{company_id}/runs")
+@app.get("/api/v1/companies/{company_id}/runs", response_model=PageBody)
 @action(READ)
 async def list_runs(
     request: Request, company_id: str, limit: int = Query(50, ge=1, le=200), cursor: int = Query(0, ge=0)
@@ -3643,7 +3763,7 @@ async def run_scheduler_now(request: Request, email: bool = False) -> JSONRespon
     return JSONResponse(await run_scheduler(request.scope["env"], email))
 
 
-@app.get("/api/v1/notifications")
+@app.get("/api/v1/notifications", response_model=PageBody)
 @action(READ)
 async def list_notifications(
     request: Request,

@@ -39,6 +39,8 @@ reports/             license and vulnerability reports, written by setup.sh
 | --- | --- | --- |
 | Worker | `andexor-carmen-api` | `andexor-carmen-api-preview` |
 | Route | `carmen.andexor.net/api/*` | `carmen-preview.andexor.net/api/*` |
+| OpenAPI 3.1 specification, signed in | `https://carmen.andexor.net/api/openapi.json` | `https://carmen-preview.andexor.net/api/openapi.json` |
+| Swagger UI, signed in | `https://carmen.andexor.net/api/docs` | `https://carmen-preview.andexor.net/api/docs` |
 | D1 database | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
 | R2 bucket for documents and import files (`DOCS`) | `andexor-carmen-api-prod` | `andexor-carmen-api-prev` |
 | Queue for AI runs and CSV imports (`RUNS`) | `andexor-carmen-api-runs-prod` | `andexor-carmen-api-runs-prev` |

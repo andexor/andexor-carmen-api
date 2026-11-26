@@ -65,6 +65,30 @@ expect 200 '"role":"ADMIN"' "${BASE}/me"
 expect 200 '"machine":true' "${BASE}/me"
 expect 404 '"error":"NOT_FOUND"' "${BASE}/no-such-path"
 
+# The contract (specs/031-openapi/spec.md): the generated OpenAPI specification and the Swagger UI,
+# behind Cloudflare Access like every other path.
+ROOT_URL="${BASE%/v1}"
+expect 200 '"openapi":"3.1' "${ROOT_URL}/openapi.json"
+if [[ "$(jq -r '[.info.title, .info.version, (.paths | has("/api/v1/companies")), (.paths | has("/api/openapi.json"))] | @csv' "${BODY}")" != "\"$(jq -r '.name' wrangler.jsonc)\",\"$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)\",true,false" ]]; then
+    echo "FAILED: the specification should carry the app's name and version and list the app's routes: $(jq -c '.info' "${BODY}")"
+    exit 1
+fi
+echo "ok: the specification carries the app's name and version and lists the routes"
+expect 200 'swagger-ui' "${ROOT_URL}/docs"
+expect 404 '"error":"NOT_FOUND"' "${ROOT_URL}/redoc"
+# With no credentials, Cloudflare Access answers before the Worker does, and never with the document.
+for path in openapi.json docs; do
+    if ! bare=$(curl -s -o "${BODY}" --write-out '%{http_code}' "${ROOT_URL}/${path}"); then
+        echo "FAILED: ${ROOT_URL}/${path} could not be reached"
+        exit 1
+    fi
+    if [[ "${bare}" == "200" ]] || grep -q '"openapi"\|swagger-ui' "${BODY}"; then
+        echo "FAILED: ${ROOT_URL}/${path} answered ${bare} to a request with no credentials"
+        exit 1
+    fi
+    echo "ok: ${bare} ${ROOT_URL}/${path} with no credentials"
+done
+
 # No delete endpoint is called, here or anywhere below (specs/030-keep-preview-data/spec.md):
 # every record a run makes stays on the preview, to be looked at. So each run has a tag of its own in its names and
 # websites, and the data of earlier runs is never in its way.
