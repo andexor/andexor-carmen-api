@@ -18,7 +18,7 @@ Setup steps for `andexor-carmen-api` that a person must do on a platform such as
 - [X] Enable R2 on the account (dash.cloudflare.com, R2 Object Storage). Checked 2026-11-22: the API answers "Please enable R2 through the Cloudflare Dashboard", so no bucket can be created yet. Needed before feature 008 (agreements and documents).
 - [X] Check the permissions of this repo's Account API token (Manage account, Account API tokens). It needs Workers Scripts Edit, Workers Routes Edit on the `andexor.net` zone, D1 Edit, Workers R2 Storage Edit, Workers AI Read, Account Secrets Store Edit, and Queues Edit if discovery task D2 chooses a queue. The token is in GitHub secrets, and its permissions were never checked.
 - [X] Only when a page at another origin must call the preview API from a browser (for example the UI running on your machine): in Zero Trust, Access, Applications, open the application for `carmen-preview.andexor.net`, and under the Cross-Origin Resource Sharing (CORS) settings turn on "Bypass options requests to origin". A browser sends its preflight request with no sign-in, so without this Cloudflare Access answers it and the API never sees it. Then list that origin in `ALLOWED_ORIGINS` under `env.preview` in `wrangler.jsonc`. Not needed for the deployed UI, which is served from the same hostname as the API.
-- [ ] Check that this repo's Account API token (the one the pipeline uses) can deploy a Worker bound to Secrets Store: it needs the Secrets Store permission (read is enough). Feature 010 binds `CLAUDE_API_KEY` in both environments. If the check `Preview and smoke test` fails at the deploy step with a Secrets Store error, add the permission to the token.
+- [X] Check that this repo's Account API token (the one the pipeline uses) can deploy a Worker bound to Secrets Store: it needs the Secrets Store permission (read is enough). Feature 010 binds `CLAUDE_API_KEY` in both environments. If the check `Preview and smoke test` fails at the deploy step with a Secrets Store error, add the permission to the token.
 
 ## GitHub
 
@@ -58,7 +58,7 @@ No billing account should be needed for this API. If the console asks for one, s
 - [ ] Feature 015 (scheduler and notifications): confirm that the test alert sent from the preview on 2026-11-24, "Renewal: Test agreement from the Carmen preview", reached the inbox.
 - [ ] After the first morning in production with something to report, confirm that the digest reached the inbox. That closes master question Q5.
 - [ ] After the first one-time agreement is completed in production, confirm that the proposals email reached the inbox and that its research is from that day (`specs/025-service-proposals/spec.md`).
-- [ ] After feature 028 is deployed to production, put your name in the setting `digest.recipient` there: `PATCH /api/v1/settings` with the value `First Last <address>` (`specs/028-email-names/spec.md`). Until then the To line shows the address alone.
+- [X] 2026-11-26: the name is in the setting `digest.recipient` in both databases, set by the migration `0018_recipient_name` in `andexor-carmen-main` (`specs/028-email-names/spec.md`).
 
 ## A service token for production (for later)
 

@@ -14,7 +14,12 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["workers-py", "workers-runtime-sdk", "pip-licenses"]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+    "pip-licenses",
+    "openapi-spec-validator>=0.9.0",
+]
 
 [tool.uv]
 exclude-newer = "1 week"
