@@ -397,7 +397,7 @@ def setting_problem(key: str, value: object) -> str | None:
         ok, wanted = _email(text), "one email address"
     elif key == "renewal.default_notice_days":
         ok, wanted = _whole(text, 0), "a whole number of days"
-    elif key in ("document.max_size_bytes", "import.max_rows", "ai.research.max_pages", "proposal.max_tries"):
+    elif key in ("document.max_size_bytes", "import.max_rows", "ai.research.max_pages", "proposal.max_tries", "uptime.window_days"):
         ok, wanted = _whole(text, 1), "a whole number of at least 1"
     else:
         return None

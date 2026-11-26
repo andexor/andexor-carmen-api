@@ -25,6 +25,7 @@ Error handling rule (constitution, Principle VIII): every step that can raise is
 inline try/except, which logs the step, the error, and the line. Detail stays in the log.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -43,6 +44,7 @@ import access
 import ai
 import imports
 import notify
+import pages
 from records import (
     ACTIVITY_CODES,
     ACTIVITY_FIELDS,
@@ -3585,8 +3587,8 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     variable EMAIL_PROVIDER says, and makes the digest now. The Cron Trigger never sets it.
     """
     provider = notify.PROVIDERS["CLOUDFLARE"] if email else notify.provider(getattr(env, "EMAIL_PROVIDER", None))
-    summary: Row = {"completed": 0, "expired": 0, "alerts": 0, "digest": None, "failed": []}
-    sql = "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key = 'renewal.default_notice_days'"
+    summary: Row = {"completed": 0, "expired": 0, "uptime": 0, "alerts": 0, "digest": None, "failed": []}
+    sql = "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key IN ('renewal.default_notice_days', 'uptime.window_days')"
     try:
         found = await env.DB.prepare(sql).all()
         settings: dict[str, str] = {row["key"]: row["value"] for row in found["results"]}
@@ -3604,6 +3606,11 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     except Exception as e:
         scheduler_log("failed", f"end_agreements: {type(e).__name__}: {e}")
         summary["failed"].append("end_agreements")
+    try:
+        summary["uptime"] = await uptime_checks(env, uptime_days(settings))
+    except Exception as e:
+        scheduler_log("failed", f"uptime_checks: {type(e).__name__}: {e}")
+        summary["failed"].append("uptime_checks")
     if not recipient:
         scheduler_log("failed", "the setting digest.recipient is missing, so nothing is sent")
         summary["failed"].append("recipient")
@@ -3651,6 +3658,137 @@ async def list_notifications(
     except Exception as e:
         return failed(request, "list_notifications", e)
     return page(result, limit, cursor)
+
+
+# ---- Uptime checker ------------------------------------------------------------------------------
+# specs/026-uptime-checker/spec.md. The scheduler checks the website of each lead and prospect once
+# a day until the company has uptime.window_days checks, and keeps the share of successful checks
+# as the fact uptime_percent. A scoring run answers "Is the site reliably up?" from that fact.
+
+UPTIME_DAYS = 14  # the fallback for a missing setting uptime.window_days
+UPTIME_BATCH = 25  # sites checked in one run of the scheduler; the rest wait for the next hour
+UPTIME_SCAN = 200  # shortcut: a company whose website is not a public address is skipped only after it is read, so more than 175 such companies would hold the others back; filter in SQL then
+UPTIME_COUNTS = (
+    "SELECT c.id, c.website, c.stage, c.archived_at, COUNT(u.id) AS checks, COALESCE(SUM(u.up), 0) AS ups,"
+    " (SELECT f.value FROM enrichment_fact f WHERE f.company_id = c.id AND f.key = 'uptime_percent'"
+    " ORDER BY f.observed_at DESC, f.created_at DESC LIMIT 1) AS stored"
+    " FROM company c LEFT JOIN uptime_check u ON u.company_id = c.id"
+)
+# Due: a lead or a prospect whose days are not full and whose last check is about a day old. A
+# company that was never checked comes first, the newest first.
+UPTIME_DUE = (
+    f"{UPTIME_COUNTS} WHERE c.stage IN ('LEAD', 'PROSPECT') AND c.archived_at IS NULL AND c.website IS NOT NULL"
+    " GROUP BY c.id HAVING COUNT(u.id) < ?"
+    " AND (MAX(u.checked_at) IS NULL OR MAX(u.checked_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-23 hours'))"
+    " ORDER BY MAX(u.checked_at) IS NOT NULL, MAX(u.checked_at), c.created_at DESC LIMIT ?"
+)
+
+
+def uptime_days(settings: dict[str, str]) -> int:
+    wanted = settings.get("uptime.window_days", "")
+    return int(wanted) if wanted.isdecimal() and int(wanted) > 0 else UPTIME_DAYS
+
+
+def uptime_writes(database: Any, company: Row, check: Row) -> list[Any]:
+    """The statements that store one check of a company, and the fact uptime_percent when the share
+    of successful checks changed. company holds its earlier checks, ups, and the stored fact."""
+    checks, ups = int(company["checks"]) + 1, int(company["ups"]) + int(check["up"])
+    value = f"{pages.percent_up(ups, checks):g}"
+    statements = [insert(database, "uptime_check", {"id": str(uuid.uuid4()), "company_id": company["id"], **check})]
+    if str(company["stored"]) != value:
+        fact: Values = {
+            "id": str(uuid.uuid4()),
+            "company_id": company["id"],
+            "key": "uptime_percent",
+            "value": value,
+            "source": "UPTIME_CHECK",
+            "source_detail": "Carmen uptime checker",
+            "notes": f"{ups} of {checks} daily checks succeeded",
+        }
+        statements.append(insert(database, "enrichment_fact", fact))
+    return statements
+
+
+async def uptime_checks(env: Any, days: int) -> int:
+    """The scheduler's step: check every site that is due, and store the checks in one batch.
+    Returns how many sites were checked."""
+    database = env.DB
+    found = await database.prepare(UPTIME_DUE).bind(days, UPTIME_SCAN).all()
+    due = [(company, url) for company in found["results"] if (url := pages.site_url(company["website"]))][:UPTIME_BATCH]
+    if not due:
+        return 0
+    checks = await asyncio.gather(*(pages.check_site(url) for _, url in due))  # check_site never raises
+    statements: list[Any] = []
+    for (company, _), check in zip(due, checks):
+        statements += uptime_writes(database, company, check)
+    await database.batch(statements)
+    return len(due)
+
+
+async def uptime_company(request: Request, company_id: str) -> Row | None:
+    found = await db(request).prepare(f"{UPTIME_COUNTS} WHERE c.id = ? GROUP BY c.id").bind(company_id).first()
+    return found or None
+
+
+def may_measure(company: Row) -> bool:
+    return company["stage"] in ("LEAD", "PROSPECT") and not company["archived_at"] and pages.site_url(company["website"]) is not None
+
+
+@app.get("/api/v1/companies/{company_id}/uptime")
+@action(READ)
+async def read_uptime(request: Request, company_id: str) -> JSONResponse:
+    database = db(request)
+    try:
+        company = await uptime_company(request, company_id)
+        if not company:
+            return error(request, 404)
+        setting, checks = await database.batch(
+            [
+                database.prepare("SELECT value FROM setting WHERE key = 'uptime.window_days'"),
+                database.prepare("SELECT * FROM uptime_check WHERE company_id = ? ORDER BY checked_at DESC, id").bind(company_id),
+            ]
+        )
+    except Exception as e:
+        return failed(request, "read_uptime", e)
+    days = uptime_days({"uptime.window_days": row["value"] for row in setting["results"]})
+    count, ups = int(company["checks"]), int(company["ups"])
+    answer: Row = {
+        "percent": pages.percent_up(ups, count) if count else None,
+        "checks": count,
+        "up": ups,
+        "window_days": days,
+        "measuring": may_measure(company) and count < days,  # the scheduler will check this site again
+        "items": checks["results"],
+    }
+    return JSONResponse(answer)
+
+
+# A new measurement: the earlier checks are deleted, the first check is made now, and the scheduler
+# makes the others, one a day. For a person who wants the answer measured again.
+@app.post("/api/v1/companies/{company_id}/uptime")
+@action(WRITE)
+async def start_uptime(request: Request, company_id: str) -> JSONResponse:
+    database = db(request)
+    try:
+        company = await uptime_company(request, company_id)
+    except Exception as e:
+        return failed(request, "load_company", e)
+    if not company:
+        return error(request, 404)
+    if not may_measure(company):
+        return error(request, 409)  # not a lead or a prospect, archived, or no public website
+    check = await pages.check_site(str(pages.site_url(company["website"])))  # never raises
+    try:
+        statements: list[Any] = []
+        if company["checks"]:
+            before: Row = {"checks": company["checks"], "uptime_percent": company["stored"]}
+            statements += audit(request, "Uptime checks", company_id, before, None)
+            statements.append(database.prepare("DELETE FROM uptime_check WHERE company_id = ?").bind(company_id))
+        statements += uptime_writes(database, {**company, "checks": 0, "ups": 0}, check)
+        await database.batch(statements)
+    except Exception as e:
+        return failed(request, "start_uptime", e)
+    return await read_uptime(request, company_id)
 
 
 # ---- Service proposals ---------------------------------------------------------------------------
