@@ -122,6 +122,11 @@ def run_lines(runs: list[dict[str, Any]]) -> str:
     return "\n".join(lines) or "- None. No model could be used."
 
 
+def subject_line(prefix: str | None, subject: str) -> str:
+    """The subject as it is sent: after the environment's prefix and a colon, when the environment has one."""
+    return f"{prefix}: {subject}" if prefix else subject
+
+
 def party(text: str) -> str | dict[str, str]:
     """One side of a message for the send_email binding: the name with the address, or the bare
     address when no name is known. See specs/028-email-names/spec.md."""
