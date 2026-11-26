@@ -14,11 +14,12 @@
 #   ./ai-test.sh models                 List the models on the preview: id, provider, enabled, runnable.
 #   ./ai-test.sh enable <model id>      Enable a model on the preview.
 #   ./ai-test.sh disable <model id>     Disable a model on the preview, so that nobody runs it by mistake.
-#   ./ai-test.sh run <model id> [website] [--keep] [--research <model id>]
+#   ./ai-test.sh run <model id> [website] [--research <model id>]
 #                                       Research a company with the model, then score the dossier with
 #                                       the same model. Prints the dossier, the proposed facts, the
-#                                       scores, and what the run used. The test company is deleted
-#                                       afterward unless --keep is given. The default website is
+#                                       scores, and what the run used. The test company stays on the
+#                                       preview, and a later run with the same website uses it again
+#                                       (specs/030-keep-preview-data/spec.md). The default website is
 #                                       https://www.cloudflare.com. For a model that only scores,
 #                                       such as Jev, name the model that researches with --research.
 #
@@ -64,14 +65,13 @@ case "${1:-}" in
         ;;
     run)
         MODEL=${2:-}
-        [[ -n "${MODEL}" ]] || { echo "usage: $0 run <model id> [website] [--keep] [--research <model id>]" >&2; exit 1; }
+        [[ -n "${MODEL}" ]] || { echo "usage: $0 run <model id> [website] [--research <model id>]" >&2; exit 1; }
         WEBSITE=https://www.cloudflare.com
-        KEEP=false
         RESEARCHER=${MODEL}
         shift 2
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                --keep) KEEP=true ;;
+                --keep) ;;  # accepted for old habits: the company is always kept
                 --research) RESEARCHER=${2:?--research needs a model id}; shift ;;
                 *) WEBSITE=$1 ;;
             esac
@@ -79,15 +79,14 @@ case "${1:-}" in
         done
 
         echo "This calls a real model on the preview and costs money."
-        COMPANY=$(call -X POST -d "{\"website\":\"${WEBSITE}\",\"name\":\"AI test $(date -u +%Y%m%dT%H%M%SZ)\"}" "${BASE}/companies" | jq -r '.id')
-        cleanup() {
-            if [[ "${KEEP}" == true ]]; then
-                echo "Kept the test company ${COMPANY}."
-            else
-                call -X DELETE "${BASE}/companies/${COMPANY}" > /dev/null && echo "Deleted the test company."
-            fi
-        }
-        trap cleanup EXIT
+        # Two companies cannot share a website, and nothing is deleted on the preview, so the company
+        # of an earlier run with this website is used again.
+        DOMAIN=$(sed -E 's#^https?://##; s#^www\.##; s#/.*##' <<< "${WEBSITE,,}")
+        COMPANY=$(call "${BASE}/companies?q=${DOMAIN}" | jq -r --arg d "${DOMAIN}" '[.items[] | select(.domain == $d)][0].id // empty')
+        if [[ -z "${COMPANY}" ]]; then
+            COMPANY=$(call -X POST -d "{\"website\":\"${WEBSITE}\",\"name\":\"AI test $(date -u +%Y%m%dT%H%M%SZ)\"}" "${BASE}/companies" | jq -r '.id')
+        fi
+        echo "The test company is ${COMPANY}. It stays on the preview."
 
         IDS=$(call -X POST -d "{\"research_model_id\":\"${RESEARCHER}\",\"scoring_model_ids\":[\"${MODEL}\"]}" "${BASE}/companies/${COMPANY}/runs/research-and-score")
         RESEARCH=$(jq -r '.run_ids[0]' <<< "${IDS}")
