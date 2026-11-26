@@ -17,6 +17,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import access
+import records
 
 logger = logging.getLogger("carmen")
 
@@ -121,6 +122,13 @@ def run_lines(runs: list[dict[str, Any]]) -> str:
     return "\n".join(lines) or "- None. No model could be used."
 
 
+def party(text: str) -> str | dict[str, str]:
+    """One side of a message for the send_email binding: the name with the address, or the bare
+    address when no name is known. See specs/028-email-names/spec.md."""
+    name, address = records.mailbox(text)
+    return {"email": address, "name": name} if name else address
+
+
 class Provider(Protocol):
     status: str  # the NOTIFICATION_STATUS of a message this provider accepted
 
@@ -133,7 +141,8 @@ class Stub:
     status = "STUBBED"
 
     async def send(self, env: Any, recipient: str, subject: str, body: str) -> str | None:
-        logger.info(json.dumps({"event": "carmen_email_stub", "recipient": recipient, "subject": subject, "body": body}))
+        sender = str(getattr(env, "EMAIL_FROM", ""))
+        logger.info(json.dumps({"event": "carmen_email_stub", "from": sender, "recipient": recipient, "subject": subject, "body": body}))
         return None
 
 
@@ -145,7 +154,7 @@ class CloudflareEmail:
     async def send(self, env: Any, recipient: str, subject: str, body: str) -> str | None:
         from pyodide.ffi import to_js
 
-        message = {"to": recipient, "from": str(env.EMAIL_FROM), "subject": subject, "text": body}
+        message = {"to": party(recipient), "from": party(str(env.EMAIL_FROM)), "subject": subject, "text": body}
         result = await env.EMAIL.send(to_js(message, dict_converter=access.js_module().Object.fromEntries))
         return str(result.messageId)
 

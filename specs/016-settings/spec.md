@@ -79,7 +79,7 @@ A value that would make Carmen fall back silently, such as an unknown time zone,
 | `digest.hour_local` | A whole number from 0 to 23 |
 | `digest.time_zone` | A time zone name that the zone data knows |
 | `digest.days` | Day names from `MON` to `SUN`, separated by commas, none twice |
-| `digest.recipient` | One email address |
+| `digest.recipient` | One email address, with or without a name: `First Last <address>` (`specs/028-email-names/spec.md`) |
 | `renewal.default_notice_days` | A whole number of 0 or more |
 | `document.max_size_bytes`, `import.max_rows`, `ai.research.max_pages` | A whole number of 1 or more |
 | `ai.default_research_model`, `ai.default_scoring_model` | The id of a row in `ai_model` |

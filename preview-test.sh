@@ -474,6 +474,7 @@ expect 200 "\"value\":\"${ROWS}\"" "${PATCH[@]}" -d "{\"import.max_rows\":\"${RO
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"no.such.setting":"1"}' "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.hour_local":"25"}' "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.time_zone":"Mars/Olympus_Mons"}' "${BASE}/settings"
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.recipient":"Some One <not an address>"}' "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"ai.default_scoring_model":"no-such-model"}' "${BASE}/settings"
 # One bad value refuses the whole change: the good one beside it is not stored.
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d "{\"import.max_rows\":$((ROWS + 7)),\"score.min_confidence\":101}" "${BASE}/settings"

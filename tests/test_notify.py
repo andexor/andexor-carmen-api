@@ -141,6 +141,12 @@ class Messages(unittest.TestCase):
 
 
 class Providers(unittest.TestCase):
+    def test_a_side_of_a_message_carries_its_name_and_a_bare_address_stays_bare(self):
+        self.assertEqual(notify.party("Carmen PREV <carmen@test.example>"), {"email": "carmen@test.example", "name": "Carmen PREV"})
+        self.assertEqual(notify.party('"Last, First" <someone@test.example>'), {"email": "someone@test.example", "name": "Last, First"})
+        self.assertEqual(notify.party("someone@test.example"), "someone@test.example")
+        self.assertEqual(notify.party(" <someone@test.example> "), "someone@test.example")
+
     def test_only_a_named_provider_sends_and_anything_else_is_the_stub(self):
         self.assertEqual(notify.provider("CLOUDFLARE").status, "SENT")
         for name in ("STUB", "", None, "undefined", "cloudflare"):

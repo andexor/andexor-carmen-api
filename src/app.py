@@ -80,6 +80,7 @@ from records import (
     id_list,
     iso_date,
     local_date,
+    mailbox,
     renewal_problem,
     setting_problem,
     slug,
@@ -3472,6 +3473,9 @@ async def notification(
         "agreement_id": agreement_id,
         "status": provider.status,
     }
+    if not mailbox(recipient)[0]:
+        # Sent all the same, to the bare address (specs/028-email-names/spec.md, FR-005).
+        scheduler_log("no_recipient_name", f"{kind}: the recipient has no name, so the To line shows the address alone")
     try:
         values["provider_ref"] = await provider.send(env, recipient, subject, body)
         if provider.status == "SENT":

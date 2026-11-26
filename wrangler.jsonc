@@ -12,7 +12,7 @@
         "ACCESS_AUD": "17fc8e216219c7456af6fce2bb529e0c99df04b37eb244317d5ac662c2aa451c",
         "EMAIL_PROVIDER": "CLOUDFLARE",
         "PROPOSAL_MODELS": "DEFAULT",
-        "EMAIL_FROM": "carmen@carmen.andexor.net"
+        "EMAIL_FROM": "Carmen <carmen@carmen.andexor.net>"
     },
     "observability": {
         "enabled": true,
@@ -58,7 +58,7 @@
                 "SERVICE_TOKENS_ARE_ADMIN": "true",
                 "EMAIL_PROVIDER": "STUB",
             "PROPOSAL_MODELS": "STUB",
-                "EMAIL_FROM": "carmen@carmen.andexor.net"
+                "EMAIL_FROM": "Carmen PREV <carmen@carmen.andexor.net>"
             },
             "routes": [
                 {
