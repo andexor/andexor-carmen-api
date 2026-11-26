@@ -21,6 +21,9 @@ src/prompts/         the prompts a model is given, as files with {{name}} placeh
 src/pages.py         reads a company's own website for a model that cannot search
 src/imports.py       the rules of a CSV import: reading the file, the column mapping, one row
 src/access.py        Cloudflare Access token verification
+src/models.py        GENERATED: the fields of every stored record and record body, for the OpenAPI specification
+src/contract.py      the answers and bodies that are more than one record
+tools/               gen_models.py writes src/models.py from the schema; contract_check.py checks answers against the specification
 src/notify.py        notifications: when the digest is due, what a message says, the email providers
 src/templates/email/ the text of each email: the first line is the subject
 src/roles.py         who may do what

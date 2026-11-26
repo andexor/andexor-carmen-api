@@ -44,6 +44,8 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
 import access
+import contract
+import models
 import ai
 import imports
 import notify
@@ -88,6 +90,7 @@ from records import (
     setting_problem,
     slug,
 )
+from contract import Items, Page, takes
 from roles import ADMIN, DELETE, MACHINE, MACHINE_CALLER, MANAGE, PUBLIC, READ, WRITE, action, allowed
 from scoring import Row, from_fact, measured, notable, points, score, valid_config
 
@@ -166,18 +169,11 @@ class ErrorBody(BaseModel):
     request_id: str
 
 
-class HealthBody(BaseModel):
+class HealthBody(models.Row):
     ok: bool
 
 
-class PageBody(BaseModel):
-    """One page of a list. next_cursor is passed as cursor to read the next page, and is null on the last one."""
-
-    items: list[dict[str, Any]]
-    next_cursor: str | None
-
-
-class IdentityBody(BaseModel):
+class IdentityBody(models.Row):
     """The caller: the user's row, or a machine caller, which has no row."""
 
     id: str | None
@@ -193,6 +189,7 @@ def describe(schema: dict[str, Any], routes: list[Any]) -> None:
     """Make the generated specification say what the app does: the action each route needs, the
     errors it really answers, and that Cloudflare Access stands in front of all but the health check."""
     refusal = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorBody"}}}}
+    found: dict[str, Any] = {}
     reasons = {"400": "The request is not valid", "401": "No valid Cloudflare Access token", "403": "The caller's role may not do this", "404": "No such record"}
     for route in routes:
         if not isinstance(route, APIRoute) or not route.include_in_schema:
@@ -204,6 +201,13 @@ def describe(schema: dict[str, Any], routes: list[Any]) -> None:
                 continue
             operation["tags"] = [route.path.removeprefix("/api/v1/").split("/")[0]]
             operation["x-carmen-action"] = needed
+            body: type[BaseModel] | None = getattr(route.endpoint, "body_model", None)
+            if body is not None:
+                # The handler reads the body as a free object and checks it itself; the declared model says what it takes.
+                described: dict[str, Any] = body.model_json_schema(ref_template="#/components/schemas/{model}")
+                found.update(described.pop("$defs", {}))
+                found[body.__name__] = described
+                operation["requestBody"]["content"]["application/json"]["schema"] = {"$ref": f"#/components/schemas/{body.__name__}"}
             operation["description"] = (operation.get("description", "") + f"\n\nNeeds the action {needed}.").strip()
             # A request that fails validation is answered 400 with the error body, never FastAPI's 422.
             invalid = operation["responses"].pop("422", None) is not None or "requestBody" in operation
@@ -217,6 +221,7 @@ def describe(schema: dict[str, Any], routes: list[Any]) -> None:
     schemas: dict[str, Any] = components.setdefault("schemas", {})
     for unused in ("HTTPValidationError", "ValidationError"):
         schemas.pop(unused, None)
+    schemas.update(found)
     schemas["ErrorBody"] = ErrorBody.model_json_schema()
     about = "The cookie that Cloudflare Access sets after sign-in. A service sends a service token instead."
     components["securitySchemes"] = {ACCESS_SCHEME: {"type": "apiKey", "in": "cookie", "name": "CF_Authorization", "description": about}}
@@ -481,7 +486,7 @@ async def duplicate(request: Request, condition: str, value: str | None) -> JSON
 # ---- Reference codes -----------------------------------------------------------------------------
 
 
-@app.get("/api/v1/srt")
+@app.get("/api/v1/srt", response_model=Items[models.Srt])
 @action(READ)
 async def list_srt(request: Request) -> JSONResponse:
     sql = "SELECT domain, code, label, description, sort_order FROM srt WHERE active = 1 ORDER BY domain, sort_order, code"
@@ -502,7 +507,7 @@ SORTS = {
 }
 
 
-@app.get("/api/v1/companies", response_model=PageBody)
+@app.get("/api/v1/companies", response_model=Page[models.Company])
 @action(READ)
 async def list_companies(
     request: Request,
@@ -537,8 +542,9 @@ async def list_companies(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/companies", status_code=201)
+@app.post("/api/v1/companies", response_model=models.Company, status_code=201)
 @action(WRITE)
+@takes(models.CompanyBody)
 async def create_company(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, COMPANY_FIELDS)
@@ -565,7 +571,7 @@ async def create_company(request: Request, body: dict[str, Any]) -> JSONResponse
     return JSONResponse(row, status_code=201)
 
 
-@app.get("/api/v1/companies/{company_id}")
+@app.get("/api/v1/companies/{company_id}", response_model=contract.CompanyDetail)
 @action(READ)
 async def get_company(request: Request, company_id: str) -> JSONResponse:
     try:
@@ -591,8 +597,9 @@ async def get_company(request: Request, company_id: str) -> JSONResponse:
     )
 
 
-@app.patch("/api/v1/companies/{company_id}")
+@app.patch("/api/v1/companies/{company_id}", response_model=models.Company)
 @action(WRITE)
+@takes(models.CompanyBody)
 async def update_company(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, COMPANY_FIELDS)
@@ -705,13 +712,13 @@ async def set_archived(request: Request, company_id: str, archive: bool) -> JSON
     return JSONResponse(row)
 
 
-@app.post("/api/v1/companies/{company_id}/archive")
+@app.post("/api/v1/companies/{company_id}/archive", response_model=models.Company)
 @action(WRITE)
 async def archive_company(request: Request, company_id: str) -> JSONResponse:
     return await set_archived(request, company_id, True)
 
 
-@app.post("/api/v1/companies/{company_id}/unarchive")
+@app.post("/api/v1/companies/{company_id}/unarchive", response_model=models.Company)
 @action(WRITE)
 async def unarchive_company(request: Request, company_id: str) -> JSONResponse:
     return await set_archived(request, company_id, False)
@@ -724,7 +731,7 @@ CONTACTS_OF = "SELECT * FROM contact WHERE company_id = ? ORDER BY is_primary DE
 CLEAR_PRIMARY = f"UPDATE contact SET is_primary = 0, updated_at = {NOW} WHERE company_id = ? AND is_primary = 1 AND id != ?"
 
 
-@app.get("/api/v1/companies/{company_id}/contacts")
+@app.get("/api/v1/companies/{company_id}/contacts", response_model=Items[models.Contact])
 @action(READ)
 async def list_contacts(request: Request, company_id: str) -> JSONResponse:
     try:
@@ -737,8 +744,9 @@ async def list_contacts(request: Request, company_id: str) -> JSONResponse:
     return JSONResponse({"items": contacts["results"]})
 
 
-@app.post("/api/v1/companies/{company_id}/contacts", status_code=201)
+@app.post("/api/v1/companies/{company_id}/contacts", response_model=models.Contact, status_code=201)
 @action(WRITE)
+@takes(models.ContactBody)
 async def create_contact(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, CONTACT_FIELDS)
@@ -770,8 +778,9 @@ async def create_contact(request: Request, company_id: str, body: dict[str, Any]
     return JSONResponse(row, status_code=201)
 
 
-@app.patch("/api/v1/contacts/{contact_id}")
+@app.patch("/api/v1/contacts/{contact_id}", response_model=models.Contact)
 @action(WRITE)
+@takes(models.ContactBody)
 async def update_contact(request: Request, contact_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, CONTACT_FIELDS)
@@ -849,7 +858,7 @@ async def outside_company(database: Any, values: Values, company_id: str) -> str
     return None
 
 
-@app.get("/api/v1/companies/{company_id}/activities", response_model=PageBody)
+@app.get("/api/v1/companies/{company_id}/activities", response_model=Page[models.Activity])
 @action(READ)
 async def list_activities(
     request: Request,
@@ -873,8 +882,9 @@ async def list_activities(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/companies/{company_id}/activities", status_code=201)
+@app.post("/api/v1/companies/{company_id}/activities", response_model=models.Activity, status_code=201)
 @action(WRITE)
+@takes(models.ActivityBody)
 async def create_activity(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, ACTIVITY_FIELDS)
@@ -904,8 +914,9 @@ async def create_activity(request: Request, company_id: str, body: dict[str, Any
     return JSONResponse(row, status_code=201)
 
 
-@app.patch("/api/v1/activities/{activity_id}")
+@app.patch("/api/v1/activities/{activity_id}", response_model=models.Activity)
 @action(WRITE)
+@takes(models.ActivityBody)
 async def update_activity(request: Request, activity_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, ACTIVITY_FIELDS)
@@ -985,7 +996,7 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-@app.get("/api/v1/tasks", response_model=PageBody)
+@app.get("/api/v1/tasks", response_model=Page[models.Task])
 @action(READ)
 async def list_tasks(
     request: Request,
@@ -1015,8 +1026,9 @@ async def list_tasks(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/tasks", status_code=201)
+@app.post("/api/v1/tasks", response_model=models.Task, status_code=201)
 @action(WRITE)
+@takes(models.TaskBody)
 async def create_task(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, TASK_FIELDS)
@@ -1043,8 +1055,9 @@ async def create_task(request: Request, body: dict[str, Any]) -> JSONResponse:
     return JSONResponse(row, status_code=201)
 
 
-@app.patch("/api/v1/tasks/{task_id}")
+@app.patch("/api/v1/tasks/{task_id}", response_model=models.Task)
 @action(WRITE)
+@takes(models.TaskBody)
 async def update_task(request: Request, task_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, TASK_FIELDS)
@@ -1225,7 +1238,7 @@ def scores_body(scores: Row, services: list[Row]) -> Row:
 # ---- Services ------------------------------------------------------------------------------------
 
 
-@app.get("/api/v1/services")
+@app.get("/api/v1/services", response_model=Items[models.Service])
 @action(READ)
 async def list_services(request: Request) -> JSONResponse:
     try:
@@ -1235,8 +1248,9 @@ async def list_services(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.post("/api/v1/services", status_code=201)
+@app.post("/api/v1/services", response_model=models.Service, status_code=201)
 @action(MANAGE)
+@takes(models.ServiceBody)
 async def create_service(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, SERVICE_FIELDS)
@@ -1263,8 +1277,9 @@ async def create_service(request: Request, body: dict[str, Any]) -> JSONResponse
     return JSONResponse(row, status_code=201)
 
 
-@app.patch("/api/v1/services/{service_id}")
+@app.patch("/api/v1/services/{service_id}", response_model=models.Service)
 @action(MANAGE)
+@takes(models.ServiceBody)
 async def update_service(request: Request, service_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, SERVICE_FIELDS)
@@ -1311,7 +1326,7 @@ async def update_service(request: Request, service_id: str, body: dict[str, Any]
 SCORING_COLUMNS = {"section", "service_id", "answer_type", "weight", "config_json", "active"}
 
 
-@app.get("/api/v1/rubric")
+@app.get("/api/v1/rubric", response_model=Items[models.RubricCriterion])
 @action(READ)
 async def list_rubric(request: Request) -> JSONResponse:
     try:
@@ -1321,7 +1336,7 @@ async def list_rubric(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.post("/api/v1/rubric/recompute")
+@app.post("/api/v1/rubric/recompute", response_model=contract.Recomputed)
 @action(WRITE)
 async def recompute_scores(request: Request) -> JSONResponse:
     try:
@@ -1331,8 +1346,9 @@ async def recompute_scores(request: Request) -> JSONResponse:
     return JSONResponse({"companies": count})
 
 
-@app.post("/api/v1/rubric", status_code=201)
+@app.post("/api/v1/rubric", response_model=models.RubricCriterion, status_code=201)
 @action(MANAGE)
+@takes(models.CriterionBody)
 async def create_criterion(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, CRITERION_FIELDS)
@@ -1366,8 +1382,9 @@ async def create_criterion(request: Request, body: dict[str, Any]) -> JSONRespon
     return JSONResponse(row, status_code=201)
 
 
-@app.patch("/api/v1/rubric/{criterion_id}")
+@app.patch("/api/v1/rubric/{criterion_id}", response_model=models.RubricCriterion)
 @action(MANAGE)
+@takes(models.CriterionBody)
 async def update_criterion(request: Request, criterion_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, CRITERION_FIELDS)
@@ -1411,7 +1428,7 @@ async def update_criterion(request: Request, criterion_id: str, body: dict[str, 
 # ---- Answers -------------------------------------------------------------------------------------
 
 
-@app.get("/api/v1/companies/{company_id}/answers")
+@app.get("/api/v1/companies/{company_id}/answers", response_model=Items[contract.Answer])
 @action(READ)
 async def list_answers(request: Request, company_id: str) -> JSONResponse:
     # Every criterion in use, with the company's answer beside it. An unanswered one has a null value.
@@ -1430,8 +1447,9 @@ async def list_answers(request: Request, company_id: str) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.put("/api/v1/companies/{company_id}/answers")
+@app.put("/api/v1/companies/{company_id}/answers", response_model=contract.Scores)
 @action(WRITE)
+@takes(contract.AnswersBody)
 async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     entries: Any = body.get("answers")
     if not isinstance(entries, list) or not entries:
@@ -1560,7 +1578,7 @@ def audit(request: Request, what: str, company_id: str | None, before: Row, afte
     return [insert(db(request), "activity", entry)]
 
 
-@app.get("/api/v1/facts/keys")
+@app.get("/api/v1/facts/keys", response_model=Items[contract.FactKey])
 @action(READ)
 async def list_fact_keys(request: Request) -> JSONResponse:
     # For auto-complete: the well-known keys, then any other key already in use.
@@ -1576,7 +1594,7 @@ async def list_fact_keys(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.get("/api/v1/companies/{company_id}/facts", response_model=PageBody)
+@app.get("/api/v1/companies/{company_id}/facts", response_model=Page[models.EnrichmentFact])
 @action(READ)
 async def list_facts(
     request: Request,
@@ -1620,8 +1638,9 @@ def fact_inserts(database: Any, company_id: str, given: object, source: str, typ
     return statements
 
 
-@app.post("/api/v1/companies/{company_id}/facts", status_code=201)
+@app.post("/api/v1/companies/{company_id}/facts", response_model=Items[models.EnrichmentFact], status_code=201)
 @action(WRITE)
+@takes(contract.FactsBody)
 async def create_facts(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
@@ -1647,8 +1666,9 @@ async def create_facts(request: Request, company_id: str, body: dict[str, Any]) 
     return JSONResponse({"items": rows}, status_code=201)
 
 
-@app.patch("/api/v1/facts/{fact_id}")
+@app.patch("/api/v1/facts/{fact_id}", response_model=models.EnrichmentFact)
 @action(WRITE)
+@takes(contract.FactIn)
 async def update_fact(request: Request, fact_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = fact_fields(body)
@@ -1732,7 +1752,7 @@ TODAY_RENEWING = (
 )
 
 
-@app.get("/api/v1/today")
+@app.get("/api/v1/today", response_model=contract.Today)
 @action(READ)
 async def today(request: Request, limit: int = Query(50, ge=1, le=200)) -> JSONResponse:
     database = db(request)
@@ -1819,7 +1839,7 @@ async def contact_outside(database: Any, values: Values, company_id: str) -> boo
     return not await database.prepare(sql).bind(values["primary_contact_id"], company_id).first()
 
 
-@app.get("/api/v1/deals", response_model=PageBody)
+@app.get("/api/v1/deals", response_model=Page[contract.DealOut])
 @action(READ)
 async def list_deals(
     request: Request,
@@ -1845,8 +1865,9 @@ async def list_deals(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/deals", status_code=201)
+@app.post("/api/v1/deals", response_model=contract.DealOut, status_code=201)
 @action(WRITE)
+@takes(contract.DealBody)
 async def create_deal(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, DEAL_FIELDS)
@@ -1896,7 +1917,7 @@ async def create_deal(request: Request, body: dict[str, Any]) -> JSONResponse:
     return JSONResponse(deal_out(row), status_code=201)
 
 
-@app.get("/api/v1/deals/{deal_id}")
+@app.get("/api/v1/deals/{deal_id}", response_model=contract.DealOut)
 @action(READ)
 async def get_deal(request: Request, deal_id: str) -> JSONResponse:
     try:
@@ -1906,8 +1927,9 @@ async def get_deal(request: Request, deal_id: str) -> JSONResponse:
     return JSONResponse(deal_out(row)) if row else error(request, 404)
 
 
-@app.patch("/api/v1/deals/{deal_id}")
+@app.patch("/api/v1/deals/{deal_id}", response_model=contract.DealOut)
 @action(WRITE)
+@takes(contract.DealBody)
 async def update_deal(request: Request, deal_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, DEAL_FIELDS)
@@ -2054,7 +2076,7 @@ def company_stage_move(request: Request, company_id: str, old: str, new: str, wh
     return [db(request).prepare(sql).bind(new, company_id), insert(db(request), "activity", entry)]
 
 
-@app.get("/api/v1/agreements", response_model=PageBody)
+@app.get("/api/v1/agreements", response_model=Page[contract.AgreementOut])
 @action(READ)
 async def list_agreements(
     request: Request,
@@ -2091,8 +2113,9 @@ async def list_agreements(
     return page(result, limit, cursor)
 
 
-@app.post("/api/v1/agreements", status_code=201)
+@app.post("/api/v1/agreements", response_model=contract.AgreementOut, status_code=201)
 @action(WRITE)
+@takes(contract.AgreementBody)
 async def create_agreement(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, AGREEMENT_FIELDS)
@@ -2130,7 +2153,7 @@ async def create_agreement(request: Request, body: dict[str, Any]) -> JSONRespon
     return JSONResponse(agreement_out(row), status_code=201)
 
 
-@app.get("/api/v1/agreements/{agreement_id}")
+@app.get("/api/v1/agreements/{agreement_id}", response_model=contract.AgreementDetail)
 @action(READ)
 async def get_agreement(request: Request, agreement_id: str) -> JSONResponse:
     database = db(request)
@@ -2153,8 +2176,9 @@ async def get_agreement(request: Request, agreement_id: str) -> JSONResponse:
     )
 
 
-@app.patch("/api/v1/agreements/{agreement_id}")
+@app.patch("/api/v1/agreements/{agreement_id}", response_model=contract.AgreementOut)
 @action(WRITE)
+@takes(contract.AgreementBody)
 async def update_agreement(request: Request, agreement_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, AGREEMENT_FIELDS)
@@ -2226,7 +2250,7 @@ async def update_agreement(request: Request, agreement_id: str, body: dict[str, 
 
 # Approving a renewal is its own action, not an edit of the end date: the end moves forward by the
 # agreement's term, and the timeline says who approved it. See specs/024-renewal-policy/spec.md.
-@app.post("/api/v1/agreements/{agreement_id}/renewal")
+@app.post("/api/v1/agreements/{agreement_id}/renewal", response_model=contract.AgreementOut)
 @action(WRITE)
 async def approve_renewal(request: Request, agreement_id: str) -> JSONResponse:
     database = db(request)
@@ -2311,7 +2335,7 @@ def bucket(request: Request) -> Any:
     return request.scope["env"].DOCS
 
 
-@app.get("/api/v1/companies/{company_id}/documents")
+@app.get("/api/v1/companies/{company_id}/documents", response_model=Items[models.Document])
 @action(READ)
 async def list_documents(request: Request, company_id: str) -> JSONResponse:
     sql = f"SELECT {DOCUMENT_COLUMNS} FROM document WHERE company_id = ? ORDER BY uploaded_at DESC, id"
@@ -2327,6 +2351,7 @@ async def list_documents(request: Request, company_id: str) -> JSONResponse:
 
 @app.post(
     "/api/v1/companies/{company_id}/documents",
+    response_model=models.Document,
     status_code=201,
     # The body is the file itself, read as a stream, so FastAPI cannot see it.
     openapi_extra={"requestBody": {"required": True, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}},
@@ -2402,7 +2427,7 @@ async def upload_document(
     return JSONResponse({column: row[column] for column in DOCUMENT_COLUMNS.split(", ")}, status_code=201)
 
 
-@app.get("/api/v1/documents/{document_id}")
+@app.get("/api/v1/documents/{document_id}", response_model=models.Document)
 @action(READ)
 async def get_document(request: Request, document_id: str) -> JSONResponse:
     sql = f"SELECT {DOCUMENT_COLUMNS} FROM document WHERE id = ?"
@@ -2413,7 +2438,11 @@ async def get_document(request: Request, document_id: str) -> JSONResponse:
     return JSONResponse(row) if row else error(request, 404)
 
 
-@app.get("/api/v1/documents/{document_id}/content")
+@app.get(
+    "/api/v1/documents/{document_id}/content",
+    response_class=Response,
+    responses={200: {"description": "The file", "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}},
+)
 @action(READ)
 async def download_document(request: Request, document_id: str) -> Response:
     try:
@@ -2480,7 +2509,7 @@ async def delete_document(request: Request, document_id: str) -> Response:
 # ---- AI models -----------------------------------------------------------------------------------
 
 
-@app.get("/api/v1/ai/models")
+@app.get("/api/v1/ai/models", response_model=Items[contract.ModelOut])
 @action(READ)
 async def list_models(
     request: Request, can_research: bool | None = None, can_score: bool | None = None, active: bool | None = None
@@ -2500,7 +2529,7 @@ async def list_models(
     return JSONResponse({"items": [{**row, "runnable": row["provider"] in ai.ADAPTERS} for row in result["results"]]})
 
 
-@app.get("/api/v1/ai/models/stats")
+@app.get("/api/v1/ai/models/stats", response_model=Items[contract.ModelStats])
 @action(READ)
 async def model_stats(request: Request) -> JSONResponse:
     # agreement_rate: of a model's answers, the share that equal the company's answer in effect.
@@ -2521,8 +2550,9 @@ async def model_stats(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.post("/api/v1/ai/models", status_code=201)
+@app.post("/api/v1/ai/models", response_model=models.AiModel, status_code=201)
 @action(MANAGE)
+@takes(models.ModelBody)
 async def create_model(request: Request, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, MODEL_FIELDS)
@@ -2548,8 +2578,9 @@ async def create_model(request: Request, body: dict[str, Any]) -> JSONResponse:
     return JSONResponse(row, status_code=201)
 
 
-@app.patch("/api/v1/ai/models/{model_id}")
+@app.patch("/api/v1/ai/models/{model_id}", response_model=models.AiModel)
 @action(MANAGE)
+@takes(models.ModelBody)
 async def update_model(request: Request, model_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, MODEL_FIELDS)
@@ -2648,8 +2679,9 @@ async def store_and_queue(request: Request, runs: list[Row], queue_now: list[Row
     return JSONResponse({"run_ids": [run["id"] for run in runs]}, status_code=202)
 
 
-@app.post("/api/v1/companies/{company_id}/runs")
+@app.post("/api/v1/companies/{company_id}/runs", response_model=contract.RunIds, status_code=202)
 @action(WRITE)
+@takes(contract.StartRunsBody)
 async def start_runs(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     kind, input_run_id = body.get("kind"), body.get("input_run_id")
     try:
@@ -2681,8 +2713,9 @@ async def start_runs(request: Request, company_id: str, body: dict[str, Any]) ->
     return await store_and_queue(request, runs, runs)
 
 
-@app.post("/api/v1/companies/{company_id}/runs/research-and-score")
+@app.post("/api/v1/companies/{company_id}/runs/research-and-score", response_model=contract.RunIds, status_code=202)
 @action(WRITE)
+@takes(contract.ResearchAndScoreBody)
 async def research_and_score(request: Request, company_id: str, body: dict[str, Any]) -> JSONResponse:
     research_id = body.get("research_model_id")
     try:
@@ -2871,7 +2904,7 @@ async def process_run(env: Any, run_id: str) -> None:
 # ---- AI runs: reading and deciding ---------------------------------------------------------------
 
 
-@app.get("/api/v1/companies/{company_id}/runs", response_model=PageBody)
+@app.get("/api/v1/companies/{company_id}/runs", response_model=Page[contract.RunOut])
 @action(READ)
 async def list_runs(
     request: Request, company_id: str, limit: int = Query(50, ge=1, le=200), cursor: int = Query(0, ge=0)
@@ -2887,7 +2920,7 @@ async def list_runs(
     return page(result, limit, cursor)
 
 
-@app.get("/api/v1/companies/{company_id}/runs/compare")
+@app.get("/api/v1/companies/{company_id}/runs/compare", response_model=contract.Comparison)
 @action(READ)
 async def compare_runs(request: Request, company_id: str, run_ids: str) -> JSONResponse:
     wanted = [run_id for run_id in run_ids.split(",") if run_id]
@@ -2916,7 +2949,7 @@ async def compare_runs(request: Request, company_id: str, run_ids: str) -> JSONR
     return JSONResponse({"runs": found, "items": ai.compare(criteria["results"], in_effect, by_run)})
 
 
-@app.get("/api/v1/runs/{run_id}")
+@app.get("/api/v1/runs/{run_id}", response_model=contract.RunDetail)
 @action(READ)
 async def get_run(request: Request, run_id: str) -> JSONResponse:
     database = db(request)
@@ -2946,8 +2979,9 @@ async def get_run(request: Request, run_id: str) -> JSONResponse:
     return JSONResponse({**run, "answers": answers["results"], "services": services["results"]})
 
 
-@app.patch("/api/v1/runs/{run_id}")
+@app.patch("/api/v1/runs/{run_id}", response_model=contract.RunOut)
 @action(WRITE)
+@takes(models.RunBody)
 async def rate_run(request: Request, run_id: str, body: dict[str, Any]) -> JSONResponse:
     try:
         values = clean(body, RUN_FIELDS)
@@ -2978,8 +3012,9 @@ async def rate_run(request: Request, run_id: str, body: dict[str, Any]) -> JSONR
     return JSONResponse(row)
 
 
-@app.post("/api/v1/runs/{run_id}/facts/decide")
+@app.post("/api/v1/runs/{run_id}/facts/decide", response_model=Items[models.AiRunFact])
 @action(WRITE)
+@takes(contract.DecideBody)
 async def decide_facts(request: Request, run_id: str, body: dict[str, Any]) -> JSONResponse:
     database = db(request)
     try:
@@ -3088,7 +3123,7 @@ async def apply_scoring(request: Request, run: Row) -> tuple[Row, list[Row]]:
     return scores, services
 
 
-@app.post("/api/v1/runs/{run_id}/apply")
+@app.post("/api/v1/runs/{run_id}/apply", response_model=contract.Scores)
 @action(WRITE)
 async def apply_run(request: Request, run_id: str) -> JSONResponse:
     try:
@@ -3162,8 +3197,9 @@ async def read_csv(request: Request, body: dict[str, Any]) -> tuple[str, list[st
     return text, headers, rows
 
 
-@app.post("/api/v1/imports/preview")
+@app.post("/api/v1/imports/preview", response_model=contract.ImportPreview)
 @action(WRITE)
+@takes(contract.CsvBody)
 async def preview_import(request: Request, body: dict[str, Any]) -> JSONResponse:
     read = await read_csv(request, body)
     if isinstance(read, JSONResponse):
@@ -3180,8 +3216,9 @@ async def preview_import(request: Request, body: dict[str, Any]) -> JSONResponse
     )
 
 
-@app.post("/api/v1/imports")
+@app.post("/api/v1/imports", response_model=contract.Created, status_code=202)
 @action(WRITE)
+@takes(contract.ImportBody)
 async def create_import(request: Request, body: dict[str, Any]) -> JSONResponse:
     read = await read_csv(request, body)
     if isinstance(read, JSONResponse):
@@ -3322,7 +3359,7 @@ async def process_import(env: Any, import_id: str) -> None:
         import_log(import_id, "result_not_stored", f"{type(e).__name__}: {e}")
 
 
-@app.get("/api/v1/imports/{import_id}")
+@app.get("/api/v1/imports/{import_id}", response_model=contract.ImportStatus)
 @action(READ)
 async def get_import(request: Request, import_id: str) -> JSONResponse:
     try:
@@ -3339,7 +3376,7 @@ async def get_import(request: Request, import_id: str) -> JSONResponse:
 
 
 # WRITE, not DELETE: a MEMBER may undo an import they made. may_delete decides.
-@app.delete("/api/v1/imports/{import_id}")
+@app.delete("/api/v1/imports/{import_id}", response_model=contract.ImportUndone)
 @action(WRITE)
 async def undo_import(request: Request, import_id: str) -> JSONResponse:
     database = db(request)
@@ -3548,14 +3585,16 @@ async def machine_answer(request: Request, method: MachineMethod, body: Row) -> 
     return JSONResponse(result, status_code=201 if result.get("created") else 200)
 
 
-@app.post("/api/v1/machine/leads")
+@app.post("/api/v1/machine/leads", response_model=contract.LeadResult, responses={201: {"model": contract.LeadResult, "description": "A new company was made"}})
 @action(MACHINE)
+@takes(contract.LeadBody)
 async def machine_lead(request: Request, body: dict[str, Any]) -> JSONResponse:
     return await machine_answer(request, create_lead, body)
 
 
-@app.post("/api/v1/machine/facts")
+@app.post("/api/v1/machine/facts", response_model=contract.FactsAdded)
 @action(MACHINE)
+@takes(contract.MachineFactsBody)
 async def machine_facts(request: Request, body: dict[str, Any]) -> JSONResponse:
     return await machine_answer(request, add_facts, body)
 
@@ -3757,13 +3796,13 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
 
 # For an administrator, and for the smoke test: the same run the Cron Trigger makes, now.
 # With email=true the run sends real email in any environment, and makes the digest now. The smoke test never sets it.
-@app.post("/api/v1/scheduler/run")
+@app.post("/api/v1/scheduler/run", response_model=contract.SchedulerRun)
 @action(MANAGE)
 async def run_scheduler_now(request: Request, email: bool = False) -> JSONResponse:
     return JSONResponse(await run_scheduler(request.scope["env"], email))
 
 
-@app.get("/api/v1/notifications", response_model=PageBody)
+@app.get("/api/v1/notifications", response_model=Page[models.Notification])
 @action(READ)
 async def list_notifications(
     request: Request,
@@ -3872,7 +3911,7 @@ def may_measure(company: Row) -> bool:
     return company["stage"] in ("LEAD", "PROSPECT") and not company["archived_at"] and pages.site_url(company["website"]) is not None
 
 
-@app.get("/api/v1/companies/{company_id}/uptime")
+@app.get("/api/v1/companies/{company_id}/uptime", response_model=contract.Uptime)
 @action(READ)
 async def read_uptime(request: Request, company_id: str) -> JSONResponse:
     database = db(request)
@@ -3903,7 +3942,7 @@ async def read_uptime(request: Request, company_id: str) -> JSONResponse:
 
 # A new measurement: the earlier checks are deleted, the first check is made now, and the scheduler
 # makes the others, one a day. For a person who wants the answer measured again.
-@app.post("/api/v1/companies/{company_id}/uptime")
+@app.post("/api/v1/companies/{company_id}/uptime", response_model=contract.Uptime)
 @action(WRITE)
 async def start_uptime(request: Request, company_id: str) -> JSONResponse:
     database = db(request)
@@ -3988,7 +4027,7 @@ async def proposals_of(database: Any, company_id: str, agreement_id: str | None 
     return {"scored_at": company["results"][0]["scored_at"], "items": items}
 
 
-@app.get("/api/v1/companies/{company_id}/proposals")
+@app.get("/api/v1/companies/{company_id}/proposals", response_model=contract.Proposals)
 @action(READ)
 async def list_proposals(request: Request, company_id: str) -> JSONResponse:
     try:
@@ -4011,7 +4050,7 @@ async def queue_proposals(env: Any, agreement_id: str, real: bool = False) -> bo
 # For an administrator, and for the smoke test: the same job a completed one-time agreement starts.
 # With real=true the job uses the default models and sends real email in any environment. It costs
 # money, so the smoke test never sets it.
-@app.post("/api/v1/agreements/{agreement_id}/proposals")
+@app.post("/api/v1/agreements/{agreement_id}/proposals", response_model=contract.Queued, status_code=202)
 @action(MANAGE)
 async def start_proposals(request: Request, agreement_id: str, real: bool = False) -> JSONResponse:
     try:
@@ -4149,7 +4188,7 @@ async def process_proposals(env: Any, agreement_id: str, real: bool = False) -> 
 # See specs/016-settings/spec.md.
 
 
-@app.get("/api/v1/settings")
+@app.get("/api/v1/settings", response_model=Items[models.Setting])
 @action(READ)
 async def list_settings(request: Request) -> JSONResponse:
     try:
@@ -4159,8 +4198,9 @@ async def list_settings(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
-@app.patch("/api/v1/settings")
+@app.patch("/api/v1/settings", response_model=Items[models.Setting])
 @action(MANAGE)
+@takes(contract.SettingsBody)
 async def update_settings(request: Request, body: dict[str, Any]) -> JSONResponse:
     database = db(request)
     try:

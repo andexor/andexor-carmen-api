@@ -19,6 +19,7 @@ dev = [
     "workers-runtime-sdk",
     "pip-licenses",
     "openapi-spec-validator>=0.9.0",
+    "jsonschema>=4.26.0",
 ]
 
 [tool.uv]
