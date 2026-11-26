@@ -675,7 +675,7 @@ class TypeSafe:
             logger.info(json.dumps({"event": "carmen_typesafe_judgments", "model": reply.get("model"), "answers": judged})[:8000])
             usage: Any = reply.get("usage") if isinstance(reply.get("usage"), dict) else {}
             tokens = {"input_tokens": _count(usage.get("input_tokens")) or 0, "output_tokens": _count(usage.get("output_tokens")) or 0}
-            # An alias such as jev-latest moves; the reply names the version that answered.
+            # The reply names the version that answered. It is the pinned one: see specs/027-pin-jev-version/spec.md.
             tokens["model_id_used"] = _text(reply.get("model"), 200)
         return {"answers": typesafe_answers(criteria, judged, parts), **tokens}
 
