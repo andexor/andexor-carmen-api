@@ -556,7 +556,7 @@ def levels(top: int, chance: float = 0.6) -> Row:
 class TypeSafeAdapter(unittest.TestCase):
     ASKED = [CRITERIA[0], CRITERIA[1], {**CRITERIA[2], "enrichment_key": "employee_count"}, CRITERIA[3]]
     MATERIAL = ai.material({"name": "Acme", "website": "https://acme.com"}, [{"key": "employee_count", "value": "12"}], "They fix pipes.\n\nFACTS are few.")
-    JEV = {"model_id": "jev-latest"}
+    JEV = {"model_id": "jev-1.14.0"}
 
     def test_the_material_is_sent_as_named_parts(self):
         parts = ai.material_parts(self.MATERIAL)
@@ -606,7 +606,7 @@ class TypeSafeAdapter(unittest.TestCase):
         fake = FakeClaude(judged(c1=0.9))
         result = asyncio.run(ai.TypeSafe(fake).score(None, self.JEV, self.ASKED, self.MATERIAL))
         body = fake.bodies[0]
-        self.assertEqual((body["model"], body["state"]), ("jev-latest", ai.material_parts(self.MATERIAL)))
+        self.assertEqual((body["model"], body["state"]), ("jev-1.14.0", ai.material_parts(self.MATERIAL)))
         self.assertEqual(body["questions"], ai.typesafe_questions(self.ASKED))
         self.assertEqual({answer["criterion_id"] for answer in result["answers"]}, {"c1", "c3"})
         self.assertEqual((result["input_tokens"], result["output_tokens"], result["model_id_used"]), (900, 12, "jev-1.14.0"))

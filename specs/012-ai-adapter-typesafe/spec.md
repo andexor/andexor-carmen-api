@@ -76,7 +76,7 @@ An unknown answer never lowers a score; it lowers confidence. So a judgment that
 - A rubric of only `NUMBER` criteria sends no request.
 - A damaged answer, such as a probability that is not a number, is left unknown.
 - A criterion's `help` is added to its question in brackets.
-- `jev-latest` is an alias that moves. The run stores the version that answered, for example `jev-1.14.0`.
+- Jev is called by a numbered version, `jev-1.14.0`, and not by the alias `jev-latest`, which moves (`specs/027-pin-jev-version/spec.md`). The run stores the version that answered.
 - Too many requests gets status 429. The run fails and says to try again later; nothing is tried again by itself.
 
 ## Requirements
