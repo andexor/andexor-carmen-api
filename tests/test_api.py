@@ -313,7 +313,7 @@ class Routes(unittest.TestCase):
 
     def test_a_scheduler_run_with_no_database_fails_as_an_answer(self):
         answer = asyncio.run(api.run_scheduler(SimpleNamespace(DB=None)))
-        self.assertEqual(answer, {"completed": 0, "expired": 0, "uptime": 0, "alerts": 0, "digest": None, "failed": ["load_settings"]})
+        self.assertEqual(answer, {"completed": 0, "expired": 0, "uptime": 0, "rescored": 0, "alerts": 0, "digest": None, "failed": ["load_settings"]})
 
     def test_only_health_is_public(self):
         routes = [r for r in api.app.routes if isinstance(r, APIRoute)]

@@ -1200,13 +1200,31 @@ def score_writes(request: Request, company: Row, scores: Row) -> list[Any]:
     return statements
 
 
+# The setting that says every score must be recomputed (specs/034-rescore-retry/spec.md). Empty: nothing waits.
+RESCORE = "rescore.requested"
+
+
+def rescore_mark(database: Any) -> Any:
+    """A statement that records that every score must be recomputed. It goes in the same batch as the
+    change that makes it necessary, so the two are stored together or not at all. rescore_all clears it.
+
+    The value is the time and a tag: two requests never write the same value, so a rescoring can
+    clear its own request and leave a later one. With no such setting the statement changes nothing.
+    """
+    value = f"{datetime.now(UTC):%Y-%m-%dT%H:%M:%SZ} {uuid.uuid4().hex[:8]}"
+    return database.prepare(f"UPDATE setting SET value = ?, updated_at = {NOW} WHERE key = ?").bind(value, RESCORE)
+
+
 async def rescore_all(request: Request) -> int:
     """Recompute and store the scores of every company that has answers. Returns how many.
 
-    Called after a change to a service or to the rubric. Stored points are brought up to date too.
+    Called after a change to a service or to the rubric, and by the scheduler while the setting
+    rescore.requested is set. Stored points are brought up to date too.
     """
     # shortcut: runs inside the request; move it to the background or a queue when it is consistently slow
     database = db(request)
+    # Read before the rubric: a change stored after this point writes another value, which is not cleared.
+    mark = await database.prepare("SELECT value FROM setting WHERE key = ?").bind(RESCORE).first()
     criteria, services, thresholds = await load_rubric(database)
     by_id = {criterion["id"]: criterion for criterion in criteria}
     results = await database.batch(
@@ -1232,6 +1250,9 @@ async def rescore_all(request: Request) -> int:
         if len(pending) >= 50:  # each batch is one transaction; a company's statements stay together
             await database.batch(pending)
             pending = []
+    if mark and mark["value"]:  # cleared with the last scores, and only when it is still the request found above
+        sql = f"UPDATE setting SET value = '', updated_at = {NOW} WHERE key = ? AND value = ?"
+        pending.append(database.prepare(sql).bind(RESCORE, mark["value"]))
     if pending:
         await database.batch(pending)
     return len(companies)
@@ -1319,13 +1340,16 @@ async def update_service(request: Request, service_id: str, body: dict[str, Any]
 
     if not changed:
         return JSONResponse(current)
+    rescore = "offered" in changed or "active" in changed
     try:
         audit(request, f"Service {current['name']}", None, current, changed)  # no company: the Worker log only
-        row = await update(db(request), "service", changed, service_id, stamp=False).first()
+        statements = [update(db(request), "service", changed, service_id, stamp=False)]
+        results = await db(request).batch(statements + ([rescore_mark(db(request))] if rescore else []))
+        row = results[0]["results"][0]
     except Exception as e:
         return failed(request, "update_service", e)
 
-    if "offered" in changed or "active" in changed:
+    if rescore:  # when this fails the request stays recorded, and the scheduler rescores
         try:
             await rescore_all(request)
         except Exception as e:
@@ -1383,7 +1407,8 @@ async def create_criterion(request: Request, body: dict[str, Any]) -> JSONRespon
         return error(request, 400)
 
     try:
-        row = await insert(db(request), "rubric_criterion", values).first()
+        results = await db(request).batch([insert(db(request), "rubric_criterion", values), rescore_mark(db(request))])
+        row = results[0]["results"][0]
     except Exception as e:
         return failed(request, "insert_criterion", e)
 
@@ -1424,13 +1449,16 @@ async def update_criterion(request: Request, criterion_id: str, body: dict[str, 
 
     if not changed:
         return JSONResponse(current)
+    rescore = bool(SCORING_COLUMNS & set(changed))
     try:
         audit(request, f"Rubric question {current['prompt']}", None, current, changed)  # no company: the Worker log only
-        row = await update(db(request), "rubric_criterion", changed, criterion_id, stamp=False).first()
+        statements = [update(db(request), "rubric_criterion", changed, criterion_id, stamp=False)]
+        results = await db(request).batch(statements + ([rescore_mark(db(request))] if rescore else []))
+        row = results[0]["results"][0]
     except Exception as e:
         return failed(request, "update_criterion", e)
 
-    if SCORING_COLUMNS & set(changed):
+    if rescore:
         try:
             await rescore_all(request)
         except Exception as e:
@@ -3792,8 +3820,11 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     variable EMAIL_PROVIDER says, and makes the digest now. The Cron Trigger never sets it.
     """
     provider = notify.PROVIDERS["CLOUDFLARE"] if email else notify.provider(getattr(env, "EMAIL_PROVIDER", None))
-    summary: Row = {"completed": 0, "expired": 0, "uptime": 0, "alerts": 0, "digest": None, "failed": []}
-    sql = "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key = 'renewal.default_notice_days' OR key LIKE 'uptime.%'"
+    summary: Row = {"completed": 0, "expired": 0, "uptime": 0, "rescored": 0, "alerts": 0, "digest": None, "failed": []}
+    sql = (
+        "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key = 'renewal.default_notice_days'"
+        f" OR key LIKE 'uptime.%' OR key = '{RESCORE}'"
+    )
     try:
         found = await env.DB.prepare(sql).all()
         settings: dict[str, str] = {row["key"]: row["value"] for row in found["results"]}
@@ -3816,6 +3847,12 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     except Exception as e:
         scheduler_log("failed", f"uptime_checks: {type(e).__name__}: {e}")
         summary["failed"].append("uptime_checks")
+    try:
+        if settings.get(RESCORE):  # a rescoring after a change failed, or a person asked for one
+            summary["rescored"] = await rescore_all(job_request(env, "scheduler"))
+    except Exception as e:
+        scheduler_log("failed", f"rescore: {type(e).__name__}: {e}")
+        summary["failed"].append("rescore")
     if not recipient:
         scheduler_log("failed", "the setting digest.recipient is missing, so nothing is sent")
         summary["failed"].append("recipient")
@@ -4264,15 +4301,17 @@ async def update_settings(request: Request, body: dict[str, Any]) -> JSONRespons
         return failed(request, "check_settings", e)
 
     if changed:
+        rescore = any(key.startswith("score.") for key in changed)
         try:
             # A setting belongs to no company, so the Worker log is the record of the change. It is written first.
             for key, value in changed.items():
                 audit(request, f"Setting {key}", None, {"value": current[key]}, {"value": value})
             sql = f"UPDATE setting SET value = ?, updated_at = {NOW} WHERE key = ?"
-            await database.batch([database.prepare(sql).bind(value, key) for key, value in changed.items()])
+            statements = [database.prepare(sql).bind(value, key) for key, value in changed.items()]
+            await database.batch(statements + ([rescore_mark(database)] if rescore else []))
         except Exception as e:
             return failed(request, "update_settings", e)
-        if any(key.startswith("score.") for key in changed):
+        if rescore:
             try:
                 await rescore_all(request)  # a threshold moved, so stored recommendations may be out of date
             except Exception as e:

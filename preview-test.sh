@@ -498,6 +498,20 @@ expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"ai.default_scoring_model"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d "{\"import.max_rows\":$((ROWS + 7)),\"score.min_confidence\":101}" "${BASE}/settings"
 expect 200 "\"value\":\"${ROWS}\"" "${BASE}/settings"
 
+# A rescoring that fails is made again (specs/034-rescore-retry/spec.md). A threshold change records
+# the request with the change, and the rescoring after it clears it. The threshold is put back.
+MINC=$(jq -r '.items[] | select(.key == "score.min_confidence") | .value' "${BODY}")
+expect 200 '"key":"rescore.requested","value":""' "${PATCH[@]}" -d "{\"score.min_confidence\":$((MINC > 0 ? MINC - 1 : 1))}" "${BASE}/settings"
+expect 200 '"key":"rescore.requested","value":""' "${PATCH[@]}" -d "{\"score.min_confidence\":\"${MINC}\"}" "${BASE}/settings"
+# A request that is still there is carried out by the scheduler, which then clears it.
+expect 200 "\"key\":\"rescore.requested\",\"value\":\"smoke ${STAG}\"" "${PATCH[@]}" -d "{\"rescore.requested\":\"smoke ${STAG}\"}" "${BASE}/settings"
+expect 200 '"failed":\[\]' -X POST "${BASE}/scheduler/run"
+if [[ "$(jq -c '.rescored >= 1' "${BODY}")" != "true" ]]; then
+    echo "FAILED: the run should rescore the companies that have answers: $(cat "${BODY}")"
+    exit 1
+fi
+expect 200 '"key":"rescore.requested","value":""' "${BASE}/settings"
+
 # Archiving hides a company and unarchiving brings it back; neither removes anything.
 expect 200 '"archived_at":"2' -X POST "${BASE}/companies/${SOLO_ID}/archive"
 expect 200 '"archived_at":null' -X POST "${BASE}/companies/${SOLO_ID}/unarchive"
