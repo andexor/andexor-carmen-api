@@ -85,4 +85,4 @@ None are added or changed.
 
 ## Manual steps
 
-Listed in `MANUAL-TASKS.md`: when this feature is deployed to production, apply the migrations to production and run the recompute.
+None are left. The migrations were applied to production on 2026-11-24, as recorded in `MANUAL-TASKS.md`. No recompute was needed: production held no companies and no answers at the time.
