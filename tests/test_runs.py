@@ -3,6 +3,7 @@
 # Author: Ed Jenkins
 
 """Unit tests for the queue's run handler: what it reports when a failure cannot be recorded.
+Also for the record that a rescoring is waiting.
 Run with ./unit-test.sh."""
 
 import asyncio
@@ -75,3 +76,53 @@ class RunHandlerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Statement:
+    def __init__(self, database: "Scores", sql: str) -> None:
+        self.database, self.sql, self.values = database, sql, ()
+
+    def bind(self, *values: object) -> "Statement":
+        self.values = values
+        return self
+
+    async def first(self) -> dict[str, Any]:
+        return {"value": self.database.mark}
+
+
+class Scores:
+    """A database with a rubric, no answers, and the setting rescore.requested. It keeps what is written."""
+
+    def __init__(self, mark: str) -> None:
+        self.mark = mark
+        self.written: list[Statement] = []
+
+    def prepare(self, sql: str) -> Statement:
+        return Statement(self, sql)
+
+    async def batch(self, statements: list[Statement]) -> list[dict[str, Any]]:
+        if not statements[0].sql.startswith("SELECT"):
+            self.written += statements
+        return [{"results": []} for _ in statements]
+
+
+class RescoreTest(unittest.TestCase):
+    def rescore(self, mark: str) -> list[Statement]:
+        database = Scores(mark)
+        asyncio.run(api.rescore_all(api.job_request(SimpleNamespace(DB=database), "test")))
+        return database.written
+
+    def test_a_rescoring_clears_the_request_it_found_and_no_other(self):
+        (clear,) = self.rescore("2026-11-27T10:00:00Z 1a2b3c4d")
+        # Cleared by its value: a request written while the rescoring ran has another value and stays.
+        self.assertIn("SET value = ''", clear.sql)
+        self.assertIn("AND value = ?", clear.sql)
+        self.assertEqual(clear.values, (api.RESCORE, "2026-11-27T10:00:00Z 1a2b3c4d"))
+
+    def test_with_no_request_nothing_is_cleared(self):
+        self.assertEqual(self.rescore(""), [])
+
+    def test_two_requests_never_write_the_same_value(self):
+        first, second = api.rescore_mark(Scores("")), api.rescore_mark(Scores(""))
+        self.assertEqual(first.values[1], api.RESCORE)
+        self.assertNotEqual(first.values[0], second.values[0])

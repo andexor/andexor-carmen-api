@@ -328,6 +328,7 @@ class SchedulerRun(Row):
     completed: int
     expired: int
     uptime: int
+    rescored: int
     alerts: int
     digest: str | None
     failed: list[str]
