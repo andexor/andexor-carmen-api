@@ -17,11 +17,12 @@ import importlib
 import json
 import logging
 import pathlib
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, cast
 
 import pages as site
-from records import BadBody, fact_key, fact_value
+from records import BadBody, fact_key, fact_value, fill
 from scoring import Row, points
 
 
@@ -122,11 +123,24 @@ def render(name: str, **values: str) -> str:
     except OSError as e:
         logger.error(json.dumps({"event": "carmen_prompt_error", "prompt": name, "detail": f"{type(e).__name__}: {e}"[:300]}))
         raise RunError(f"The prompt {name} could not be read") from e
-    for key, value in values.items():
-        text = text.replace("{{" + key + "}}", value)
-    if "{{" in text:
-        raise RunError(f"The prompt {name} has a placeholder with no value")
-    return text
+    # Text from outside sits between the prompt's tags and is declared to be data. It must not be able
+    # to close its tag, so every tag the prompt uses is taken out of every value.
+    tags = "|".join(sorted(set(re.findall(r"</(\w+)>", text))))
+    try:
+        return fill(text, {key: untag(value, tags) for key, value in values.items()})
+    except KeyError as e:
+        raise RunError(f"The prompt {name} has a placeholder with no value") from e
+
+
+def untag(value: str, tags: str) -> str:
+    """The value with no opening or closing tag of the given names ("pages|material")."""
+    if not tags:
+        return value
+    while True:  # again, because taking one out of "</pa</pages>ges>" leaves another
+        cleaned = re.sub(rf"<\s*/?\s*(?:{tags})\s*>", "", value, flags=re.IGNORECASE)
+        if cleaned == value:
+            return value
+        value = cleaned
 
 
 def company_text(company: Row) -> str:

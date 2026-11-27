@@ -66,10 +66,10 @@ def render(name: str, **values: str) -> tuple[str, str]:
         text = (TEMPLATES / f"{name}.txt").read_text()
     except OSError as e:
         raise NotifyError(f"the template {name} could not be read: {type(e).__name__}") from e
-    for key, value in values.items():
-        text = text.replace("{{" + key + "}}", value)
-    if "{{" in text:
-        raise NotifyError(f"the template {name} has a placeholder with no value")
+    try:
+        text = records.fill(text, values)
+    except KeyError as e:
+        raise NotifyError(f"the template {name} has a placeholder with no value") from e
     subject, _, body = text.partition("\n")
     return subject.strip(), body.strip() + "\n"
 

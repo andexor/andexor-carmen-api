@@ -385,6 +385,14 @@ expect 400 '"error":"BAD_REQUEST"' "${JSON[@]}" -d '{"source":"NO_SUCH_SOURCE","
 expect 201 '"created":true' "${JSON[@]}" -d "{\"source\":\"CONTACT_US\",\"contact\":{\"name\":\"Solo ${MTAG}\"}}" "${BASE}/machine/leads"
 SOLO_ID=$(jq -r '.company_id' "${BODY}")
 expect 200 "\"name\":\"Solo ${MTAG}\"" "${BASE}/companies/${SOLO_ID}"
+# Two businesses with pages on one shared site are two companies (specs/033-audit-fixes/spec.md).
+expect 200 '"key":"company.shared_hosts"' "${BASE}/settings"
+expect 201 '"created":true' "${JSON[@]}" -d "{\"source\":\"CONTACT_US\",\"website\":\"https://www.facebook.com/joes-${MTAG}\",\"contact\":{\"name\":\"Joe ${MTAG}\"}}" "${BASE}/machine/leads"
+expect 201 '"created":true' "${JSON[@]}" -d "{\"source\":\"CONTACT_US\",\"website\":\"https://www.facebook.com/anns-${MTAG}\",\"contact\":{\"name\":\"Ann ${MTAG}\"}}" "${BASE}/machine/leads"
+expect 200 '"domain":null' "${BASE}/companies/$(jq -r '.company_id' "${BODY}")"
+# Braces in a name and a website that is not an address are stored as given. The scheduler runs
+# further down still report no failed step: neither stops the digest or the uptime checks.
+expect 201 '"created":true' "${JSON[@]}" -d "{\"source\":\"CONTACT_US\",\"name\":\"Braces {{x ${MTAG}\",\"website\":\"${MTAG}.example]\"}" "${BASE}/machine/leads"
 
 # The scheduler and notifications (specs/015-scheduler-and-notifications/spec.md). The preview's
 # provider is the stub, so no email is sent. The dates leave a margin of days, so the time zone

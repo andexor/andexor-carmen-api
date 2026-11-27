@@ -125,6 +125,11 @@ class Messages(unittest.TestCase):
         with self.assertRaises(notify.NotifyError):
             notify.render("no-such-template")
 
+    def test_braces_in_a_record_do_not_fail_an_email(self):
+        subject, body = notify.render("digest", date="2026-11-24", sections="Leads (1)\n- Acme {{x and {{date}}")
+        self.assertEqual(subject, "Carmen digest for 2026-11-24")
+        self.assertIn("- Acme {{x and {{date}}", body)  # kept as typed, and not filled a second time
+
     def test_the_renewal_alert_names_the_agreement_and_its_dates(self):
         subject, body = notify.render(
             "renewal",

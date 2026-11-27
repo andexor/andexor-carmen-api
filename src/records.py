@@ -306,8 +306,14 @@ def describe_change(what: str, before: Values, after: Values | None) -> str:
     return f"{what} edited: {moved}"
 
 
-def derive_domain(website: str | None) -> str | None:
-    """The website's host: lowercase, with no scheme, no "www.", no port, and no path."""
+# Sites that many businesses share: a page there does not say which business it is. The fallback for
+# the setting company.shared_hosts (specs/033-audit-fixes/spec.md).
+SHARED_HOSTS = "facebook.com,fb.com,instagram.com,linkedin.com,x.com,twitter.com,youtube.com,tiktok.com,yelp.com,linktr.ee,nextdoor.com,pinterest.com,google.com"
+
+
+def derive_domain(website: str | None, shared: str = SHARED_HOSTS) -> str | None:
+    """The website's host: lowercase, with no scheme, no "www.", no port, and no path. None for a page
+    of a shared site (shared: host names separated by commas), which would match another business."""
     if not website:
         return None
     text = website.strip()
@@ -315,7 +321,17 @@ def derive_domain(website: str | None) -> str | None:
         host = urlsplit(text if "//" in text else f"//{text}").hostname
     except ValueError:
         return None
-    return (host or "").removeprefix("www.") or None
+    host = (host or "").removeprefix("www.")
+    for name in shared.lower().split(","):
+        if name.strip() and (host == name.strip() or host.endswith("." + name.strip())):
+            return None
+    return host or None
+
+
+def fill(template: str, values: dict[str, str]) -> str:
+    """The template with each {{name}} replaced by its value. One pass over the template: a value is
+    never read again, so braces in text from outside stay as they are. KeyError for a name with no value."""
+    return re.sub(r"\{\{(\w+)\}\}", lambda found: values[found[1]], template)
 
 
 def renewal_problem(agreement: Values) -> str | None:
@@ -392,6 +408,10 @@ def _mailbox(text: str) -> bool:
     return _email(address) and not any(c in '<>"' or not c.isprintable() for c in name)
 
 
+def _hosts(text: str) -> bool:
+    return all(re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", name.strip().lower()) for name in text.split(","))
+
+
 def setting_problem(key: str, value: object) -> str | None:
     """Why the setting may not hold the value, or None. The value is text, or a whole number."""
     if isinstance(value, bool) or not isinstance(value, (str, int)):
@@ -409,6 +429,8 @@ def setting_problem(key: str, value: object) -> str | None:
         ok, wanted = _days(text), "day names such as MON,TUE,WED,THU,FRI"
     elif key == "digest.recipient":
         ok, wanted = _mailbox(text), "one email address, with or without a name: First Last <address>"
+    elif key == "company.shared_hosts":
+        ok, wanted = _hosts(text), "host names separated by commas, such as facebook.com,instagram.com"
     elif key == "renewal.default_notice_days":
         ok, wanted = _whole(text, 0), "a whole number of days"
     elif key in ("document.max_size_bytes", "import.max_rows", "ai.research.max_pages", "proposal.max_tries") or key.startswith("uptime."):

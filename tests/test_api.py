@@ -373,6 +373,19 @@ class Records(unittest.TestCase):
         for website, domain in cases.items():
             self.assertEqual(records.derive_domain(website), domain, repr(website))
 
+    def test_a_page_of_a_shared_site_gives_no_domain(self):
+        # Two businesses on Facebook are two companies: neither gets the domain facebook.com.
+        for website in ("facebook.com/joes-plumbing", "https://www.facebook.com/anns-bakery", "m.facebook.com/x", "https://sites.google.com/view/acme", "linktr.ee/acme", "X.com/acme"):
+            self.assertIsNone(records.derive_domain(website), website)
+        self.assertEqual(records.derive_domain("fox.com"), "fox.com")  # ends in x.com, and is not x.com
+        self.assertEqual(records.derive_domain("notfacebook.com"), "notfacebook.com")
+        # The list is the setting company.shared_hosts; the one in code is only its fallback.
+        self.assertEqual(records.derive_domain("facebook.com/a", "example.org"), "facebook.com")
+        self.assertIsNone(records.derive_domain("pages.example.org/a", " Example.org , other.example "))
+        self.assertIsNone(records.setting_problem("company.shared_hosts", "facebook.com, x.com"))
+        for bad in ("facebook", "facebook.com/page", "https://facebook.com", "a.com,,b.com"):
+            self.assertIsNotNone(records.setting_problem("company.shared_hosts", bad), bad)
+
     def test_clean_keeps_only_writable_keys(self):
         body = {"name": " Acme ", "city": "", "employee_count": 12, "summary": None, "id": "x", "fit_score": 99, "junk": 1}
         expected = {"name": "Acme", "city": None, "employee_count": 12, "summary": None}

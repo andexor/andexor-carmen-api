@@ -15,7 +15,7 @@ import csv
 import io
 from typing import cast
 
-from records import BadBody, Values, derive_domain, fact_key, fact_value
+from records import SHARED_HOSTS, BadBody, Values, derive_domain, fact_key, fact_value
 
 COMPANY_TARGETS = (
     "name",
@@ -101,7 +101,7 @@ def check_mapping(headers: list[str], mapping: object) -> dict[str, str]:
 
 
 def row_values(
-    headers: list[str], cells: list[str], mapping: dict[str, str], types: dict[str, str]
+    headers: list[str], cells: list[str], mapping: dict[str, str], types: dict[str, str], shared: str = SHARED_HOSTS
 ) -> tuple[Values, Values, list[tuple[str, str]]]:
     """One row as company values, contact values (empty for no contact), and facts as key and value.
 
@@ -132,7 +132,7 @@ def row_values(
             company["employee_count"] = int(str(company["employee_count"]).replace(",", ""))
         except ValueError as e:
             raise BadBody("The employee count is not a whole number") from e
-    company["domain"] = derive_domain(company.get("website"))
+    company["domain"] = derive_domain(company.get("website"), shared)
     if not (contact.get("name") or contact.get("email")):
         contact = {}  # a contact needs a name or an email; a title or a phone alone is dropped
     return company, contact, facts
