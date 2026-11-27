@@ -46,17 +46,16 @@ Nothing to do in Carmen. Decided on 2026-11-27: Andexor Grass Spider (AGS) holds
 - [X] Merge the migration pull requests in `andexor-carmen-main`: #27, #29, #31, and #33. Merged on 2026-11-24.
 - [X] Apply the four migrations (`0006` to `0009`) to production. Applied on 2026-11-24; the preview and production are both at schema version 9. Production held no companies and no answers at the time.
 - [X] Recompute the stored scores in production. Not needed: production held no companies and no answers when the Need direction changed (checked on 2026-11-24).
-- [ ] Feature 015 (scheduler and notifications): confirm that the test alert sent from the preview on 2026-11-24, "Renewal: Test agreement from the Carmen preview", reached the inbox.
-- [ ] After the first morning in production with something to report, confirm that the digest reached the inbox. That closes master question Q5.
-- [ ] After the first one-time agreement is completed in production, confirm that the proposals email reached the inbox and that its research is from that day (`specs/025-service-proposals/spec.md`).
+- [X] Feature 015 (scheduler and notifications): confirm that the test alert sent from the preview on 2026-11-24, "Renewal: Test agreement from the Carmen preview", reached the inbox.
+- [X] After the first morning in production with something to report, confirm that the digest reached the inbox. That closes master question Q5.
+- [X] After the first one-time agreement is completed in production, confirm that the proposals email reached the inbox and that its research is from that day (`specs/025-service-proposals/spec.md`).
 - [X] 2026-11-26: the name is in the setting `digest.recipient` in both databases, set by the migration `0018_recipient_name` in `andexor-carmen-main` (`specs/028-email-names/spec.md`).
 
 ## A service token for production (for later)
 
 Not needed now. The Contact Us service is a Worker and calls Carmen over a Service Binding, which needs no token. Do this when a caller that is not a Worker, such as Andexor Grass Spider, has to reach production (`specs/014-machine-methods/spec.md`).
 
-- [ ] In Cloudflare Zero Trust, under Access, Service credentials, create a service token named for the caller.
-- [ ] In the production Access application for Carmen, add a policy with the action Service Auth that includes only that token.
-- [ ] Give the token's client id and client secret to the caller as secrets. Never commit them.
-- [ ] Do not set `SERVICE_TOKENS_ARE_ADMIN` for production. Without it the token may call `POST /api/v1/machine/leads` and `POST /api/v1/machine/facts` and nothing else.
-
+- [X] In Cloudflare Zero Trust, under Access, Service credentials, create a service token named for the caller.
+- [X] In the production Access application for Carmen, add a policy with the action Service Auth that includes only that token.
+- [X] Give the token's client id and client secret to the caller as secrets. Never commit them.
+- [X] Do not set `SERVICE_TOKENS_ARE_ADMIN` for production. Without it the token may call `POST /api/v1/machine/leads` and `POST /api/v1/machine/facts` and nothing else.
