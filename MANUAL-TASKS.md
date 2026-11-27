@@ -31,20 +31,11 @@ The first user in an empty database becomes the `ADMIN`. Only you are on the Clo
 - [X] After feature 001 is deployed, open `https://carmen.andexor.net/api/v1/me` and check that it shows your email and `"role": "ADMIN"`.
 - [X] Do the same at `https://carmen-preview.andexor.net/api/v1/me`.
 
-## Google PageSpeed Insights key (for later)
+## Google PageSpeed Insights key
 
-A reminder, asked for on 2026-11-24. Do this when the PageSpeed Insights feature is taken up; nothing needs the key until then. The steps were written on 2026-11-24 from Google's page "Get Started with the PageSpeed Insights API" (`https://developers.google.com/speed/docs/insights/v5/get-started`). Google changes its console now and then, so read that page again first.
+Nothing to do in Carmen. Decided on 2026-11-27: Andexor Grass Spider (AGS) holds the key and makes the measurement, so Carmen gets no key and no binding. Ed created the key on 2026-11-27 for AGS. See `NOTES.md`, under "Decisions to revisit".
 
-Why a key: the API is free, but a call without a key shares one pool with everyone, and on 2026-11-24 that pool was used up (status 429). With a key the limit is the project's own, about 25,000 requests a day by third-party guides; the exact numbers are shown in the console once the API is enabled.
-
-- [ ] In the Google Cloud Console (`https://console.cloud.google.com`), pick a project or create one for Carmen.
-- [ ] Go to APIs & Services, then Library. Search for "PageSpeed Insights API" and choose Enable.
-- [ ] Go to APIs & Services, then Credentials. Choose Create credentials, then API key.
-- [ ] Edit the new key. Under API restrictions, choose Restrict key and select only "PageSpeed Insights API". Leave application restrictions at None: the calls come from a Cloudflare Worker, which has no fixed address.
-- [ ] Store the key in the Cloudflare Secrets Store, in the same store as the other two keys, under the name `carmen-pagespeed-api-key`. It sits beside `carmen-claude-api-key` and `carmen-typesafe-api-key`. Do not put it in a file, in GitHub, or in `wrangler.jsonc`.
-- [ ] Tell Claude that the key is stored. The feature then binds it as `PAGESPEED_API_KEY` in production and in the preview.
-
-No billing account should be needed for this API. If the console asks for one, stop and check before adding a card.
+- [ ] Tell Claude when AGS can measure PageSpeed. Carmen's side (the request to AGS) is specified then.
 
 ## Later, in the running app
 
