@@ -91,7 +91,7 @@ None are added or changed. `POST` and `PATCH` of a rubric criterion (`MANAGE`) n
 ### What is not tested
 
 - A real model on a rubric with a measured criterion. The smoke test uses the stub; the filter is the same for every provider.
-- Production. The migration is applied to the preview only.
+- Production. The migration is in both databases, but no check was made there: the smoke test runs on the preview only.
 
 ## Success Criteria
 
@@ -100,4 +100,4 @@ None are added or changed. `POST` and `PATCH` of a rubric criterion (`MANAGE`) n
 
 ## Manual steps
 
-Listed in `MANUAL-TASKS.md`: merge the migration pull requests in `andexor-carmen-main` (#27 and #31) unchanged, and apply them to production with `python3 tools/migrate.py prod`.
+None are left. The migration pull requests in `andexor-carmen-main` (#27 and #31) were merged, and the migrations were applied to production on 2026-11-24, as recorded in `MANUAL-TASKS.md`.
