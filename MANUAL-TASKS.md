@@ -51,11 +51,6 @@ Nothing to do in Carmen. Decided on 2026-11-27: Andexor Grass Spider (AGS) holds
 - [X] After the first one-time agreement is completed in production, confirm that the proposals email reached the inbox and that its research is from that day (`specs/025-service-proposals/spec.md`).
 - [X] 2026-11-26: the name is in the setting `digest.recipient` in both databases, set by the migration `0018_recipient_name` in `andexor-carmen-main` (`specs/028-email-names/spec.md`).
 
-## A service token for production (for later)
+## A service token for production
 
-Not needed now. The Contact Us service is a Worker and calls Carmen over a Service Binding, which needs no token. Do this when a caller that is not a Worker, such as Andexor Grass Spider, has to reach production (`specs/014-machine-methods/spec.md`).
-
-- [X] In Cloudflare Zero Trust, under Access, Service credentials, create a service token named for the caller.
-- [X] In the production Access application for Carmen, add a policy with the action Service Auth that includes only that token.
-- [X] Give the token's client id and client secret to the caller as secrets. Never commit them.
-- [X] Do not set `SERVICE_TOKENS_ARE_ADMIN` for production. Without it the token may call `POST /api/v1/machine/leads` and `POST /api/v1/machine/facts` and nothing else.
+Nothing to do. Decided on 2026-11-27: Andexor Grass Spider (AGS) will be a Worker and will call Carmen over a Service Binding, as the Contact Us service does. A Service Binding needs no token, so production keeps one Access policy, Allow, and admits no service token. If a caller that is not a Worker ever needs production, the steps are in `specs/014-machine-methods/spec.md`, under Manual steps: a token for that caller and a Service Auth policy that includes only it. `SERVICE_TOKENS_ARE_ADMIN` is never set for production.
