@@ -10,7 +10,7 @@ Author: Ed Jenkins
 
 **Created**: 2026-11-24
 
-**Status**: Implemented, and live on the preview. Production needs the migration and a recompute when this is deployed; see Manual steps.
+**Status**: Implemented, and live on the preview and in production. The migrations were applied to production on 2026-11-24. No recompute was needed: production held no companies and no answers at the time.
 
 **Input**: Issue #38. Found on 2026-11-24 while asking what "Is the site fast?" means: a `YES` on a yes-or-no question in the Need section raised the Need score, although the question is worded so that yes is the good outcome. In the test runs a company with an excellent website scored a Need of 100. Decided 2026-11-24: fix it in code, and keep the data in a recognizable form, so that the logic can be changed or replaced later without touching the data. This changes `specs/004-services-rubric-and-scoring/spec.md`, FR-003 and FR-004. Where this spec and an earlier document differ, this spec governs.
 
