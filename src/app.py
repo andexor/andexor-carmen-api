@@ -76,6 +76,7 @@ from records import (
     Values,
     add_months,
     clean,
+    SHARED_HOSTS,
     derive_domain,
     describe_change,
     download_header,
@@ -497,6 +498,18 @@ async def list_srt(request: Request) -> JSONResponse:
     return JSONResponse({"items": result["results"]})
 
 
+async def shared_hosts(database: Any) -> str:
+    """The setting company.shared_hosts: the sites whose pages do not say which business they are, so
+    that they give a company no domain. The fallback when it is missing or cannot be read: a write
+    does not fail because of this setting."""
+    try:
+        row = await database.prepare("SELECT value FROM setting WHERE key = 'company.shared_hosts'").first()
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_setting_error", "step": "read_shared_hosts", "error": type(e).__name__}))
+        return SHARED_HOSTS
+    return str(row["value"]) if row else SHARED_HOSTS
+
+
 # ---- Companies -----------------------------------------------------------------------------------
 
 SORTS = {
@@ -553,7 +566,7 @@ async def create_company(request: Request, body: dict[str, Any]) -> JSONResponse
     except BadBody as e:
         return failed(request, "read_company", e)
     values["id"] = str(uuid.uuid4())
-    values["domain"] = derive_domain(values.get("website"))
+    values["domain"] = derive_domain(values.get("website"), await shared_hosts(db(request)))
 
     try:
         column = await unknown_code(db(request), values, COMPANY_CODES)
@@ -606,7 +619,7 @@ async def update_company(request: Request, company_id: str, body: dict[str, Any]
     except BadBody as e:
         return failed(request, "read_company", e)
     if "website" in values:
-        values["domain"] = derive_domain(values["website"])
+        values["domain"] = derive_domain(values["website"], await shared_hosts(db(request)))
 
     try:
         current = await db(request).prepare("SELECT * FROM company WHERE id = ?").bind(company_id).first()
@@ -2840,22 +2853,48 @@ async def fail_run(env: Any, run: Row, message: str) -> None:
     await database.batch(statements)
 
 
-async def process_run(env: Any, run_id: str) -> None:
-    """Carry out one queued run. Never raises: a failure is recorded on the run."""
+async def start_waiting(env: Any, run_id: str) -> None:
+    """Queue the scoring runs that waited for this research run's dossier. The research is stored by
+    now, so a failure here fails only the run that could not be started, never the research run."""
+    database = env.DB
+    fail = "UPDATE ai_run SET status = 'FAILED', error = 'The run could not be started', finished_at = ? WHERE status = 'QUEUED' AND "
+    try:
+        waiting = await database.prepare("SELECT id FROM ai_run WHERE input_run_id = ? AND status = 'QUEUED'").bind(run_id).all()
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_run", "run_id": run_id, "step": "find_waiting", "error": type(e).__name__}))
+        await database.prepare(fail + "input_run_id = ?").bind(now_ms(), run_id).run()
+        return
+    for row in waiting["results"]:
+        try:
+            await env.RUNS.send({"run_id": row["id"]})
+        except Exception as e:
+            logger.error(json.dumps({"event": "carmen_run", "run_id": row["id"], "step": "send_waiting", "error": type(e).__name__}))
+            await database.prepare(fail + "id = ?").bind(now_ms(), row["id"]).run()
+
+
+async def process_run(env: Any, run_id: str) -> bool:
+    """Carry out one queued run. Never raises: a failure is recorded on the run. False when the failure
+    could not be recorded, so that the queue delivers the message again and the run is then marked
+    as interrupted, not left RUNNING."""
     database = env.DB
     run: Row | None = None
+    stored = False  # the run's result is in the database
     try:
         sql = "SELECT r.*, m.label, m.provider FROM ai_run r JOIN ai_model m ON m.id = r.ai_model_id WHERE r.id = ?"
         run = await database.prepare(sql).bind(run_id).first()
         if not run:
-            return run_log(run_id, "skipped", "no such run")
+            run_log(run_id, "skipped", "no such run")
+            return True
         if run["status"] == "RUNNING":
             # Delivered a second time: the first attempt was cut off before it could finish.
-            return await fail_run(env, run, "The run was interrupted and did not finish")
+            await fail_run(env, run, "The run was interrupted and did not finish")
+            return True
         if run["status"] != "QUEUED":
-            return run_log(run_id, "skipped", f"status {run['status']}")
+            run_log(run_id, "skipped", f"status {run['status']}")
+            return True
         if run["provider"] not in ai.ADAPTERS:
-            return await fail_run(env, run, "The model's provider has no adapter")
+            await fail_run(env, run, "The model's provider has no adapter")
+            return True
 
         started = now_ms()
         await database.prepare("UPDATE ai_run SET status = 'RUNNING', started_at = ? WHERE id = ?").bind(started, run_id).run()
@@ -2883,22 +2922,22 @@ async def process_run(env: Any, run_id: str) -> None:
             insert(database, "activity", run_entry(run, f"{run['kind'].capitalize()} run by {run['label']} finished: {said}"))
         )
         await database.batch(statements)
+        stored = True
         run_log(run_id, "succeeded", said)
 
         if run["kind"] == "RESEARCH":
-            # The scoring runs that were waiting for this dossier can start now.
-            waiting = await database.prepare("SELECT id FROM ai_run WHERE input_run_id = ? AND status = 'QUEUED'").bind(run_id).all()
-            for row in waiting["results"]:
-                await env.RUNS.send({"run_id": row["id"]})
+            await start_waiting(env, run_id)
     except Exception as e:
         logger.error(json.dumps({"event": "carmen_run", "run_id": run_id, "step": "error", "error": type(e).__name__, "detail": str(e)}))
         try:
-            if run:
+            if run and not stored:  # a run whose result is stored stays SUCCEEDED
                 # Our own messages are safe to show. Anything else stays in the log.
                 shown = str(e) if isinstance(e, ai.RunError) else f"The run failed unexpectedly ({type(e).__name__}); see the Worker log"
                 await fail_run(env, run, shown)
         except Exception as inner:
             logger.error(json.dumps({"event": "carmen_run", "run_id": run_id, "step": "fail_run", "error": type(inner).__name__}))
+            return False
+    return True
 
 
 # ---- AI runs: reading and deciding ---------------------------------------------------------------
@@ -3282,11 +3321,12 @@ async def import_rows(database: Any, batch: Row, given: Row, result: Row) -> Non
     taken: dict[str, Row] = {row["domain"]: {"company_id": row["id"]} for row in existing["results"]}
     duplicates: list[Row] = result["duplicates"]
     errors: list[Row] = result["errors"]
+    shared = await shared_hosts(database)
 
     ready: list[tuple[int, str | None, list[Any]]] = []
     for number, cells in rows:
         try:
-            company, contact, facts = imports.row_values(headers, cells, mapping, types)
+            company, contact, facts = imports.row_values(headers, cells, mapping, types, shared)
         except BadBody as e:
             errors.append({"row": number, "error": str(e)})
             continue
@@ -3472,7 +3512,7 @@ async def create_lead(database: Any, body: Row) -> Row:
     name: str | None = lead.get("name") or (None if lead.get("website") else contact.get("name") or contact.get("email"))
     if not (name or lead.get("website")):
         raise BadBody("a lead needs a name, a website, or a contact")
-    domain = derive_domain(lead.get("website"))
+    domain = derive_domain(lead.get("website"), await shared_hosts(database))
     types, fact_source = await fact_types(database, source)
 
     for attempt in (1, 2):

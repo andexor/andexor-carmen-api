@@ -45,6 +45,7 @@ class Default(asgi.entrypoint(app)):
                 await process_import(env, str(import_id))
             elif agreement_id:
                 await process_proposals(env, str(agreement_id), field(message.body, "real") is True)
-            else:
-                await process_run(env, str(message.body["run_id"]))
+            elif not await process_run(env, str(message.body["run_id"])):
+                message.retry()  # the failure could not be recorded: on the next delivery the run is marked interrupted
+                continue
             message.ack()

@@ -90,7 +90,10 @@ def site_url(website: object) -> str | None:
     if not text:
         return None
     url = text if "://" in text else f"https://{text}"
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # an unbalanced bracket, as in "acme.com]"
+        return None
     host = parts.hostname or ""
     # A name with a dot whose last label starts with a letter: no localhost, and no address literal
     # in any spelling (decimal, octal, hexadecimal, or IPv6), since those end in a number.
@@ -105,9 +108,13 @@ def pick_links(base: str, links: list[tuple[str, str]], limit: int) -> list[str]
     found: dict[str, int] = {}
     home = urldefrag(base).url.rstrip("/")
     for href, label in links:
-        url = urldefrag(urljoin(base, href.strip())).url
-        parts = urlsplit(url)
-        if parts.scheme not in ("http", "https") or _host(url) != _host(base) or url.rstrip("/") == home:
+        try:
+            url = urldefrag(urljoin(base, href.strip())).url
+            parts = urlsplit(url)
+            other = _host(url) != _host(base)
+        except ValueError:  # a link that is not an address, as in "http://[YOUR_DOMAIN]/about"
+            continue
+        if parts.scheme not in ("http", "https") or other or url.rstrip("/") == home:
             continue
         path = parts.path.lower()
         if path.endswith(NOT_PAGES) or not any(word in path or word in label.lower() for word in WANTED):

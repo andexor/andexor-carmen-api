@@ -88,6 +88,8 @@ class RowValues(unittest.TestCase):
         self.assertEqual((company, contact, facts), ({"name": "Beta", "domain": None}, {}, []))
 
     def test_a_typed_fact(self):
+        company, _, _ = imports.row_values(["Name", "Website"], ["Joe", "facebook.com/joes"], {"Name": "company.name", "Website": "company.website"}, {})
+        self.assertEqual((company["website"], company["domain"]), ("facebook.com/joes", None))  # a shared site gives no domain
         _, _, facts = imports.row_values(["Name", "Has website"], ["Acme", "yes"], {"Name": "company.name", "Has website": "fact"}, {"has_website": "YES_NO"})
         self.assertEqual(facts, [("has_website", "YES")])
 
