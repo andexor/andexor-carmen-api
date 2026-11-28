@@ -60,15 +60,19 @@ async def _signing_key(team_domain: str, kid: str) -> Any:
         if not response.ok:
             raise AccessError(f"could not fetch the signing keys: status {response.status}")
         jwks = json.loads(await response.text())
-        _keys.clear()
+        fresh: dict[str, Any] = {}
         for jwk in jwks["keys"]:
-            _keys[jwk["kid"]] = await js.crypto.subtle.importKey(
+            fresh[jwk["kid"]] = await js.crypto.subtle.importKey(
                 "jwk",
                 to_js(jwk, dict_converter=js.Object.fromEntries),
                 to_js({"name": "RSASSA-PKCS1-v1_5", "hash": "SHA-256"}, dict_converter=js.Object.fromEntries),
                 False,
                 to_js(["verify"]),
             )
+        # Swapped in with no pause between the two lines: a request that runs while the keys are
+        # imported finds the old list or the new one, never an empty or half-filled one.
+        _keys.clear()
+        _keys.update(fresh)
     if kid not in _keys:
         raise AccessError("unknown signing key")
     return _keys[kid]
