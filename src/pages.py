@@ -29,6 +29,7 @@ BLOCKS = ("p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "sec
 
 BREAK = "\x1e"  # marks the end of a block; a line break in the HTML source is only a space
 MAX_HTML = 1_000_000  # characters of one page that are parsed
+MAX_BYTES = 5_000_000  # a page that says it is longer is not read: its whole body would be held in memory
 FETCH_MS = 10_000
 FETCH_HEADERS = {"user-agent": "Mozilla/5.0 (compatible; research-fetcher/1.0)", "accept": "text/html"}
 
@@ -147,6 +148,13 @@ def _skipped(url: str, shown: str, detail: str = "") -> str:
     return f"{url[:200]}: {shown}"
 
 
+def too_large(length: object) -> bool:
+    """Whether a Content-Length header says the page is over MAX_BYTES. No header, or one that is not
+    a whole number, says nothing, and the page is read (specs/044-page-size-check/spec.md)."""
+    text = str(length or "").strip()
+    return text.isascii() and text.isdigit() and int(text) > MAX_BYTES
+
+
 async def fetch_page(url: str) -> tuple[str, str] | str:
     """(the address after redirects, the HTML), or a short reason why the page cannot be read."""
     # Loaded by name: the module exists only inside a Worker.
@@ -159,6 +167,11 @@ async def fetch_page(url: str) -> tuple[str, str] | str:
             return _skipped(url, f"the site answered {status}", f"status {status}, content type {kind[:60] or 'none'}")
         if "html" not in kind and "text/plain" not in kind:
             return _skipped(url, "not a web page", f"status 200, content type {kind[:60] or 'none'}")
+        length = response.headers.get("content-length")
+        if too_large(length):
+            # shortcut: only a page that states its length is stopped; one that sends no length, or a false
+            # one, is still read whole. Read the body as a stream when that happens.
+            return _skipped(url, "the page is too large", f"content length {str(length)[:20]}")
         return str(response.url or url), str(await response.text())[:MAX_HTML]
     except Exception as e:
         name = type(e).__name__
