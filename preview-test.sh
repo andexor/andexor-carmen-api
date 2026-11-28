@@ -301,6 +301,16 @@ expect 200 '"source":"AI"' "${BASE}/companies/${ID}/facts"
 expect 409 '"error":"CONFLICT"' -X POST "${BASE}/runs/${RESEARCH}/apply"
 expect 200 '"recommendation":"' -X POST "${BASE}/runs/${SCORING}/apply"
 expect 200 '"source":"AI"' "${BASE}/companies/${ID}/answers"
+# An answer sent back with the value it has keeps its origin (specs/041-unchanged-answers/spec.md):
+# a screen may send the whole form, and an answer of the run must not become a person's.
+KEPT=$(jq -r '[.items[] | select(.source == "AI")][0].id' "${BODY}")
+SAME=$(jq -c --arg id "${KEPT}" '{answers: [.items[] | select(.id == $id) | {criterion_id: .id, value: .value}]}' "${BODY}")
+expect 200 '"fit_score":' -X PUT "${JSON[@]}" -d "${SAME}" "${BASE}/companies/${ID}/answers"
+expect 200 '"source":"AI"' "${BASE}/companies/${ID}/answers"
+if [[ "$(jq -r --arg id "${KEPT}" '.items[] | select(.id == $id) | [.source, (.ai_run_id != null)] | @csv' "${BODY}")" != '"AI",true' ]]; then
+    echo "FAILED: an answer sent back unchanged should keep its source and its run: $(cat "${BODY}")"
+    exit 1
+fi
 expect 200 '"disagreement":false' "${BASE}/companies/${ID}/runs/compare?run_ids=${SCORING}"
 expect 200 '"user_rating":5' -X PATCH "${JSON[@]}" -d '{"user_rating":5}' "${BASE}/runs/${SCORING}"
 expect 200 '"agreement_rate":1' "${BASE}/ai/models/stats"
