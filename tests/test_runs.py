@@ -80,52 +80,132 @@ if __name__ == "__main__":
 
 class Statement:
     def __init__(self, database: "Scores", sql: str) -> None:
-        self.database, self.sql, self.values = database, sql, ()
+        self.database, self.sql = database, sql
+        self.values: tuple[object, ...] = ()
 
     def bind(self, *values: object) -> "Statement":
         self.values = values
         return self
 
     async def first(self) -> dict[str, Any]:
+        if "score_token" in self.sql:
+            return {"score_token": self.database.token}  # the company's mark as it is stored now
         return {"value": self.database.mark}
+
+    async def run(self) -> None:
+        self.database.written.append(self)
+
+
+QUESTION = {"id": "q1", "prompt": "Is it so?", "section": "FIT", "service_id": None, "answer_type": "YES_NO", "weight": 1, "config_json": None, "active": 1}
 
 
 class Scores:
-    """A database with a rubric, no answers, and the setting rescore.requested. It keeps what is written."""
+    """A database with a rubric of one question, the setting rescore.requested, and perhaps one company
+    (c1). It keeps what is written. refuse: how many writes fail first. moves: a write fails because
+    another writer was first and gave the company a new mark; otherwise the database is away."""
 
-    def __init__(self, mark: str) -> None:
-        self.mark = mark
+    def __init__(self, mark: str = "", company: bool = False, refuse: int = 0, moves: bool = True) -> None:
+        self.mark, self.company, self.refuse, self.moves = mark, company, refuse, moves
+        self.token = "t1"
+        self.reads = 0
         self.written: list[Statement] = []
 
     def prepare(self, sql: str) -> Statement:
         return Statement(self, sql)
 
+    def rows(self, sql: str) -> list[dict[str, Any]]:
+        if sql.startswith("SELECT * FROM rubric_criterion"):
+            return [QUESTION]
+        if sql.startswith(api.SCORED_COMPANY) and self.company:
+            return [{"id": "c1", "fit_score": None, "need_score": None, "recommendation": None, "score_token": self.token}]
+        return []
+
     async def batch(self, statements: list[Statement]) -> list[dict[str, Any]]:
-        if not statements[0].sql.startswith("SELECT"):
-            self.written += statements
+        if statements[0].sql.startswith("SELECT * FROM rubric_criterion"):
+            self.reads += 1  # one read of the rubric, the answers, and the mark together
+            return [{"results": self.rows(statement.sql)} for statement in statements]
+        if self.refuse:
+            self.refuse -= 1
+            self.token = f"t{int(self.token[1:]) + 1}" if self.moves else self.token  # the other writer's new mark
+            raise RuntimeError("the batch was refused")
+        self.written += statements
         return [{"results": []} for _ in statements]
 
 
 class RescoreTest(unittest.TestCase):
-    def rescore(self, mark: str) -> list[Statement]:
-        database = Scores(mark)
-        asyncio.run(api.rescore_all(api.job_request(SimpleNamespace(DB=database), "test")))
-        return database.written
+    def rescore(self, database: Scores) -> int:
+        return asyncio.run(api.rescore_all(api.job_request(SimpleNamespace(DB=database), "test")))
 
     def test_a_rescoring_clears_the_request_it_found_and_no_other(self):
-        (clear,) = self.rescore("2026-11-27T10:00:00Z 1a2b3c4d")
+        database = Scores("2026-11-27T10:00:00Z 1a2b3c4d")
+        self.rescore(database)
+        (clear,) = database.written
         # Cleared by its value: a request written while the rescoring ran has another value and stays.
         self.assertIn("SET value = ''", clear.sql)
         self.assertIn("AND value = ?", clear.sql)
         self.assertEqual(clear.values, (api.RESCORE, "2026-11-27T10:00:00Z 1a2b3c4d"))
 
     def test_with_no_request_nothing_is_cleared(self):
-        self.assertEqual(self.rescore(""), [])
+        database = Scores("")
+        self.rescore(database)
+        self.assertEqual(database.written, [])
 
     def test_two_requests_never_write_the_same_value(self):
         first, second = api.rescore_mark(Scores("")), api.rescore_mark(Scores(""))
         self.assertEqual(first.values[1], api.RESCORE)
         self.assertNotEqual(first.values[0], second.values[0])
+
+
+class ScoreMarkTest(unittest.TestCase):
+    """Scores are written only while the company's mark is the one that was read (specs/039-score-version-mark/spec.md)."""
+
+    def test_scores_are_written_under_the_mark_that_was_read_and_get_a_new_one(self):
+        database = Scores(company=True)
+        self.assertEqual(asyncio.run(api.rescore_all(api.job_request(SimpleNamespace(DB=database), "test"))), 1)
+        guard, update = database.written[0], database.written[-1]
+        self.assertEqual((guard.sql, guard.values), (api.SCORE_GUARD, ("t1", "c1")))
+        self.assertIn("score_token = ?", update.sql)
+        self.assertNotIn(update.values[-2], (None, "t1"))  # every write gives the company a new mark
+
+    def test_a_rescoring_reads_a_company_again_when_another_writer_was_first(self):
+        database = Scores("request", company=True, refuse=1)
+        with self.assertLogs("carmen"):
+            self.assertEqual(asyncio.run(api.rescore_all(api.job_request(SimpleNamespace(DB=database), "test"))), 1)
+        self.assertEqual(database.reads, 2)
+        self.assertEqual(database.written[0].values, ("t2", "c1"))  # written under the mark of the second read
+        self.assertIn("SET value = ''", database.written[-1].sql)  # and only then is the request cleared
+
+    def test_a_rescoring_that_cannot_finish_keeps_its_request(self):
+        database = Scores("request", company=True, refuse=99)
+        with self.assertLogs("carmen"), self.assertRaises(RuntimeError):
+            asyncio.run(api.rescore_all(api.job_request(SimpleNamespace(DB=database), "test")))
+        self.assertEqual(database.reads, api.SCORE_TRIES)
+        self.assertEqual(database.written, [])  # the request stays, so the scheduler rescores again
+
+    def answer(self, database: Scores) -> int:
+        request = api.job_request(SimpleNamespace(DB=database), "test")
+        body = {"answers": [{"criterion_id": "q1", "value": "yes"}]}
+        return asyncio.run(api.set_answers(request, "c1", body)).status_code
+
+    def test_saving_answers_is_done_again_when_another_writer_was_first(self):
+        database = Scores(company=True, refuse=1)
+        self.assertEqual(self.answer(database), 200)
+        self.assertEqual(database.reads, 2)
+        guard = next(statement for statement in database.written if statement.sql == api.SCORE_GUARD)
+        self.assertEqual(guard.values, ("t2", "c1"))
+        self.assertEqual(sum("INSERT INTO rubric_answer" in statement.sql for statement in database.written), 1)  # stored once
+
+    def test_saving_answers_fails_when_the_database_refuses_and_nothing_moved(self):
+        database = Scores(company=True, refuse=1, moves=False)
+        with self.assertLogs("carmen", level="ERROR"):
+            self.assertEqual(self.answer(database), 500)
+        self.assertEqual(database.reads, 1)  # not tried again: no other writer was the cause
+
+    def test_saving_answers_gives_up_after_a_few_tries(self):
+        database = Scores(company=True, refuse=99)
+        with self.assertLogs("carmen", level="ERROR"):
+            self.assertEqual(self.answer(database), 500)
+        self.assertEqual(database.reads, api.SCORE_TRIES)
 
 
 class Agreements:

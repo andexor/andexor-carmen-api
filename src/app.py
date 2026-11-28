@@ -1148,13 +1148,17 @@ RUBRIC_FROM = "FROM rubric_criterion c LEFT JOIN service s ON s.id = c.service_i
 RUBRIC_ORDER = "ORDER BY c.section = 'NEED', s.sort_order, s.id, c.sort_order, c.id"
 
 
-async def load_rubric(database: Any) -> tuple[list[Row], list[Row], dict[str, float]]:
-    """Every criterion, every service, and the score thresholds, read on every call."""
+async def read_for_scoring(database: Any, *more: Any) -> tuple[list[Row], list[Row], dict[str, float], list[list[Row]]]:
+    """Every criterion, every service, the score thresholds, and the rows of each further statement,
+    read on every call and in one batch. One batch is one moment of the database, so a writer of
+    scores sees the rubric, the answers, and the company's mark as they were together
+    (specs/039-score-version-mark/spec.md)."""
     results = await database.batch(
         [
             database.prepare("SELECT * FROM rubric_criterion"),
             database.prepare("SELECT * FROM service"),
             database.prepare("SELECT key, value FROM setting WHERE key LIKE 'score.%'"),
+            *more,
         ]
     )
     thresholds: dict[str, float] = {}
@@ -1163,25 +1167,56 @@ async def load_rubric(database: Any) -> tuple[list[Row], list[Row], dict[str, fl
             thresholds[row["key"]] = float(row["value"])
         except ValueError:
             pass  # a setting that is not a number falls back to the default
-    return results[0]["results"], results[1]["results"], thresholds
+    return results[0]["results"], results[1]["results"], thresholds, [result["results"] for result in results[3:]]
+
+
+async def load_rubric(database: Any) -> tuple[list[Row], list[Row], dict[str, float]]:
+    """Every criterion, every service, and the score thresholds, for a caller that writes no scores."""
+    criteria, services, thresholds, _ = await read_for_scoring(database)
+    return criteria, services, thresholds
+
+
+# A company's scores are written only while its mark, score_token, is the one the writer read with
+# the answers and the rubric; every write gives a new mark. This statement fails when the mark has
+# moved (json_extract of a broken text), and a failed statement undoes its whole batch. The writer
+# then reads again and redoes its work, at most SCORE_TRIES times in all.
+SCORE_GUARD = "SELECT json_extract(CASE WHEN score_token IS ? THEN '{}' ELSE '{' END, '$') FROM company WHERE id = ?"
+SCORE_TRIES = 5  # enough for five writers of one company at the same moment; measured on the preview
+# What a writer of scores reads of the company. score_writes needs all of it.
+SCORED_COMPANY = "SELECT id, fit_score, need_score, recommendation, score_token FROM company"
+
+
+async def score_moved(database: Any, company: Row) -> bool:
+    """Whether another writer wrote the company's scores since company was read. A batch that failed
+    is then no error: the writer reads again. False when it cannot be told, and the failure stands."""
+    try:
+        row = await database.prepare("SELECT score_token FROM company WHERE id = ?").bind(company["id"]).first()
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_error", "step": "check_score_mark", "error": type(e).__name__, "description": str(e)}))
+        return False
+    return bool(row) and row["score_token"] != company["score_token"]
 
 
 def score_writes(request: Request, company: Row, scores: Row) -> list[Any]:
     """The statements that store a company's scores, with a timeline entry when the change is notable.
 
-    company holds the id and the scores before the change.
+    company is a row of SCORED_COMPANY: the id, the scores before the change, and the mark that was
+    read with the answers. The statements go through only while that mark is still the stored one.
     """
     database, company_id = db(request), company["id"]
-    statements = [database.prepare("DELETE FROM company_service WHERE company_id = ?").bind(company_id)]
+    statements = [
+        database.prepare(SCORE_GUARD).bind(company["score_token"], company_id),
+        database.prepare("DELETE FROM company_service WHERE company_id = ?").bind(company_id),
+    ]
     for service_id, own in scores["services"].items():
         row = {"company_id": company_id, "service_id": service_id, **own}
         statements.append(insert(database, "company_service", row))
     sql = (
-        "UPDATE company SET fit_score = ?, need_score = ?, confidence = ?, recommendation = ?,"
+        "UPDATE company SET fit_score = ?, need_score = ?, confidence = ?, recommendation = ?, score_token = ?,"
         f" scored_at = {NOW}, updated_at = {NOW} WHERE id = ?"
     )
     values = [scores[key] for key in ("fit_score", "need_score", "confidence", "recommendation")]
-    statements.append(database.prepare(sql).bind(*values, company_id))
+    statements.append(database.prepare(sql).bind(*values, str(uuid.uuid4()), company_id))
     if notable(company, scores):
 
         def moved(key: str) -> str:
@@ -1225,37 +1260,51 @@ async def rescore_all(request: Request) -> int:
     database = db(request)
     # Read before the rubric: a change stored after this point writes another value, which is not cleared.
     mark = await database.prepare("SELECT value FROM setting WHERE key = ?").bind(RESCORE).first()
-    criteria, services, thresholds = await load_rubric(database)
-    by_id = {criterion["id"]: criterion for criterion in criteria}
-    results = await database.batch(
-        [
+    waiting: set[str] | None = None  # the companies whose scores are still to be written; None: all that have answers
+    count = 0
+    problem: Exception | None = None
+    for _ in range(SCORE_TRIES):
+        criteria, services, thresholds, (rows, found) = await read_for_scoring(
+            database,
             database.prepare("SELECT company_id, criterion_id, value, points FROM rubric_answer"),
-            database.prepare(
-                "SELECT id, fit_score, need_score, recommendation FROM company"
-                " WHERE id IN (SELECT company_id FROM rubric_answer)"
-            ),
-        ]
-    )
-    answers: dict[str, Row] = {}
-    pending: list[Any] = []
-    for row in results[0]["results"]:
-        answers.setdefault(row["company_id"], {})[row["criterion_id"]] = row["value"]
-        earned = points(by_id[row["criterion_id"]], row["value"])
-        if earned is not None and abs(earned - row["points"]) > 1e-9:
-            sql = "UPDATE rubric_answer SET points = ? WHERE company_id = ? AND criterion_id = ?"
-            pending.append(database.prepare(sql).bind(earned, row["company_id"], row["criterion_id"]))
-    companies: list[Row] = results[1]["results"]
-    for company in companies:
-        pending += score_writes(request, company, score(criteria, answers[company["id"]], services, thresholds))
-        if len(pending) >= 50:  # each batch is one transaction; a company's statements stay together
-            await database.batch(pending)
-            pending = []
-    if mark and mark["value"]:  # cleared with the last scores, and only when it is still the request found above
+            database.prepare(f"{SCORED_COMPANY} WHERE id IN (SELECT company_id FROM rubric_answer)"),
+        )
+        by_id = {criterion["id"]: criterion for criterion in criteria}
+        answers: dict[str, Row] = {}
+        pending: list[Any] = []
+        for row in rows:
+            answers.setdefault(row["company_id"], {})[row["criterion_id"]] = row["value"]
+            earned = points(by_id[row["criterion_id"]], row["value"])
+            if earned is not None and abs(earned - row["points"]) > 1e-9:
+                sql = "UPDATE rubric_answer SET points = ? WHERE company_id = ? AND criterion_id = ?"
+                pending.append(database.prepare(sql).bind(earned, row["company_id"], row["criterion_id"]))
+        companies: list[Row] = [company for company in found if waiting is None or company["id"] in waiting]
+        if waiting is None:
+            count = len(companies)
+        waiting = set()
+        ids: list[str] = []
+        for company in [*companies, None]:  # None: the end, where what is left is written
+            if company:
+                pending += score_writes(request, company, score(criteria, answers.get(company["id"], {}), services, thresholds))
+                ids.append(company["id"])
+            if pending and (company is None or len(pending) >= 50):  # each batch is one transaction; a company's statements stay together
+                try:
+                    await database.batch(pending)
+                except Exception as e:
+                    # Another writer was first for one of these companies, or the database refused: they are read again.
+                    waiting.update(ids)
+                    problem = e
+                pending, ids = [], []
+        if not waiting:
+            break
+        logger.info(json.dumps({"event": "carmen_rescore_again", "companies": len(waiting), "error": type(problem).__name__}))
+    if waiting:
+        # The request stays set, so the scheduler rescores again.
+        raise RuntimeError(f"{len(waiting)} companies could not be rescored") from problem
+    if mark and mark["value"]:  # cleared only when it is still the request found above
         sql = f"UPDATE setting SET value = '', updated_at = {NOW} WHERE key = ? AND value = ?"
-        pending.append(database.prepare(sql).bind(RESCORE, mark["value"]))
-    if pending:
-        await database.batch(pending)
-    return len(companies)
+        await database.prepare(sql).bind(RESCORE, mark["value"]).run()
+    return count
 
 
 def scores_body(scores: Row, services: list[Row]) -> Row:
@@ -1495,64 +1544,72 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
         return error(request, 400)
 
     database = db(request)
-    try:
-        company = await database.prepare(
-            "SELECT id, fit_score, need_score, recommendation FROM company WHERE id = ?"
-        ).bind(company_id).first()
-        criteria, services, thresholds = await load_rubric(database)
-        stored = await database.prepare("SELECT criterion_id, value FROM rubric_answer WHERE company_id = ?").bind(company_id).all()
-    except Exception as e:
-        return failed(request, "load_answers", e)
-    if not company:
-        return error(request, 404)
-
-    in_use = {criterion["id"]: criterion for criterion in criteria if criterion["active"]}
-    answers: Row = {row["criterion_id"]: row["value"] for row in stored["results"]}
-    before: Row = {}
-    after: Values = {}
-    statements: list[Any] = []
-    try:
-        for entry in cast(list[Any], entries):
-            given: Row = cast(Row, entry) if isinstance(entry, dict) else {}
-            criterion = in_use.get(given.get("criterion_id"))
-            if criterion is None:
-                raise BadBody("an answer names no criterion in use")
-            value = given.get("value")
-            if value is None or value == "":
-                # Cleared: the criterion is unknown again.
-                if criterion["id"] in answers:
-                    before[criterion["prompt"]], after[criterion["prompt"]] = answers[criterion["id"]], None
-                answers.pop(criterion["id"], None)
-                sql = "DELETE FROM rubric_answer WHERE company_id = ? AND criterion_id = ?"
-                statements.append(database.prepare(sql).bind(company_id, criterion["id"]))
-                continue
-            text = str(value).strip()
-            text = text.upper() if criterion["answer_type"] == "YES_NO" else text
-            earned = None if isinstance(value, bool) else points(criterion, text)
-            if earned is None:
-                raise BadBody("a value does not suit its criterion")
-            if answers.get(criterion["id"], text) != text:
-                before[criterion["prompt"]], after[criterion["prompt"]] = answers[criterion["id"]], text
-            answers[criterion["id"]] = text
-            sql = (
-                "INSERT INTO rubric_answer (company_id, criterion_id, value, points, source, answered_by)"
-                " VALUES (?, ?, ?, ?, 'MANUAL', ?) ON CONFLICT (company_id, criterion_id) DO UPDATE SET"
-                " value = excluded.value, points = excluded.points, source = 'MANUAL', ai_run_id = NULL,"
-                f" answered_by = excluded.answered_by, answered_at = {NOW}"
+    for attempt in range(SCORE_TRIES):
+        try:
+            # One read, so the answers, the rubric, and the company's mark are of one moment.
+            criteria, services, thresholds, (found, stored) = await read_for_scoring(
+                database,
+                database.prepare(f"{SCORED_COMPANY} WHERE id = ?").bind(company_id),
+                database.prepare("SELECT criterion_id, value FROM rubric_answer WHERE company_id = ?").bind(company_id),
             )
-            caller = request.state.identity["id"]
-            statements.append(database.prepare(sql).bind(company_id, criterion["id"], text, earned, caller))
-        scores = score(criteria, answers, services, thresholds)
-    except BadBody as e:
-        return failed(request, "read_answers", e)
+        except Exception as e:
+            return failed(request, "load_answers", e)
+        if not found:
+            return error(request, 404)
+        company = found[0]
 
-    try:
-        # A changed or cleared answer is recorded first. The answers and their scores are one transaction.
-        record = audit(request, "Answers", company_id, before, after) if after else []
-        await database.batch(record + statements + score_writes(request, company, scores))
-    except Exception as e:
-        return failed(request, "store_answers", e)
-    return JSONResponse(scores_body(scores, services))
+        in_use = {criterion["id"]: criterion for criterion in criteria if criterion["active"]}
+        answers: Row = {row["criterion_id"]: row["value"] for row in stored}
+        before: Row = {}
+        after: Values = {}
+        statements: list[Any] = []
+        try:
+            for entry in cast(list[Any], entries):
+                given: Row = cast(Row, entry) if isinstance(entry, dict) else {}
+                criterion = in_use.get(given.get("criterion_id"))
+                if criterion is None:
+                    raise BadBody("an answer names no criterion in use")
+                value = given.get("value")
+                if value is None or value == "":
+                    # Cleared: the criterion is unknown again.
+                    if criterion["id"] in answers:
+                        before[criterion["prompt"]], after[criterion["prompt"]] = answers[criterion["id"]], None
+                    answers.pop(criterion["id"], None)
+                    sql = "DELETE FROM rubric_answer WHERE company_id = ? AND criterion_id = ?"
+                    statements.append(database.prepare(sql).bind(company_id, criterion["id"]))
+                    continue
+                text = str(value).strip()
+                text = text.upper() if criterion["answer_type"] == "YES_NO" else text
+                earned = None if isinstance(value, bool) else points(criterion, text)
+                if earned is None:
+                    raise BadBody("a value does not suit its criterion")
+                if answers.get(criterion["id"], text) != text:
+                    before[criterion["prompt"]], after[criterion["prompt"]] = answers[criterion["id"]], text
+                answers[criterion["id"]] = text
+                sql = (
+                    "INSERT INTO rubric_answer (company_id, criterion_id, value, points, source, answered_by)"
+                    " VALUES (?, ?, ?, ?, 'MANUAL', ?) ON CONFLICT (company_id, criterion_id) DO UPDATE SET"
+                    " value = excluded.value, points = excluded.points, source = 'MANUAL', ai_run_id = NULL,"
+                    f" answered_by = excluded.answered_by, answered_at = {NOW}"
+                )
+                caller = request.state.identity["id"]
+                statements.append(database.prepare(sql).bind(company_id, criterion["id"], text, earned, caller))
+            scores = score(criteria, answers, services, thresholds)
+        except BadBody as e:
+            return failed(request, "read_answers", e)
+
+        try:
+            # A changed or cleared answer is recorded first. The answers and their scores are one transaction.
+            record = audit(request, "Answers", company_id, before, after) if after else []
+            await database.batch(record + statements + score_writes(request, company, scores))
+        except Exception as e:
+            if attempt + 1 < SCORE_TRIES and await score_moved(database, company):
+                # Another writer was first: read again, and put these answers on what is stored now.
+                logger.info(json.dumps({"event": "carmen_scores_again", "step": "store_answers", "company_id": company_id}))
+                continue
+            return failed(request, "store_answers", e)
+        return JSONResponse(scores_body(scores, services))
+    return error(request, 500)  # not reached: the last try answers
 
 
 # ---- Enrichment facts ----------------------------------------------------------------------------
@@ -3147,45 +3204,53 @@ async def apply_scoring(request: Request, run: Row) -> tuple[Row, list[Row]]:
     Returns the scores and the services. Raises StepFailed. Written once: a person applies a run
     through apply_run, and the proposals job applies its own (specs/025-service-proposals/spec.md)."""
     database, run_id, company_id = db(request), run["id"], run["company_id"]
-    try:
-        company = await database.prepare(
-            "SELECT id, fit_score, need_score, recommendation FROM company WHERE id = ?"
-        ).bind(company_id).first()
-        criteria, services, thresholds = await load_rubric(database)
-        stored = await database.prepare("SELECT criterion_id, value FROM rubric_answer WHERE company_id = ?").bind(company_id).all()
-        given = await database.prepare("SELECT criterion_id, value FROM ai_run_answer WHERE ai_run_id = ?").bind(run_id).all()
-    except Exception as e:
-        raise StepFailed("load_run", e) from e
+    for attempt in range(SCORE_TRIES):
+        try:
+            # One read, so the answers, the rubric, and the company's mark are of one moment.
+            criteria, services, thresholds, (found, stored, given) = await read_for_scoring(
+                database,
+                database.prepare(f"{SCORED_COMPANY} WHERE id = ?").bind(company_id),
+                database.prepare("SELECT criterion_id, value FROM rubric_answer WHERE company_id = ?").bind(company_id),
+                database.prepare("SELECT criterion_id, value FROM ai_run_answer WHERE ai_run_id = ?").bind(run_id),
+            )
+            company = found[0]
+        except Exception as e:
+            raise StepFailed("load_run", e) from e
 
-    by_id = {criterion["id"]: criterion for criterion in criteria}
-    old: Row = {row["criterion_id"]: row["value"] for row in stored["results"]}
-    new: Row = {}
-    try:
-        sql = (
-            "INSERT INTO rubric_answer (company_id, criterion_id, value, points, source, ai_run_id, answered_by)"
-            " VALUES (?, ?, ?, ?, 'AI', ?, ?)"
-        )
-        caller = request.state.identity["id"]
-        inserts: list[Any] = []
-        for row in given["results"]:
-            # Points are computed again, in case the rubric changed since the run.
-            earned = points(by_id[row["criterion_id"]], row["value"])
-            if earned is not None:
-                new[row["criterion_id"]] = row["value"]
-                inserts.append(database.prepare(sql).bind(company_id, row["criterion_id"], row["value"], earned, run_id, caller))
-        # An answer that changes or goes away is an edit, and is recorded first. A first answer is not.
-        before = {by_id[key]["prompt"]: value for key, value in old.items() if new.get(key) != value}
-        after = {by_id[key]["prompt"]: new.get(key) for key, value in old.items() if new.get(key) != value}
-        scores = score(criteria, new, services, thresholds)
-        statements = audit(request, f"Answers, replaced by the run by {run['model_label']}", company_id, before, after) if after else []
-        statements.append(database.prepare("DELETE FROM rubric_answer WHERE company_id = ?").bind(company_id))
-        statements += inserts
-        statements += score_writes(request, company, scores)
-        statements.append(database.prepare(f"UPDATE ai_run SET applied_at = {NOW} WHERE id = ?").bind(run_id))
-        await database.batch(statements)
-    except Exception as e:
-        raise StepFailed("apply_run", e) from e
-    return scores, services
+        by_id = {criterion["id"]: criterion for criterion in criteria}
+        old: Row = {row["criterion_id"]: row["value"] for row in stored}
+        new: Row = {}
+        try:
+            sql = (
+                "INSERT INTO rubric_answer (company_id, criterion_id, value, points, source, ai_run_id, answered_by)"
+                " VALUES (?, ?, ?, ?, 'AI', ?, ?)"
+            )
+            caller = request.state.identity["id"]
+            inserts: list[Any] = []
+            for row in given:
+                # Points are computed again, in case the rubric changed since the run.
+                earned = points(by_id[row["criterion_id"]], row["value"])
+                if earned is not None:
+                    new[row["criterion_id"]] = row["value"]
+                    inserts.append(database.prepare(sql).bind(company_id, row["criterion_id"], row["value"], earned, run_id, caller))
+            # An answer that changes or goes away is an edit, and is recorded first. A first answer is not.
+            before = {by_id[key]["prompt"]: value for key, value in old.items() if new.get(key) != value}
+            after = {by_id[key]["prompt"]: new.get(key) for key, value in old.items() if new.get(key) != value}
+            scores = score(criteria, new, services, thresholds)
+            statements = audit(request, f"Answers, replaced by the run by {run['model_label']}", company_id, before, after) if after else []
+            statements.append(database.prepare("DELETE FROM rubric_answer WHERE company_id = ?").bind(company_id))
+            statements += inserts
+            statements += score_writes(request, company, scores)
+            statements.append(database.prepare(f"UPDATE ai_run SET applied_at = {NOW} WHERE id = ?").bind(run_id))
+            await database.batch(statements)
+        except Exception as e:
+            if attempt + 1 < SCORE_TRIES and await score_moved(database, company):
+                # Another writer was first: read again, and apply the run to what is stored now.
+                logger.info(json.dumps({"event": "carmen_scores_again", "step": "apply_run", "company_id": company_id}))
+                continue
+            raise StepFailed("apply_run", e) from e
+        return scores, services
+    raise StepFailed("apply_run", RuntimeError("the scores kept changing"))  # not reached: the last try raises
 
 
 @app.post("/api/v1/runs/{run_id}/apply", response_model=contract.Scores)
