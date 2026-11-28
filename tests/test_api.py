@@ -154,6 +154,7 @@ class Settings(unittest.TestCase):
             "document.max_size_bytes": 1,
             "ai.research.max_pages": 8,
             "proposal.max_tries": 3,
+            "proposal.reuse_minutes": 0,
             "uptime.window_days": "14",
             "uptime.sites_per_run": 25,
             "uptime.hours_between_checks": "23",
@@ -185,6 +186,7 @@ class Settings(unittest.TestCase):
             ("renewal.default_notice_days", "1.5"),
             ("import.max_rows", 0),
             ("proposal.max_tries", 0),
+            ("proposal.reuse_minutes", "an hour"),
             ("uptime.window_days", "0"),
             ("uptime.sites_per_run", "many"),
             ("uptime.hours_between_checks", 0),
@@ -304,7 +306,9 @@ class Routes(unittest.TestCase):
             async def send(self, message: dict[str, Any]) -> None:
                 raise RuntimeError("the queue is down")
 
-        self.assertFalse(asyncio.run(api.queue_proposals(SimpleNamespace(RUNS=Queue()), "a1")))
+        # No database: the start cannot be recorded, so nothing is queued. The queue's own failure is in test_runs.py.
+        with self.assertLogs("carmen", level="ERROR"):
+            self.assertEqual(asyncio.run(api.queue_proposals(SimpleNamespace(RUNS=Queue()), "a1")), "FAILED")
 
     def test_the_scheduler_is_run_by_an_administrator_only(self):
         routes = {r.path: r for r in api.app.routes if isinstance(r, APIRoute)}

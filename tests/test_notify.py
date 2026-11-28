@@ -106,6 +106,9 @@ class Messages(unittest.TestCase):
         ]
         self.assertEqual(notify.run_lines(runs), "- Research with First: failed. The model refused\n- Research with Second: succeeded")
         self.assertIn("No model could be used", notify.run_lines([]))
+        # A run that was paid for a short while ago is not made again, and the email says so.
+        earlier = [{"kind": "RESEARCH", "model_label": "First", "status": "SUCCEEDED", "error": None, "finished_at": "2026-11-28T14:05:00Z", "reused": True}]
+        self.assertEqual(notify.run_lines(earlier), "- Research with First: succeeded at 2026-11-28T14:05:00Z, and was used again")
 
     def test_a_proposals_email_with_no_service_says_so_and_names_a_failed_run_first(self):
         self.assertEqual(notify.proposal_sections([]), "")

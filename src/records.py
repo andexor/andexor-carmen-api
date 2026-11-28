@@ -442,6 +442,8 @@ def setting_problem(key: str, value: object) -> str | None:
         ok, wanted = _mailbox(text), "one email address, with or without a name: First Last <address>"
     elif key == "company.shared_hosts":
         ok, wanted = _hosts(text), "host names separated by commas, such as facebook.com,instagram.com"
+    elif key == "proposal.reuse_minutes":
+        ok, wanted = _whole(text, 0), "a whole number of minutes"
     elif key == "renewal.default_notice_days":
         ok, wanted = _whole(text, 0), "a whole number of days"
     elif key in ("document.max_size_bytes", "import.max_rows", "ai.research.max_pages", "proposal.max_tries") or key.startswith("uptime."):

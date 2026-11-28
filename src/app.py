@@ -4112,29 +4112,74 @@ async def list_proposals(request: Request, company_id: str) -> JSONResponse:
     return error(request, 404) if found is None else JSONResponse(found)
 
 
-async def queue_proposals(env: Any, agreement_id: str, real: bool = False) -> bool:
-    """Put the proposals job of an agreement on the queue. Never raises: says whether it was queued."""
+PROPOSAL_REUSE = 60  # minutes; the fallback for a missing setting proposal.reuse_minutes
+
+
+async def queue_proposals(env: Any, agreement_id: str, real: bool = False, fresh: bool = False) -> str:
+    """Put the proposals job of an agreement on the queue. Never raises. Answers QUEUED; RECENT when a
+    job of the agreement was started within proposal.reuse_minutes and no fresh job is asked for; or FAILED.
+
+    The start is recorded on the agreement first (specs/036-proposals-once/spec.md), so a second start
+    soon after pays for no model and sends no second email.
+    """
     try:
-        await env.RUNS.send({"proposal_agreement_id": agreement_id, "real": real})
+        database = env.DB
+        found = await database.prepare("SELECT value FROM setting WHERE key = 'proposal.reuse_minutes'").first()
+        minutes = int(found["value"]) if found and str(found["value"]).isdecimal() else PROPOSAL_REUSE
+        # One statement, so of two starts at the same moment only one gets the agreement.
+        sql = (
+            f"UPDATE agreement SET proposals_started_at = {NOW} WHERE id = ? AND (? = 1 OR proposals_started_at IS NULL"
+            " OR proposals_started_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)) RETURNING id"
+        )
+        if not await database.prepare(sql).bind(agreement_id, 1 if fresh else 0, f"-{minutes} minutes").first():
+            proposal_log(agreement_id, "recent", f"a job was started in the last {minutes} minutes, so none is started")
+            return "RECENT"
+    except Exception as e:
+        logger.error(json.dumps({"event": "carmen_proposals", "agreement_id": agreement_id, "step": "record_start", "error": type(e).__name__}))
+        return "FAILED"
+    try:
+        await env.RUNS.send({"proposal_agreement_id": agreement_id, "real": real, "fresh": fresh})
     except Exception as e:
         logger.error(json.dumps({"event": "carmen_proposals", "agreement_id": agreement_id, "step": "queue", "error": type(e).__name__}))
-        return False
-    return True
+        try:
+            # No job was started, so the next start must not be refused.
+            await database.prepare("UPDATE agreement SET proposals_started_at = NULL WHERE id = ?").bind(agreement_id).run()
+        except Exception as e:
+            logger.error(json.dumps({"event": "carmen_proposals", "agreement_id": agreement_id, "step": "clear_start", "error": type(e).__name__}))
+        return "FAILED"
+    return "QUEUED"
 
 
 # For an administrator, and for the smoke test: the same job a completed one-time agreement starts.
 # With real=true the job uses the default models and sends real email in any environment. It costs
-# money, so the smoke test never sets it.
+# money, so the smoke test never sets it. A start within proposal.reuse_minutes of the last one is
+# answered 409 with started_at and finished_at; fresh=true starts a job all the same, and that job
+# uses no earlier run again.
 @app.post("/api/v1/agreements/{agreement_id}/proposals", response_model=contract.Queued, status_code=202)
 @action(MANAGE)
-async def start_proposals(request: Request, agreement_id: str, real: bool = False) -> JSONResponse:
+async def start_proposals(request: Request, agreement_id: str, real: bool = False, fresh: bool = False) -> JSONResponse:
     try:
         found = await db(request).prepare("SELECT id FROM agreement WHERE id = ?").bind(agreement_id).first()
     except Exception as e:
         return failed(request, "load_agreement", e)
     if not found:
         return error(request, 404)
-    if not await queue_proposals(request.scope["env"], agreement_id, real):
+    outcome = await queue_proposals(request.scope["env"], agreement_id, real, fresh)
+    if outcome == "RECENT":
+        # When the job was started, and when its email was stored: none yet means it is still working.
+        started: Row | None = None
+        try:
+            sql = (
+                "SELECT a.proposals_started_at AS started_at, (SELECT max(n.created_at) FROM notification n"
+                " WHERE n.agreement_id = a.id AND n.kind = 'SERVICE_PROPOSALS' AND n.created_at >= a.proposals_started_at) AS finished_at"
+                " FROM agreement a WHERE a.id = ?"
+            )
+            started = await db(request).prepare(sql).bind(agreement_id).first()
+        except Exception as e:
+            log_error(request, "load_proposals_start", e)
+        times = {"started_at": started["started_at"] if started else None, "finished_at": started["finished_at"] if started else None}
+        return JSONResponse({"ok": False, "error": "CONFLICT", "request_id": request.state.request_id, **times}, status_code=409)
+    if outcome != "QUEUED":
         return error(request, 500)
     return JSONResponse({"queued": True}, status_code=202)
 
@@ -4183,10 +4228,32 @@ async def first_success(env: Any, agreement_id: str, company_id: str, kind: str,
     return None
 
 
-async def fresh_scores(env: Any, agreement_id: str, company_id: str, settings: dict[str, str], real: bool) -> tuple[str | None, list[Row]]:
+async def recent_run(database: Any, company_id: str, kind: str, models: list[Row], minutes: int, input_run_id: str | None = None) -> Row | None:
+    """The newest run of the company that one of the models finished in the last minutes, or None. A
+    scoring run must have read the given research run. Such a run is used again and marked reused,
+    so a job that is started twice, or delivered twice by the queue, pays once."""
+    if minutes <= 0 or not models:
+        return None
+    marks = ", ".join("?" * len(models))
+    sql = (
+        f"{RUN_SELECT} WHERE r.company_id = ? AND r.kind = ? AND r.status = 'SUCCEEDED' AND r.ai_model_id IN ({marks})"
+        " AND r.finished_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) AND (? IS NULL OR r.input_run_id = ?)"
+        " ORDER BY r.finished_at DESC, r.id LIMIT 1"
+    )
+    ids = [model["id"] for model in models]
+    row = await database.prepare(sql).bind(company_id, kind, *ids, f"-{minutes} minutes", input_run_id, input_run_id).first()
+    return {**row, "reused": True} if row else None
+
+
+async def fresh_scores(
+    env: Any, agreement_id: str, company_id: str, settings: dict[str, str], real: bool, fresh: bool = False
+) -> tuple[str | None, list[Row]]:
     """Research the company, score it, and apply the scores. Returns why it failed, in words that are
-    safe to show, or None; and every run that was made. When a run fails, the next model that can do
-    the part is tried, and the failure stays on its own run.
+    safe to show, or None; and every run that was made or used again. When a run fails, the next model
+    that can do the part is tried, and the failure stays on its own run.
+
+    A run that one of the job's models finished within proposal.reuse_minutes is used again, unless
+    the job is a fresh one (specs/036-proposals-once/spec.md).
 
     The models are the real ones where the variable PROPOSAL_MODELS is DEFAULT, or when a person
     asked for a real run. Anywhere else the stub is used, so the preview and the pipeline pay nothing.
@@ -4201,12 +4268,22 @@ async def fresh_scores(env: Any, agreement_id: str, company_id: str, settings: d
     else:
         found = await database.prepare("SELECT * FROM ai_model WHERE provider = 'STUB' ORDER BY sort_order LIMIT 1").all()
         researchers = scorers = cast(list[Row], found["results"])
-    research = await first_success(env, agreement_id, company_id, "RESEARCH", researchers, runs)
+    wanted = settings.get("proposal.reuse_minutes", "")
+    minutes = 0 if fresh else int(wanted) if wanted.isdecimal() else PROPOSAL_REUSE
+    research = await recent_run(database, company_id, "RESEARCH", researchers, minutes)
+    scoring = await recent_run(database, company_id, "SCORING", scorers, minutes, research["id"]) if research else None
+    for run in (research, scoring):
+        if run:
+            runs.append(run)
+            proposal_log(agreement_id, "reused", f"{run['kind']} with {run['model_label']}, finished {run['finished_at']}")
+    research = research or await first_success(env, agreement_id, company_id, "RESEARCH", researchers, runs)
     if not research:
         return "No model could do the research", runs
-    scoring = await first_success(env, agreement_id, company_id, "SCORING", scorers, runs, research["id"])
+    scoring = scoring or await first_success(env, agreement_id, company_id, "SCORING", scorers, runs, research["id"])
     if not scoring:
         return "No model could do the scoring", runs
+    if scoring.get("reused") and scoring["applied_at"]:
+        return None, runs  # its answers are the company's answers already
     try:
         await apply_scoring(job_request(env, "proposals"), scoring)
     except StepFailed as e:
@@ -4215,26 +4292,33 @@ async def fresh_scores(env: Any, agreement_id: str, company_id: str, settings: d
     return None, runs
 
 
-async def process_proposals(env: Any, agreement_id: str, real: bool = False) -> None:
+async def process_proposals(env: Any, agreement_id: str, real: bool = False, fresh: bool = False) -> None:
     """The proposals job of one agreement: fresh research and scoring, then one email with the other
     services worth proposing. Never raises. With real, a person asked for the default models and real
-    email, whatever the environment says."""
+    email, whatever the environment says. With fresh, a person asked for a job that uses no earlier
+    run again. Any other job that the queue delivers a second time sends no second email."""
     try:
         database = env.DB
         sql = (
-            "SELECT a.id, a.title, a.type, a.company_id, c.name AS company_name FROM agreement a"
+            "SELECT a.id, a.title, a.type, a.company_id, a.proposals_started_at, c.name AS company_name FROM agreement a"
             " JOIN company c ON c.id = a.company_id WHERE a.id = ?"
         )
         agreement = await database.prepare(sql).bind(agreement_id).first()
         if not agreement:
             return proposal_log(agreement_id, "skipped", "no such agreement")
-        found = await database.prepare("SELECT key, value FROM setting WHERE key IN ('digest.recipient', 'proposal.max_tries') OR key LIKE 'ai.default_%'").all()
+        found = await database.prepare("SELECT key, value FROM setting WHERE key IN ('digest.recipient', 'proposal.max_tries', 'proposal.reuse_minutes') OR key LIKE 'ai.default_%'").all()
         settings: dict[str, str] = {row["key"]: row["value"] for row in found["results"]}
         recipient = settings.get("digest.recipient", "")
         if not recipient:
             return proposal_log(agreement_id, "skipped", "the setting digest.recipient is missing, so nothing is sent")
 
-        problem, runs = await fresh_scores(env, agreement_id, agreement["company_id"], settings, real)
+        if not fresh and agreement["proposals_started_at"]:
+            sql = "SELECT created_at FROM notification WHERE agreement_id = ? AND kind = 'SERVICE_PROPOSALS' AND created_at >= ? LIMIT 1"
+            sent = await database.prepare(sql).bind(agreement_id, agreement["proposals_started_at"]).first()
+            if sent:
+                return proposal_log(agreement_id, "skipped", f"the email of this start was stored at {sent['created_at']}")
+
+        problem, runs = await fresh_scores(env, agreement_id, agreement["company_id"], settings, real, fresh)
         proposals = await proposals_of(database, agreement["company_id"], agreement_id)
         if proposals is None:
             return proposal_log(agreement_id, "skipped", "the company is gone")
