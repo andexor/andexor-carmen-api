@@ -1597,6 +1597,10 @@ async def set_answers(request: Request, company_id: str, body: dict[str, Any]) -
                 earned = None if isinstance(value, bool) else points(criterion, text)
                 if earned is None:
                     raise BadBody("a value does not suit its criterion")
+                if answers.get(criterion["id"]) == text:
+                    # Unchanged, so it is not written: its source, its run, the person, and the time stay
+                    # as they were. A screen may send the whole form (specs/041-unchanged-answers/spec.md).
+                    continue
                 if answers.get(criterion["id"], text) != text:
                     before[criterion["prompt"]], after[criterion["prompt"]] = answers[criterion["id"]], text
                 answers[criterion["id"]] = text

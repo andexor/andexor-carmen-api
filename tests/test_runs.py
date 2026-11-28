@@ -109,6 +109,7 @@ class Scores:
     def __init__(self, mark: str = "", company: bool = False, refuse: int = 0, moves: bool = True, auto: str = "ON") -> None:
         self.mark, self.company, self.refuse, self.moves, self.auto = mark, company, refuse, moves, auto
         self.token = "t1"
+        self.stored = ""  # the company's answer to the one question, when it has one
         self.reads = 0
         self.written: list[Statement] = []
 
@@ -118,6 +119,8 @@ class Scores:
     def rows(self, sql: str) -> list[dict[str, Any]]:
         if sql.startswith("SELECT * FROM rubric_criterion"):
             return [QUESTION]
+        if sql.startswith("SELECT criterion_id, value FROM rubric_answer"):
+            return [{"criterion_id": "q1", "value": self.stored}] if self.stored else []
         if sql.startswith(api.SCORED_COMPANY) and self.company:
             return [{"id": "c1", "fit_score": None, "need_score": None, "recommendation": None, "score_token": self.token}]
         return []
@@ -200,10 +203,21 @@ class ScoreMarkTest(unittest.TestCase):
         self.assertEqual(database.reads, api.SCORE_TRIES)
         self.assertEqual(database.written, [])  # the request stays, so the scheduler rescores again
 
-    def answer(self, database: Scores) -> int:
+    def answer(self, database: Scores, value: str = "yes") -> int:
         request = api.job_request(SimpleNamespace(DB=database), "test")
-        body = {"answers": [{"criterion_id": "q1", "value": "yes"}]}
+        body = {"answers": [{"criterion_id": "q1", "value": value}]}
         return asyncio.run(api.set_answers(request, "c1", body)).status_code
+
+    def test_an_answer_sent_with_the_value_it_has_is_not_written(self):
+        database = Scores(company=True)
+        database.stored = "YES"  # given by an AI run, say: its source and its run must stay
+        self.assertEqual(self.answer(database, "yes"), 200)
+        self.assertEqual(sum("rubric_answer" in statement.sql for statement in database.written), 0)
+        database = Scores(company=True)
+        database.stored = "YES"
+        with self.assertLogs("carmen"):  # a changed answer is an edit, and is recorded
+            self.assertEqual(self.answer(database, "no"), 200)
+        self.assertEqual(sum("INSERT INTO rubric_answer" in statement.sql for statement in database.written), 1)
 
     def test_saving_answers_is_done_again_when_another_writer_was_first(self):
         database = Scores(company=True, refuse=1)
