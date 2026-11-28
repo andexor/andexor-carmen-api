@@ -538,6 +538,8 @@ expect 200 "\"value\":\"${ROWS}\"" "${BASE}/settings"
 
 # A rescoring that fails is made again (specs/034-rescore-retry/spec.md). A threshold change records
 # the request with the change, and the rescoring after it clears it. The threshold is put back.
+# The switch is ON for this: an earlier run that stopped halfway may have left it OFF.
+expect 200 '"key":"rescore.auto","value":"ON"' -X PATCH -H 'Content-Type: application/json' -d '{"rescore.auto":"ON"}' "${BASE}/settings"
 MINC=$(jq -r '.items[] | select(.key == "score.min_confidence") | .value' "${BODY}")
 expect 200 '"key":"rescore.requested","value":""' "${PATCH[@]}" -d "{\"score.min_confidence\":$((MINC > 0 ? MINC - 1 : 1))}" "${BASE}/settings"
 expect 200 '"key":"rescore.requested","value":""' "${PATCH[@]}" -d "{\"score.min_confidence\":\"${MINC}\"}" "${BASE}/settings"
@@ -549,6 +551,17 @@ if [[ "$(jq -c '.rescored >= 1' "${BODY}")" != "true" ]]; then
     exit 1
 fi
 expect 200 '"key":"rescore.requested","value":""' "${BASE}/settings"
+
+# The switch for automatic rescoring (specs/040-rescore-switch/spec.md). While it is OFF a threshold
+# change is stored and its rescoring waits, also through a scheduler run. ON again rescores once.
+# The threshold is put back while the switch is OFF, and the switch is left ON.
+expect 200 '"key":"rescore.auto","value":"OFF"' "${PATCH[@]}" -d '{"rescore.auto":"OFF"}' "${BASE}/settings"
+expect 200 '"key":"rescore.requested","value":"2' "${PATCH[@]}" -d "{\"score.min_confidence\":$((MINC > 0 ? MINC - 1 : 1))}" "${BASE}/settings"
+expect 200 '"rescored":0' -X POST "${BASE}/scheduler/run"
+expect 200 '"key":"rescore.requested","value":"2' "${PATCH[@]}" -d "{\"score.min_confidence\":\"${MINC}\"}" "${BASE}/settings"
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"rescore.auto":"MAYBE"}' "${BASE}/settings"
+expect 200 '"key":"rescore.requested","value":""' "${PATCH[@]}" -d '{"rescore.auto":"ON"}' "${BASE}/settings"
+expect 200 '"key":"rescore.auto","value":"ON"' "${BASE}/settings"
 
 # Archiving hides a company and unarchiving brings it back; neither removes anything.
 expect 200 '"archived_at":"2' -X POST "${BASE}/companies/${SOLO_ID}/archive"

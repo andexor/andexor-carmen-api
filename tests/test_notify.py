@@ -73,6 +73,14 @@ class Messages(unittest.TestCase):
             "Messages that may not have been sent (1)\n- Renewal: Site build ends 2026-12-15, recorded 2026-11-28T09:00:00Z",
         )
 
+    def test_a_digest_says_that_automatic_rescoring_is_off_while_a_rescoring_waits(self):
+        text = notify.digest_sections({"rescoring_off": [{"requested": "2026-11-28T14:02:00Z 1a2b3c4d"}]})
+        self.assertEqual(
+            text,
+            "Scores waiting for a rescoring (1)\n"
+            "- Automatic rescoring is switched off (the setting rescore.auto). Requested: 2026-11-28T14:02:00Z 1a2b3c4d",
+        )
+
     def test_a_digest_shows_only_the_lists_that_hold_something(self):
         text = notify.digest_sections(
             {

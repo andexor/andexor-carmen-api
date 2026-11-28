@@ -1250,6 +1250,20 @@ def rescore_mark(database: Any) -> Any:
     return database.prepare(f"UPDATE setting SET value = ?, updated_at = {NOW} WHERE key = ?").bind(value, RESCORE)
 
 
+# The switch for automatic rescoring (specs/040-rescore-switch/spec.md): ON, or OFF while the rubric is edited.
+RESCORE_AUTO = "rescore.auto"
+
+
+async def rescore_after(request: Request) -> None:
+    """Rescore every company after a change that moves every score, unless automatic rescoring is
+    switched off. The change has recorded the request with rescore_mark, so nothing is lost: the
+    rescoring runs when the switch is ON again. A missing setting is ON."""
+    found = await db(request).prepare("SELECT value FROM setting WHERE key = ?").bind(RESCORE_AUTO).first()
+    if found and found["value"] == "OFF":
+        return
+    await rescore_all(request)
+
+
 async def rescore_all(request: Request) -> int:
     """Recompute and store the scores of every company that has answers. Returns how many.
 
@@ -1398,7 +1412,7 @@ async def update_service(request: Request, service_id: str, body: dict[str, Any]
 
     if rescore:  # when this fails the request stays recorded, and the scheduler rescores
         try:
-            await rescore_all(request)
+            await rescore_after(request)
         except Exception as e:
             return failed(request, "rescore_after_service", e)
     return JSONResponse(row)
@@ -1461,7 +1475,7 @@ async def create_criterion(request: Request, body: dict[str, Any]) -> JSONRespon
 
     try:
         # A new criterion is unanswered everywhere, which lowers confidence.
-        await rescore_all(request)
+        await rescore_after(request)
     except Exception as e:
         return failed(request, "rescore_after_criterion", e)
     return JSONResponse(row, status_code=201)
@@ -1507,7 +1521,7 @@ async def update_criterion(request: Request, criterion_id: str, body: dict[str, 
 
     if rescore:
         try:
-            await rescore_all(request)
+            await rescore_after(request)
         except Exception as e:
             return failed(request, "rescore_after_criterion", e)
     return JSONResponse(row)
@@ -3913,7 +3927,10 @@ async def daily_digest(
         ]
     )
     # A day with nothing to report still gets its digest, which says so (specs/023-weekday-digest/spec.md).
-    sections = notify.digest_sections({name: result["results"] for name, result in zip(names, results, strict=True)})
+    lists: dict[str, list[Row]] = {name: result["results"] for name, result in zip(names, results, strict=True)}
+    if settings.get(RESCORE_AUTO) == "OFF" and settings.get(RESCORE):
+        lists["rescoring_off"] = [{"requested": settings[RESCORE]}]  # so the switch is not left OFF unnoticed
+    sections = notify.digest_sections(lists)
     sections = sections or notify.NOTHING
     subject, body = notify.render("digest", date=date, sections=sections)
     # Another run at the same moment may have made today's digest since the check above.
@@ -3932,7 +3949,7 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
     summary: Row = {"completed": 0, "expired": 0, "uptime": 0, "rescored": 0, "alerts": 0, "digest": None, "failed": []}
     sql = (
         "SELECT key, value FROM setting WHERE key LIKE 'digest.%' OR key = 'renewal.default_notice_days'"
-        f" OR key LIKE 'uptime.%' OR key = '{RESCORE}'"
+        f" OR key LIKE 'uptime.%' OR key IN ('{RESCORE}', '{RESCORE_AUTO}')"
     )
     try:
         found = await env.DB.prepare(sql).all()
@@ -3957,7 +3974,8 @@ async def run_scheduler(env: Any, email: bool = False) -> Row:
         scheduler_log("failed", f"uptime_checks: {type(e).__name__}: {e}")
         summary["failed"].append("uptime_checks")
     try:
-        if settings.get(RESCORE):  # a rescoring after a change failed, or a person asked for one
+        # A rescoring after a change failed, or a person asked for one. Not while the switch is OFF.
+        if settings.get(RESCORE) and settings.get(RESCORE_AUTO) != "OFF":
             summary["rescored"] = await rescore_all(job_request(env, "scheduler"))
     except Exception as e:
         scheduler_log("failed", f"rescore: {type(e).__name__}: {e}")
@@ -4506,9 +4524,11 @@ async def update_settings(request: Request, body: dict[str, Any]) -> JSONRespons
             await database.batch(statements + ([rescore_mark(database)] if rescore else []))
         except Exception as e:
             return failed(request, "update_settings", e)
-        if rescore:
+        # A threshold moved, so stored recommendations may be out of date. Or the switch is ON again
+        # with a rescoring waiting: this is the one rescoring for everything changed while it was OFF.
+        if rescore or (changed.get(RESCORE_AUTO) == "ON" and current.get(RESCORE)):
             try:
-                await rescore_all(request)  # a threshold moved, so stored recommendations may be out of date
+                await rescore_after(request)
             except Exception as e:
                 return failed(request, "rescore_after_settings", e)
     return await list_settings(request)
