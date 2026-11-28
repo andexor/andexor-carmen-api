@@ -673,5 +673,13 @@ class PrimaryContactSentenceTest(unittest.TestCase):
         self.assertEqual(records.primary_change(None, None, "Bob"), "The primary contact for this company is now Bob.")
 
 
+class SettingDigitsTest(unittest.TestCase):
+    def test_a_whole_number_is_written_in_the_digits_0_to_9(self):
+        self.assertIsNone(records.setting_problem("proposal.reuse_minutes", "30"))
+        # A superscript two, Arabic-Indic digits, and full-width digits: each is refused, and none raises.
+        for value in (chr(0xB2), chr(0x663) + chr(0x660), chr(0xFF13) + chr(0xFF10)):
+            self.assertIsNotNone(records.setting_problem("proposal.reuse_minutes", value), ascii(value))
+
+
 if __name__ == "__main__":
     unittest.main()

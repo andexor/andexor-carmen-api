@@ -6,6 +6,7 @@
 Run with ./unit-test.sh."""
 
 import asyncio
+import base64
 import json
 import pathlib
 import sys
@@ -75,6 +76,30 @@ class SigningKeysTest(unittest.TestCase):
     def test_a_key_that_access_does_not_publish_is_refused(self):
         with self.assertRaises(access.AccessError):
             asyncio.run(access._signing_key("team.example", "forged"))  # pyright: ignore[reportPrivateUsage]
+
+
+def part(value: object) -> str:
+    """One part of a token: JSON in base64url, with no padding."""
+    return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+
+class MalformedTokenTest(unittest.TestCase):
+    """A token that cannot be read is a bad token (401), never a failure of Carmen (500)."""
+
+    def refused(self, header: object, payload: object) -> str:
+        with self.assertRaises(access.AccessError) as raised:
+            asyncio.run(access.verify(f"{part(header)}.{part(payload)}.c2ln", "team.example", "aud", 0.0))
+        return str(raised.exception)
+
+    def test_a_header_that_is_json_but_not_an_object_is_malformed(self):
+        headers: tuple[object, ...] = ([], 5, "RS256", None, True)
+        for header in headers:
+            self.assertIn("malformed token", self.refused(header, {"iss": "x"}), header)
+
+    def test_a_payload_that_is_json_but_not_an_object_is_malformed(self):
+        payloads: tuple[object, ...] = ([], 5, "claims", None)
+        for payload in payloads:
+            self.assertIn("malformed token", self.refused({"alg": "RS256", "kid": "k1"}, payload), payload)
 
 
 if __name__ == "__main__":

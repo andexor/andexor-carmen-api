@@ -382,7 +382,9 @@ DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 
 
 def _whole(text: str, low: int, high: int | None = None) -> bool:
-    return text.isdigit() and low <= int(text) and (high is None or int(text) <= high)
+    # ASCII only: isdigit alone is true for a superscript two, which int cannot read, and for digits
+    # of other scripts, which would be stored as typed. A screen in another language sends 0 to 9.
+    return text.isascii() and text.isdigit() and low <= int(text) and (high is None or int(text) <= high)
 
 
 def _zone(text: str) -> bool:
