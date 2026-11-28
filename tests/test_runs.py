@@ -3,7 +3,7 @@
 # Author: Ed Jenkins
 
 """Unit tests for the queue's run handler: what it reports when a failure cannot be recorded.
-Also for the record that a rescoring is waiting, and for the start of a proposals job.
+Also for the record that a rescoring is waiting, for the start of a proposals job, and for the order in which an email is recorded and sent.
 Run with ./unit-test.sh."""
 
 import asyncio
@@ -186,3 +186,89 @@ class ProposalsStartTest(unittest.TestCase):
         # The record is taken back, or the next start would be refused although no job ran.
         self.assertEqual(len(database.ran), 1)
         self.assertIn("proposals_started_at = NULL", database.ran[0])
+
+
+class Result:
+    def __init__(self, mail: "Mail") -> None:
+        self.mail = mail
+        self.values: tuple[object, ...] = ()
+
+    def bind(self, *values: object) -> "Result":
+        self.values = values
+        return self
+
+    async def first(self) -> dict[str, Any]:
+        if not self.mail.results:
+            raise RuntimeError("the database is away")
+        self.mail.events.append("result")
+        return {"id": "n1", "status": self.values[0]}
+
+
+class Mail:
+    """A database for one message. It notes the order of what happens. taken: another run recorded
+    the message first. records, results: whether the record and the result can be written."""
+
+    def __init__(self, taken: bool = False, records: bool = True, results: bool = True) -> None:
+        self.taken, self.records, self.results = taken, records, results
+        self.events: list[str] = []
+        self.recorded = 0
+
+    def prepare(self, sql: str) -> Result:
+        return Result(self)
+
+    async def batch(self, statements: list[Any]) -> list[dict[str, Any]]:
+        if not self.records:
+            raise RuntimeError("the database is away")
+        self.events.append("record")
+        self.recorded = len(statements)
+        return [{"results": [] if self.taken else [{"id": "n1", "status": "QUEUED"}]}] + [{"results": []} for _ in statements[1:]]
+
+
+class Post:
+    """An email provider that notes when it sends, and can fail."""
+
+    status = "SENT"
+
+    def __init__(self, mail: Mail, works: bool = True) -> None:
+        self.mail, self.works = mail, works
+
+    async def send(self, env: Any, recipient: str, subject: str, body: str) -> str | None:
+        self.mail.events.append("send")
+        if not self.works:
+            raise RuntimeError("the provider is away")
+        return "ref-1"
+
+
+class EmailOrderTest(unittest.TestCase):
+    def message(self, mail: Mail, works: bool = True, task: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        env = SimpleNamespace(DB=mail)
+        to = "Some One <someone@test.example>"
+        return asyncio.run(api.notification(env, Post(mail, works), "RENEWAL_ALERT", to, "Subject", "Body", "a1", "2026-11-27", task))
+
+    def test_a_message_is_recorded_then_sent_and_then_gets_its_result(self):
+        mail = Mail()
+        stored = self.message(mail, task={"id": "t1", "title": "Renewal", "owner_id": None})
+        self.assertEqual(mail.events, ["record", "send", "result"])
+        self.assertEqual(mail.recorded, 2)  # the task is stored with the record
+        self.assertEqual(stored, {"id": "n1", "status": "SENT"})
+
+    def test_a_message_that_cannot_be_recorded_is_not_sent(self):
+        mail = Mail(records=False)
+        with self.assertRaises(RuntimeError):  # the scheduler's step fails, and the next run tries again
+            self.message(mail)
+        self.assertEqual(mail.events, [])
+
+    def test_a_message_that_another_run_recorded_is_not_sent(self):
+        mail = Mail(taken=True)
+        self.assertIsNone(self.message(mail))
+        self.assertEqual(mail.events, ["record"])
+
+    def test_a_message_that_cannot_be_sent_is_recorded_as_failed(self):
+        mail = Mail()
+        self.assertEqual(self.message(mail, works=False), {"id": "n1", "status": "FAILED"})
+        self.assertEqual(mail.events, ["record", "send", "result"])
+
+    def test_a_result_that_cannot_be_stored_leaves_the_message_queued_and_does_not_raise(self):
+        mail = Mail(results=False)
+        self.assertEqual(self.message(mail), {"id": "n1", "status": "QUEUED"})  # the digest names it later
+        self.assertEqual(mail.events, ["record", "send"])
