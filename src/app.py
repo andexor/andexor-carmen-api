@@ -88,8 +88,8 @@ from records import (
     local_date,
     mailbox,
     renewal_problem,
+    new_service_id,
     setting_problem,
-    slug,
 )
 from contract import Items, Page, takes
 from roles import ADMIN, DELETE, MACHINE, MACHINE_CALLER, MANAGE, PUBLIC, READ, WRITE, action, allowed
@@ -1290,9 +1290,7 @@ async def create_service(request: Request, body: dict[str, Any]) -> JSONResponse
         values = clean(body, SERVICE_FIELDS)
         if not values.get("name"):
             raise BadBody("name is required")
-        values["id"] = values.get("id") or slug(values["name"])
-        if not values["id"]:
-            raise BadBody("the name gives no id")
+        values["id"] = new_service_id(values.get("id"), values["name"])
     except BadBody as e:
         return failed(request, "read_service", e)
 

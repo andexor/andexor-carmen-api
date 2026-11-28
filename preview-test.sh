@@ -173,6 +173,8 @@ expect 400 '"error":"BAD_REQUEST"' -X PUT "${JSON[@]}" -d "$(answer '"PERHAPS"')
 expect 200 '"fit_score":null' -X PUT "${JSON[@]}" -d "$(answer null)" "${BASE}/companies/${ID}/answers"
 expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"prompt":"Smoke","config_json":"{not json"}' "${BASE}/rubric"
 expect 200 '"companies":' -X POST "${BASE}/rubric/recompute"
+# A service id is in the form of a page name (specs/035-service-id-form/spec.md). A refusal adds nothing.
+expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"name":"Smoke","id":"smoke,test"}' "${BASE}/services"
 
 # Enrichment facts (specs/005-enrichment-facts/spec.md).
 expect 201 '"key":"smoke_fact"' -X POST "${JSON[@]}" -d '{"key":"Smoke Fact","value":"old","observed_at":"2026-01-01"}' "${BASE}/companies/${ID}/facts"

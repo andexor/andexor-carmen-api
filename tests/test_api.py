@@ -472,6 +472,16 @@ class Records(unittest.TestCase):
         # A real date is never read as a phrase.
         self.assertEqual(records.iso_date("Dec 1, 2026", now), "2026-12-01")
 
+    def test_a_service_id_is_in_the_form_of_a_page_name(self):
+        self.assertEqual(records.new_service_id(None, "SEO Audit"), "seo-audit")
+        self.assertEqual(records.new_service_id("seo", "Search engine optimization"), "seo")
+        # A comma would split the id in a deal's list of services; a slash or a space cannot be in an address.
+        for given in ("seo,audit", "seo/audit", "seo audit", "SEO", "-seo", "seo--audit", "seo?"):
+            with self.assertRaises(records.BadBody, msg=given):
+                records.new_service_id(given, "SEO Audit")
+        with self.assertRaises(records.BadBody):
+            records.new_service_id(None, "!!!")  # the name gives no id
+
     def test_a_date_that_is_not_understood_is_refused(self):
         for text in ("13/45/2026", "2026-02-30", "2026", "soon", "12/01", "x", "TBD", "Acme next week please", "next"):
             for convert in (records.iso_date, records.iso_timestamp):
