@@ -189,6 +189,7 @@ class Company(Row):
     created_at: str = Field(description="A time in UTC, ISO 8601")
     updated_at: str = Field(description="A time in UTC, ISO 8601")
     archived_at: str | None = Field(description="A time in UTC, ISO 8601")
+    score_token: str | None
 
 
 class CompanyService(Row):

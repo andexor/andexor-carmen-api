@@ -164,11 +164,42 @@ expect 200 '"title":"Smoke task"' "${BASE}/tasks?status=DONE&company_id=${ID}"
 expect 200 '"offered":' "${BASE}/services"
 expect 200 '"section":"FIT"' "${BASE}/rubric"
 CRITERION=$(jq -r '[.items[] | select(.active == 1 and .section == "FIT" and .answer_type == "YES_NO")][0].id' "${BODY}")
+SECOND=$(jq -r '[.items[] | select(.active == 1 and .section == "FIT" and .answer_type == "YES_NO")][1].id' "${BODY}")
 answer() { echo "{\"answers\":[{\"criterion_id\":\"${CRITERION}\",\"value\":$1}]}"; }
 expect 200 '"fit_score":[0-9]' -X PUT "${JSON[@]}" -d "$(answer '"YES"')" "${BASE}/companies/${ID}/answers"
 expect 200 '"value":"YES"' "${BASE}/companies/${ID}/answers"
 expect 200 '"recommendation":"' "${BASE}/companies/${ID}"
 expect 200 '"kind":"SCORE_CHANGE"' "${BASE}/companies/${ID}/activities?kind=SCORE_CHANGE"
+# Two saves at the same moment (specs/039-score-version-mark/spec.md). Each write of scores gives the
+# company a new mark, and a save that meets a moved mark is done again, so both succeed. The scores
+# must then follow from both answers: a full rescoring right after changes nothing for this company.
+expect 200 '"score_token":"' "${BASE}/companies/${ID}"
+MARK=$(jq -r '.score_token' "${BODY}")
+save() {
+    curl -s -o /dev/null --write-out '%{http_code}' -X PUT "${JSON[@]}" -H "CF-Access-Client-Id: ${ACCESS_CLIENT_ID}" \
+        -H "CF-Access-Client-Secret: ${ACCESS_CLIENT_SECRET}" -d "$1" "${BASE}/companies/${ID}/answers"
+}
+save "$(answer '"NO"')" > "${FILE}.a" &
+save "{\"answers\":[{\"criterion_id\":\"${SECOND}\",\"value\":\"YES\"}]}" > "${FILE}.b" &
+wait
+if [[ "$(cat "${FILE}.a" "${FILE}.b"; rm -f "${FILE}.a" "${FILE}.b")" != "200200" ]]; then
+    echo "FAILED: two saves of answers at the same moment should both succeed"
+    exit 1
+fi
+expect 200 '"score_token":"' "${BASE}/companies/${ID}"
+SCORED=$(jq -c '[.fit_score, .need_score, .confidence, .recommendation]' "${BODY}")
+if [[ "$(jq -r '.score_token' "${BODY}")" == "${MARK}" ]]; then
+    echo "FAILED: a write of scores should give the company a new mark"
+    exit 1
+fi
+expect 200 '"companies":' -X POST "${BASE}/rubric/recompute"
+expect 200 '"score_token":"' "${BASE}/companies/${ID}"
+if [[ "$(jq -c '[.fit_score, .need_score, .confidence, .recommendation]' "${BODY}")" != "${SCORED}" ]]; then
+    echo "FAILED: after two saves at the same moment the scores do not follow from the answers: ${SCORED} became $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: two saves at the same moment left scores that follow from both answers"
+expect 200 '"fit_score":[0-9]' -X PUT "${JSON[@]}" -d "{\"answers\":[{\"criterion_id\":\"${SECOND}\",\"value\":null}]}" "${BASE}/companies/${ID}/answers"
 expect 400 '"error":"BAD_REQUEST"' -X PUT "${JSON[@]}" -d "$(answer '"PERHAPS"')" "${BASE}/companies/${ID}/answers"
 expect 200 '"fit_score":null' -X PUT "${JSON[@]}" -d "$(answer null)" "${BASE}/companies/${ID}/answers"
 expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" -d '{"prompt":"Smoke","config_json":"{not json"}' "${BASE}/rubric"
