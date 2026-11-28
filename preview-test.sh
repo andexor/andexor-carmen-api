@@ -136,9 +136,23 @@ expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"stage":"NO_SUCH_S
 # The database enforces foreign keys with no PRAGMA: an owner that does not exist is refused.
 expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d '{"owner_id":"no-such-user"}' "${BASE}/companies/${ID}"
 expect 201 '"is_primary":1' -X POST "${JSON[@]}" -d "{\"name\":\"Smoke Contact ${RUN}\",\"is_primary\":true}" "${BASE}/companies/${ID}/contacts"
+CONTACT=$(jq -r '.id' "${BODY}")
 expect 200 '"title":"Tester"' -X PATCH "${JSON[@]}" -d '{"title":"Tester"}' "${BASE}/contacts/$(jq -r '.id' "${BODY}")"
 expect 200 "\"name\":\"Smoke Contact ${RUN}\"" "${BASE}/companies/${ID}"
 expect 200 '"next_cursor":null' "${BASE}/companies?q=smoke+contact+${RUN}"
+# A change of the primary contact is one plain sentence that names both contacts
+# (specs/043-primary-contact-entry/spec.md), when a new contact takes the mark and when an edit does.
+expect 201 '"is_primary":1' -X POST "${JSON[@]}" -d "{\"name\":\"Smoke Second ${RUN}\",\"is_primary\":true}" "${BASE}/companies/${ID}/contacts"
+expect 200 "The primary contact for Smoke Test ${RUN} has changed from Smoke Contact ${RUN} to Smoke Second ${RUN}\\." \
+    "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+expect 200 '"is_primary":1' -X PATCH "${JSON[@]}" -d '{"is_primary":true}' "${BASE}/contacts/${CONTACT}"
+expect 200 "The primary contact for Smoke Test ${RUN} has changed from Smoke Second ${RUN} to Smoke Contact ${RUN}\\." \
+    "${BASE}/companies/${ID}/activities?kind=SYSTEM"
+if grep -q 'is_primary' "${BODY}"; then
+    echo "FAILED: the timeline still names the column is_primary: $(cat "${BODY}")"
+    exit 1
+fi
+echo "ok: the timeline does not name the column is_primary"
 
 # The timeline and tasks (specs/003-activities-and-tasks/spec.md). Both hang off the test company.
 expect 201 '"kind":"NOTE"' -X POST "${JSON[@]}" -d '{"body":"Smoke note"}' "${BASE}/companies/${ID}/activities"
