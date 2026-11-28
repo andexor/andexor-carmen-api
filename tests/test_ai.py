@@ -134,6 +134,18 @@ class CleanAnswers(unittest.TestCase):
         self.assertEqual(dropped, 9)
         self.assertEqual(ai.clean_answers(None, CRITERIA), ([], 0))
 
+    def test_an_answer_whose_criterion_id_is_not_a_text_is_dropped_and_the_others_are_kept(self):
+        raw: list[Any] = [
+            {"criterion_id": ["c1"], "value": "YES"},
+            {"criterion_id": {"id": "c1"}, "value": "YES"},
+            {"criterion_id": 1, "value": "YES"},
+            {"criterion_id": None, "value": "YES"},
+            {"criterion_id": "c1", "value": "NO"},
+        ]
+        kept, dropped = ai.clean_answers(raw, CRITERIA)
+        self.assertEqual([(answer["criterion_id"], answer["value"]) for answer in kept], [("c1", "NO")])
+        self.assertEqual(dropped, 4)
+
     def test_probability_must_be_between_0_and_1(self):
         for bad in (1.5, -0.1, True, None, "0.5"):
             kept, _ = ai.clean_answers([{"criterion_id": "c1", "value": "YES", "probability": bad}], CRITERIA)

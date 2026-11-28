@@ -746,7 +746,7 @@ def clean_facts(raw: object, key_types: dict[str, str]) -> list[Row]:
 def clean_answers(raw: object, criteria: list[Row]) -> tuple[list[Row], int]:
     """The answers a scoring run gave, with their points, and how many were dropped.
 
-    An answer is dropped when its criterion does not exist or is retired, when its value does not
+    An answer is dropped when its criterion is not a text, does not exist, or is retired, when its value does not
     suit the criterion's type, or when the criterion was already answered in this output.
     """
     in_use = {criterion["id"]: criterion for criterion in criteria if criterion.get("active", 1)}
@@ -754,7 +754,9 @@ def clean_answers(raw: object, criteria: list[Row]) -> tuple[list[Row], int]:
     dropped = 0
     for item in cast(list[Any], raw) if isinstance(raw, list) else []:
         answer: Row = cast(Row, item) if isinstance(item, dict) else {}
-        criterion = in_use.get(answer.get("criterion_id"))
+        given = answer.get("criterion_id")
+        # A model may put a list or an object here. That cannot be looked up, so the answer is dropped.
+        criterion = in_use.get(given) if isinstance(given, str) else None
         value = _text(answer.get("value"), 200)
         if criterion is None or value is None or criterion["id"] in answers:
             dropped += 1
