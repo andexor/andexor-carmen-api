@@ -237,6 +237,18 @@ expect 200 "Company Smoke Test ${RUN} edited: city None to 'Atlanta'" "${BASE}/c
 expect 200 '"title":"Smoke task 2"' -X PATCH "${JSON[@]}" -d '{"title":"Smoke task 2"}' "${BASE}/tasks/${TASK}"
 expect 200 "Task Smoke task edited: title 'Smoke task' to 'Smoke task 2'" "${BASE}/companies/${ID}/activities?kind=SYSTEM&limit=200"
 
+# The links of a task (specs/042-task-links/spec.md): its deal is under its own company. A task of
+# another company with this company's deal is refused, a task with only the deal gets the deal's
+# company, and its company cannot be changed while it keeps the deal.
+expect 201 "\"name\":\"Smoke Other ${RUN}\"" -X POST "${JSON[@]}" -d "{\"name\":\"Smoke Other ${RUN}\"}" "${BASE}/companies"
+OTHER=$(jq -r '.id' "${BODY}")
+expect 400 '"error":"BAD_REQUEST"' -X POST "${JSON[@]}" \
+    -d "{\"title\":\"Smoke wrong deal\",\"company_id\":\"${OTHER}\",\"deal_id\":\"${DEAL}\"}" "${BASE}/tasks"
+expect 201 "\"company_id\":\"${ID}\"" -X POST "${JSON[@]}" -d "{\"title\":\"Smoke deal task\",\"deal_id\":\"${DEAL}\"}" "${BASE}/tasks"
+LINKED=$(jq -r '.id' "${BODY}")
+expect 400 '"error":"BAD_REQUEST"' -X PATCH "${JSON[@]}" -d "{\"company_id\":\"${OTHER}\"}" "${BASE}/tasks/${LINKED}"
+expect 200 "\"company_id\":\"${ID}\"" -X PATCH "${JSON[@]}" -d '{"company_id":null,"status":"DONE"}' "${BASE}/tasks/${LINKED}"
+
 # Agreements and documents (specs/008-agreements-and-documents/spec.md). The company is a CUSTOMER
 # by hand at this point.
 expect 201 '"status":"DRAFT"' -X POST "${JSON[@]}" \
