@@ -84,8 +84,11 @@ async def verify(token: str | None, team_domain: str, aud: str, now: float) -> C
         raise AccessError("no token")
     try:
         header_b64, payload_b64, signature_b64 = token.split(".")
-        header: Claims = json.loads(b64url_decode(header_b64))
-        claims: Claims = json.loads(b64url_decode(payload_b64))
+        read: Any = [json.loads(b64url_decode(header_b64)), json.loads(b64url_decode(payload_b64))]
+        if not isinstance(read[0], dict) or not isinstance(read[1], dict):
+            raise ValueError("not an object")  # valid JSON of another kind: a bad token, not a failure here
+        header: Claims = read[0]
+        claims: Claims = read[1]
         signature = b64url_decode(signature_b64)
     except Exception as e:
         raise AccessError(f"malformed token: {type(e).__name__}") from e

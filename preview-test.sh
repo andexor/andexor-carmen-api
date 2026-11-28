@@ -565,6 +565,10 @@ expect 200 "\"value\":\"$((ROWS + 1))\"" "${PATCH[@]}" -d "{\"import.max_rows\":
 expect 200 "\"value\":\"${ROWS}\"" "${PATCH[@]}" -d "{\"import.max_rows\":\"${ROWS}\"}" "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"no.such.setting":"1"}' "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.hour_local":"25"}' "${BASE}/settings"
+# A number is written in the digits 0 to 9 (specs/047-right-status/spec.md): a superscript two and
+# Arabic-Indic digits are refused, not answered 500 or stored as typed.
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.hour_local":"\u00b2"}' "${BASE}/settings"
+expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.hour_local":"\u0661\u0660"}' "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.time_zone":"Mars/Olympus_Mons"}' "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"digest.recipient":"Some One <not an address>"}' "${BASE}/settings"
 expect 400 '"error":"BAD_REQUEST"' "${PATCH[@]}" -d '{"ai.default_scoring_model":"no-such-model"}' "${BASE}/settings"
