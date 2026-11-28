@@ -250,6 +250,17 @@ def slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
+def new_service_id(given: object, name: str) -> str:
+    """The id of a new service: the given one, or one made from the name. Raises BadBody for a given
+    id that is not in the form slug makes: the id is part of an address, and ids are listed with commas."""
+    made = str(given) if given else slug(name)
+    if not made:
+        raise BadBody("the name gives no id")
+    if made != slug(made):
+        raise BadBody("the id must be lowercase letters and digits joined by hyphens, such as seo-audit")
+    return made
+
+
 def id_list(body: Values, key: str) -> list[str] | None:
     """The list of ids under the key, without repeats and in order, or None when the key is absent.
     Raises BadBody when it is not a list of text."""
