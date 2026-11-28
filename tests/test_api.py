@@ -658,5 +658,20 @@ class Config(unittest.TestCase):
                 self.assertNotIn("SERVICE_TOKENS_ARE_ADMIN", env.get("vars", {}), name)
 
 
+class PrimaryContactSentenceTest(unittest.TestCase):
+    def test_a_change_names_the_company_and_both_contacts(self):
+        self.assertEqual(
+            records.primary_change("XYZ", "Ann Margaret", "Bob Smithers"),
+            "The primary contact for XYZ has changed from Ann Margaret to Bob Smithers.",
+        )
+
+    def test_a_first_primary_contact_and_a_removed_one_have_their_own_sentences(self):
+        self.assertEqual(records.primary_change("XYZ", None, "Bob Smithers"), "The primary contact for XYZ is now Bob Smithers.")
+        self.assertEqual(records.primary_change("XYZ", "Ann Margaret", None), "Ann Margaret is no longer the primary contact for XYZ.")
+
+    def test_a_company_with_no_name_is_this_company(self):
+        self.assertEqual(records.primary_change(None, None, "Bob"), "The primary contact for this company is now Bob.")
+
+
 if __name__ == "__main__":
     unittest.main()

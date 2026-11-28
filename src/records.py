@@ -405,6 +405,16 @@ def _email(text: str) -> bool:
     return bool(local and host and tail) and not any(c in "@,;" or c.isspace() for c in local + domain)
 
 
+def primary_change(company: str | None, old: str | None, new: str | None) -> str:
+    """The timeline sentence for a change of a company's primary contact, written for a person to read."""
+    company = company or "this company"
+    if old and new:
+        return f"The primary contact for {company} has changed from {old} to {new}."
+    if new:
+        return f"The primary contact for {company} is now {new}."
+    return f"{old} is no longer the primary contact for {company}."
+
+
 def mailbox(text: str) -> tuple[str, str]:
     """The name and the address in "Name <address>". A bare address has no name."""
     text = text.strip()

@@ -78,6 +78,7 @@ from records import (
     clean,
     SHARED_HOSTS,
     derive_domain,
+    primary_change,
     describe_change,
     download_header,
     fact_key,
@@ -742,6 +743,23 @@ async def unarchive_company(request: Request, company_id: str) -> JSONResponse:
 CONTACTS_OF = "SELECT * FROM contact WHERE company_id = ? ORDER BY is_primary DESC, name COLLATE NOCASE, id"
 # A company has at most one primary contact, so the others are cleared in the same transaction.
 CLEAR_PRIMARY = f"UPDATE contact SET is_primary = 0, updated_at = {NOW} WHERE company_id = ? AND is_primary = 1 AND id != ?"
+# The company's name, and the primary contact that is not the given one (name and email are NULL when there is none).
+PRIMARY_BEFORE = (
+    "SELECT c.name AS company, p.name, p.email FROM company c"
+    " LEFT JOIN contact p ON p.company_id = c.id AND p.is_primary = 1 AND p.id != ? WHERE c.id = ?"
+)
+
+
+def primary_entry(request: Request, company_id: str, company: str | None, old: str | None, new: str | None) -> list[Any]:
+    """Record a change of the primary contact in plain words: the Worker log first, then the timeline.
+
+    It stands for the entries of both contacts, the one that gets the mark and the one that loses it
+    (specs/043-primary-contact-entry/spec.md).
+    """
+    body = primary_change(company, old, new)
+    log_change(request, body, company_id)
+    entry = {"id": str(uuid.uuid4()), "company_id": company_id, "kind": "SYSTEM", "body": body, "created_by": request.state.identity["id"]}
+    return [insert(db(request), "activity", entry)]
 
 
 @app.get("/api/v1/companies/{company_id}/contacts", response_model=Items[models.Contact])
@@ -771,7 +789,7 @@ async def create_contact(request: Request, company_id: str, body: dict[str, Any]
     values["company_id"] = company_id
 
     try:
-        company = await db(request).prepare("SELECT id FROM company WHERE id = ?").bind(company_id).first()
+        company = await db(request).prepare(PRIMARY_BEFORE).bind(values["id"], company_id).first()
         column = await unknown_code(db(request), values, CONTACT_CODES)
     except Exception as e:
         return failed(request, "check_contact", e)
@@ -783,6 +801,11 @@ async def create_contact(request: Request, company_id: str, body: dict[str, Any]
     statements = [insert(db(request), "contact", values)]
     if values.get("is_primary"):
         statements.insert(0, db(request).prepare(CLEAR_PRIMARY).bind(company_id, values["id"]))
+        replaced = company["name"] or company["email"]
+        if replaced:
+            # A new contact is not recorded, but the contact it replaces as primary is edited, so that is.
+            new = values.get("name") or values.get("email")
+            statements = primary_entry(request, company_id, company["company"], replaced, new) + statements
     try:
         results = await db(request).batch(statements)
         row = results[-1]["results"][0]
@@ -817,11 +840,27 @@ async def update_contact(request: Request, contact_id: str, body: dict[str, Any]
     if column:
         return error(request, 400)
 
+    company_id = current["company_id"]
+    before: Row | None = None
+    if "is_primary" in changed:
+        try:
+            before = await db(request).prepare(PRIMARY_BEFORE).bind(contact_id, company_id).first()
+        except Exception as e:
+            return failed(request, "load_primary", e)
+
     statements = [update(db(request), "contact", values, contact_id)]
     if values.get("is_primary"):
-        statements.insert(0, db(request).prepare(CLEAR_PRIMARY).bind(current["company_id"], contact_id))
-    if changed:
-        statements = audit(request, contact_label(current), current["company_id"], current, changed) + statements
+        statements.insert(0, db(request).prepare(CLEAR_PRIMARY).bind(company_id, contact_id))
+    # The primary mark gets its own sentence, which names both contacts; the other fields are recorded as always.
+    other = {column: value for column, value in changed.items() if column != "is_primary"}
+    if other:
+        statements = audit(request, contact_label(current), company_id, current, other) + statements
+    if before:
+        after = {**current, **changed}
+        this = after["name"] or after["email"]
+        replaced = before["name"] or before["email"]
+        names = (replaced, this) if changed["is_primary"] else (this, None)
+        statements = primary_entry(request, company_id, before["company"], *names) + statements
     try:
         results = await db(request).batch(statements)
         row = results[-1]["results"][0]
