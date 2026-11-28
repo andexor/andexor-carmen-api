@@ -426,6 +426,14 @@ class Pages(unittest.TestCase):
         self.assertEqual(pages.pick_links("https://acme.com/", pages.read(HOME)[1], 2), picked[:2])
         self.assertEqual(pages.pick_links("https://acme.com/", pages.read(HOME)[1], 0), [])
 
+    def test_a_page_that_says_it_is_over_the_limit_is_too_large(self):
+        self.assertTrue(pages.too_large(str(pages.MAX_BYTES + 1)))
+        self.assertTrue(pages.too_large(" 900000000 "))
+
+    def test_a_page_at_the_limit_or_with_no_usable_length_is_read(self):
+        for length in (str(pages.MAX_BYTES), "0", "512", None, "", "many", "-1", "1e9", chr(0xB2)):
+            self.assertFalse(pages.too_large(length), length)
+
     def test_a_site_is_up_when_it_answers_below_500(self):
         for status in (200, 301, 403, 404, 499):
             self.assertTrue(pages.is_up(status), status)
