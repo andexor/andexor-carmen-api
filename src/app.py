@@ -420,7 +420,7 @@ def db_status(e: Exception) -> int:
         return 400
     if "UNIQUE constraint failed" in text:
         return 409
-    if "constraint failed" in text or "SRT violation" in text:
+    if "constraint failed" in text or "SRT violation" in text or "task link outside" in text:
         return 400
     return 500
 
@@ -1005,8 +1005,31 @@ TASK_ORDER = "due_date IS NULL, due_date, created_at, id"  # soonest first, unda
 OPEN_TASKS_OF = f"SELECT * FROM task WHERE company_id = ? AND status = 'OPEN' ORDER BY {TASK_ORDER}"
 
 
+# What a task may point to. Each must be a record of the task's own company (specs/042-task-links/spec.md).
+TASK_LINKS = {"deal_id": "deal", "agreement_id": "agreement"}
+
+
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+async def linked_company(database: Any, task: Values) -> str | None:
+    """The company of a whole task. A task with no company takes the company of its deal or agreement.
+
+    Raises BadBody when a link is unknown or is under another company. The triggers task_links_ins and
+    task_links_upd hold the same rule in the database.
+    """
+    company_id = task.get("company_id")
+    for column, table in TASK_LINKS.items():
+        if task.get(column) is None:
+            continue
+        row = await database.prepare(f"SELECT company_id FROM {table} WHERE id = ?").bind(task[column]).first()
+        if not row:
+            raise BadBody(f"{column} is unknown")
+        company_id = company_id or row["company_id"]
+        if row["company_id"] != company_id:
+            raise BadBody(f"{column} is under another company")
+    return company_id
 
 
 @app.get("/api/v1/tasks", response_model=Page[models.Task])
@@ -1056,6 +1079,7 @@ async def create_task(request: Request, body: dict[str, Any]) -> JSONResponse:
 
     try:
         column = await unknown_code(db(request), values, TASK_CODES)
+        values["company_id"] = await linked_company(db(request), values)
     except Exception as e:
         return failed(request, "check_task", e)
     if column:
@@ -1089,10 +1113,18 @@ async def update_task(request: Request, task_id: str, body: dict[str, Any]) -> J
     changed = {column: value for column, value in values.items() if value != current[column]}
     try:
         column = await unknown_code(db(request), changed, TASK_CODES)
+        # The whole task is checked, not only what changed: a new company must fit the deal it keeps.
+        company_id = await linked_company(db(request), {**current, **changed})
     except Exception as e:
         return failed(request, "check_task", e)
     if column:
         return error(request, 400)
+    if company_id != current["company_id"]:
+        values["company_id"] = changed["company_id"] = company_id
+    else:
+        # Taking the company away from a task that has a deal changes nothing: the deal gives it back.
+        values.pop("company_id", None)
+        changed.pop("company_id", None)
     if "status" in changed:
         # Done records when; any other status clears it.
         values["completed_at"] = utc_now() if changed["status"] == "DONE" else None
