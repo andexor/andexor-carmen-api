@@ -3,7 +3,7 @@
 # Author: Ed Jenkins
 
 """Unit tests for the queue's run handler: what it reports when a failure cannot be recorded.
-Also for the record that a rescoring is waiting.
+Also for the record that a rescoring is waiting, and for the start of a proposals job.
 Run with ./unit-test.sh."""
 
 import asyncio
@@ -126,3 +126,63 @@ class RescoreTest(unittest.TestCase):
         first, second = api.rescore_mark(Scores("")), api.rescore_mark(Scores(""))
         self.assertEqual(first.values[1], api.RESCORE)
         self.assertNotEqual(first.values[0], second.values[0])
+
+
+class Agreements:
+    """A database with one agreement, whose proposals job may be started (free) or was started just now."""
+
+    def __init__(self, free: bool) -> None:
+        self.free = free
+        self.last = ""
+        self.values: tuple[object, ...] = ()
+        self.ran: list[str] = []
+
+    def prepare(self, sql: str) -> "Agreements":
+        self.last = sql
+        return self
+
+    def bind(self, *values: object) -> "Agreements":
+        self.values = values
+        return self
+
+    async def first(self) -> dict[str, Any] | None:
+        if self.last.startswith("SELECT"):
+            return {"value": "45"}  # the setting proposal.reuse_minutes
+        return {"id": "a1"} if self.free else None
+
+    async def run(self) -> None:
+        self.ran.append(self.last)
+
+
+class Sent:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    async def send(self, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+
+
+class ProposalsStartTest(unittest.TestCase):
+    def test_a_start_is_recorded_and_a_second_one_soon_after_is_refused(self):
+        database, queue = Agreements(free=True), Sent()
+        self.assertEqual(asyncio.run(api.queue_proposals(SimpleNamespace(DB=database, RUNS=queue), "a1")), "QUEUED")
+        self.assertEqual(database.values, ("a1", 0, "-45 minutes"))  # refused inside the time the setting gives
+        self.assertEqual(queue.messages, [{"proposal_agreement_id": "a1", "real": False, "fresh": False}])
+        database, queue = Agreements(free=False), Sent()
+        with self.assertLogs("carmen"):
+            self.assertEqual(asyncio.run(api.queue_proposals(SimpleNamespace(DB=database, RUNS=queue), "a1")), "RECENT")
+        self.assertEqual(queue.messages, [])  # nothing is queued, so no model is paid and no email is sent
+
+    def test_a_fresh_job_is_started_whatever_was_started_before(self):
+        database, queue = Agreements(free=True), Sent()
+        self.assertEqual(asyncio.run(api.queue_proposals(SimpleNamespace(DB=database, RUNS=queue), "a1", real=True, fresh=True)), "QUEUED")
+        self.assertEqual(database.values[1], 1)  # the statement then takes the agreement at any time
+        self.assertEqual(queue.messages, [{"proposal_agreement_id": "a1", "real": True, "fresh": True}])
+
+    def test_a_start_that_cannot_be_queued_is_not_left_recorded(self):
+        database = Agreements(free=True)
+        with self.assertLogs("carmen", level="ERROR"):
+            self.assertEqual(asyncio.run(api.queue_proposals(SimpleNamespace(DB=database, RUNS=Queue()), "a1")), "FAILED")
+        # The record is taken back, or the next start would be refused although no job ran.
+        self.assertEqual(len(database.ran), 1)
+        self.assertIn("proposals_started_at = NULL", database.ran[0])

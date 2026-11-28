@@ -118,6 +118,8 @@ def run_lines(runs: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for run in runs:
         result = "succeeded" if run["status"] == "SUCCEEDED" else f"failed. {run['error'] or 'No reason was stored'}"
+        if run.get("reused"):  # paid for a short while ago, so not made again
+            result += f" at {run['finished_at']}, and was used again"
         lines.append(f"- {str(run['kind']).capitalize()} with {run['model_label']}: {result}")
     return "\n".join(lines) or "- None. No model could be used."
 

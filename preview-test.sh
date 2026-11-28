@@ -436,7 +436,8 @@ expect 200 '"status":"EXPIRED"' "${BASE}/agreements/${ENDED}"
 expect 200 '"status":"COMPLETED"' "${BASE}/agreements/${PROJECT}"
 # Service proposals (specs/025-service-proposals/spec.md). Completing the one-time agreement queued
 # its job. On the preview the job uses the stub model and the stub provider: no model is paid and
-# no email is sent. The job is then started once more by hand.
+# no email is sent. A second start soon after is refused (specs/036-proposals-once/spec.md), and
+# says when the job was started and when it finished. A fresh job is then started by hand.
 PROPOSALS="${BASE}/notifications?kind=SERVICE_PROPOSALS&agreement_id=${PROJECT}"
 for wanted in 1 2; do
     for attempt in $(seq 1 60); do
@@ -450,7 +451,11 @@ for wanted in 1 2; do
         echo "FAILED: a proposals email should be stubbed, list its runs, and say nothing of a failed run: $(cat "${BODY}")"
         exit 1
     fi
-    [[ "${wanted}" == "1" ]] && expect 202 '"queued":true' -X POST "${BASE}/agreements/${PROJECT}/proposals"
+    if [[ "${wanted}" == "1" ]]; then
+        expect 200 '"proposals_started_at":"2' "${BASE}/agreements/${PROJECT}"
+        expect 409 '"finished_at":"2' -X POST "${BASE}/agreements/${PROJECT}/proposals"
+        expect 202 '"queued":true' -X POST "${BASE}/agreements/${PROJECT}/proposals?fresh=true"
+    fi
 done
 echo "ok: the proposals emails came from fresh stub runs"
 expect 200 '"provider":"STUB"' "${BASE}/companies/${SCO}/runs"

@@ -60,6 +60,7 @@ class Agreement(Row):
     end_basis: str | None = Field(description="A code of the SRT domain END_BASIS")
     end_basis_reason: str | None
     term_months: int | None
+    proposals_started_at: str | None = Field(description="A time in UTC, ISO 8601")
 
 
 class AgreementService(Row):
