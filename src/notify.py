@@ -35,6 +35,7 @@ SECTIONS = (
     ("agreements_renewing", "Agreements in their renewal window"),
     ("leads_unscored", "Leads waiting for a score"),
     ("unsent", "Messages that may not have been sent"),
+    ("rescoring_off", "Scores waiting for a rescoring"),
 )
 
 
@@ -81,6 +82,8 @@ def _line(name: str, row: dict[str, Any]) -> str:
         return f"{row.get('title') or row.get('type')}{company}, ends {row.get('end_date')}"
     if name == "leads_unscored":
         return str(row.get("name") or row.get("domain"))
+    if name == "rescoring_off":
+        return f"Automatic rescoring is switched off (the setting rescore.auto). Requested: {row.get('requested')}"
     if name == "unsent":
         return f"{row.get('subject')}, recorded {row.get('created_at')}"
     return f"{row.get('title')}{company}" + (f", due {row.get('due_date')}" if name == "tasks_overdue" else "")

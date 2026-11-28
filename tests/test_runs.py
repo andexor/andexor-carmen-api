@@ -90,6 +90,8 @@ class Statement:
     async def first(self) -> dict[str, Any]:
         if "score_token" in self.sql:
             return {"score_token": self.database.token}  # the company's mark as it is stored now
+        if self.values == (api.RESCORE_AUTO,):
+            return {"value": self.database.auto}  # the switch for automatic rescoring
         return {"value": self.database.mark}
 
     async def run(self) -> None:
@@ -104,8 +106,8 @@ class Scores:
     (c1). It keeps what is written. refuse: how many writes fail first. moves: a write fails because
     another writer was first and gave the company a new mark; otherwise the database is away."""
 
-    def __init__(self, mark: str = "", company: bool = False, refuse: int = 0, moves: bool = True) -> None:
-        self.mark, self.company, self.refuse, self.moves = mark, company, refuse, moves
+    def __init__(self, mark: str = "", company: bool = False, refuse: int = 0, moves: bool = True, auto: str = "ON") -> None:
+        self.mark, self.company, self.refuse, self.moves, self.auto = mark, company, refuse, moves, auto
         self.token = "t1"
         self.reads = 0
         self.written: list[Statement] = []
@@ -154,6 +156,22 @@ class RescoreTest(unittest.TestCase):
         first, second = api.rescore_mark(Scores("")), api.rescore_mark(Scores(""))
         self.assertEqual(first.values[1], api.RESCORE)
         self.assertNotEqual(first.values[0], second.values[0])
+
+
+class RescoreSwitchTest(unittest.TestCase):
+    def after(self, auto: str) -> Scores:
+        database = Scores("request", company=True, auto=auto)
+        asyncio.run(api.rescore_after(api.job_request(SimpleNamespace(DB=database), "test")))
+        return database
+
+    def test_while_the_switch_is_off_a_change_rescores_nothing_and_its_request_stays(self):
+        database = self.after("OFF")
+        self.assertEqual((database.reads, database.written), (0, []))
+
+    def test_while_the_switch_is_on_a_change_rescores_at_once(self):
+        database = self.after("ON")
+        self.assertEqual(database.reads, 1)
+        self.assertIn("SET value = ''", database.written[-1].sql)  # the request is cleared
 
 
 class ScoreMarkTest(unittest.TestCase):
