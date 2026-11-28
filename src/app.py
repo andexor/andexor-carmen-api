@@ -31,7 +31,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal, cast
 
@@ -3685,32 +3685,73 @@ def scheduler_log(event: str, detail: str) -> None:
 
 
 async def notification(
-    env: Any, provider: notify.Provider, kind: str, recipient: str, subject: str, body: str, agreement_id: str | None = None
-) -> Any:
-    """Send one message and return the statement that stores it. A message that could not be sent is
-    stored as FAILED with the reason, and is not tried again: the row says what happened."""
+    env: Any,
+    provider: notify.Provider,
+    kind: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    agreement_id: str | None = None,
+    since: str | None = None,
+    task: Values | None = None,
+) -> Row | None:
+    """Record one message, send it, and record what happened (specs/037-record-email-first/spec.md).
+    Returns the row as it is stored, or None when nothing was sent: with since, a message of the same
+    kind and agreement that was recorded at or after that moment means another run has this one.
+
+    The record comes first, as QUEUED, so a message is never sent twice because its record could not
+    be stored: with no record nothing is sent, and the caller's step fails and is tried again. A task
+    is stored with the record, or not at all. A message that could not be sent is FAILED with the
+    reason, and is not tried again. One that stays QUEUED was cut off: the next digest names it.
+    """
     # The preview marks its subjects, so its messages are told from production's (specs/029-email-subject-prefix/spec.md).
     subject = notify.subject_line(env_var(env, "EMAIL_SUBJECT_PREFIX"), subject)
-    values: Values = {
-        "id": str(uuid.uuid4()),
-        "kind": kind,
-        "recipient": recipient,
-        "subject": subject,
-        "body": body,
-        "agreement_id": agreement_id,
-        "status": provider.status,
-    }
+    database, row_id = env.DB, str(uuid.uuid4())
     if not mailbox(recipient)[0]:
         # Sent all the same, to the bare address (specs/028-email-names/spec.md, FR-005).
         scheduler_log("no_recipient_name", f"{kind}: the recipient has no name, so the To line shows the address alone")
+    # One statement decides and records, so of two runs at the same moment only one sends.
+    sql = (
+        "INSERT INTO notification (id, kind, recipient, subject, body, agreement_id, status)"
+        " SELECT ?, ?, ?, ?, ?, ?, 'QUEUED' WHERE ? IS NULL OR NOT EXISTS"
+        " (SELECT 1 FROM notification WHERE kind = ? AND agreement_id IS ? AND created_at >= ?) RETURNING *"
+    )
+    statements = [database.prepare(sql).bind(row_id, kind, recipient, subject, body, agreement_id, since, kind, agreement_id, since)]
+    if task:
+        given = {column: value for column, value in task.items() if value is not None}
+        marks = ", ".join("?" * len(given))
+        also = f"INSERT INTO task ({', '.join(given)}) SELECT {marks} WHERE EXISTS (SELECT 1 FROM notification WHERE id = ?)"
+        statements.append(database.prepare(also).bind(*given.values(), row_id))
+    recorded = (await database.batch(statements))[0]["results"]
+    if not recorded:
+        scheduler_log("already_recorded", f"{kind}: another run recorded this message, so it is not sent again")
+        return None
+
+    outcome: Values = {"status": provider.status}
     try:
-        values["provider_ref"] = await provider.send(env, recipient, subject, body)
+        outcome["provider_ref"] = await provider.send(env, recipient, subject, body)
         if provider.status == "SENT":
-            values["sent_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            outcome["sent_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception as e:
         scheduler_log("send_failed", f"{kind}: {type(e).__name__}: {e}")
-        values.update(status="FAILED", error=f"{type(e).__name__}: {e}"[:300])
-    return insert(env.DB, "notification", values)
+        outcome = {"status": "FAILED", "error": f"{type(e).__name__}: {e}"[:300]}
+    try:
+        return await update(database, "notification", outcome, row_id, stamp=False).first()
+    except Exception as e:
+        # The message is out, or it failed, and the row still says QUEUED. It is not sent again.
+        scheduler_log("record_failed", f"{kind}: the result {outcome['status']} could not be stored: {type(e).__name__}: {e}")
+        return recorded[0]
+
+
+# A message that was recorded more than an hour ago and never got its result: the run was cut off
+# between the record and the send, or after the send. Each one is named in one digest, the first
+# that is made after it: the list starts an hour before the digest before this one.
+STAMP = "'%Y-%m-%dT%H:%M:%SZ'"
+UNSENT = (
+    "SELECT kind, subject, created_at FROM notification WHERE status = 'QUEUED'"
+    f" AND created_at <= strftime({STAMP}, 'now', '-1 hour') AND created_at > coalesce((SELECT strftime({STAMP}, max(created_at), '-1 hour')"
+    " FROM notification WHERE kind = 'DAILY_DIGEST'), '') ORDER BY created_at, id LIMIT ?"
+)
 
 
 # What an active agreement becomes after its end date, by its renewal policy. One that renews
@@ -3751,8 +3792,9 @@ async def end_agreements(env: Any, date: str) -> dict[str, int]:
 
 async def renewal_alerts(env: Any, provider: notify.Provider, date: str, notice_days: int, recipient: str) -> int:
     """One alert and one task for each active agreement that has reached its notice date. An agreement
-    that renews automatically has no end date, so it gets none."""
+    that renews automatically has no end date, so it gets none. Returns how many alerts this run made."""
     found = await env.DB.prepare(ALERTS_DUE).bind(notice_days, date, notice_days, date, notice_days, DIGEST_ROWS).all()
+    made = 0
     for agreement in found["results"]:
         title = str(agreement["title"] or agreement["type"])
         heading, what_happens = ALERT_WORDS.get(agreement["renewal_policy"], ALERT_WORDS["APPROVAL"])
@@ -3773,9 +3815,11 @@ async def renewal_alerts(env: Any, provider: notify.Provider, date: str, notice_
             "due_date": agreement["notice_date"],
             "owner_id": agreement["owner_id"],
         }
-        stored = await notification(env, provider, "RENEWAL_ALERT", recipient, subject, body, agreement["id"])
-        await env.DB.batch([stored, insert(env.DB, "task", task)])
-    return len(found["results"])
+        # The day before the notice date, as in ALERTS_DUE: a run that found the agreement at the same moment makes no second alert.
+        since = (datetime.fromisoformat(str(agreement["notice_date"])) - timedelta(days=1)).date().isoformat()
+        if await notification(env, provider, "RENEWAL_ALERT", recipient, subject, body, agreement["id"], since, task):
+            made += 1
+    return made
 
 
 async def daily_digest(
@@ -3793,21 +3837,23 @@ async def daily_digest(
         sql = "SELECT 1 AS found FROM notification WHERE kind = 'DAILY_DIGEST' AND created_at >= ?"
         if await database.prepare(sql).bind(began).first():
             return "ALREADY_MADE"
-    names = ("tasks_due", "tasks_overdue", "agreements_renewing", "leads_unscored")
+    names = ("tasks_due", "tasks_overdue", "agreements_renewing", "leads_unscored", "unsent")
     results = await database.batch(
         [
             database.prepare(TODAY_TASKS.format("=")).bind(date, DIGEST_ROWS),
             database.prepare(TODAY_TASKS.format("<")).bind(date, DIGEST_ROWS),
             database.prepare(TODAY_RENEWING).bind(notice_days, notice_days, date, DIGEST_ROWS),
             database.prepare(TODAY_UNSCORED).bind(DIGEST_ROWS),
+            database.prepare(UNSENT).bind(DIGEST_ROWS),
         ]
     )
     # A day with nothing to report still gets its digest, which says so (specs/023-weekday-digest/spec.md).
     sections = notify.digest_sections({name: result["results"] for name, result in zip(names, results, strict=True)})
     sections = sections or notify.NOTHING
     subject, body = notify.render("digest", date=date, sections=sections)
-    stored = await (await notification(env, provider, "DAILY_DIGEST", recipient, subject, body)).first()
-    return str(stored["status"])
+    # Another run at the same moment may have made today's digest since the check above.
+    stored = await notification(env, provider, "DAILY_DIGEST", recipient, subject, body, since=None if now else began)
+    return str(stored["status"]) if stored else "ALREADY_MADE"
 
 
 async def run_scheduler(env: Any, email: bool = False) -> Row:
@@ -4336,8 +4382,10 @@ async def process_proposals(env: Any, agreement_id: str, real: bool = False, fre
             sections=notify.proposal_sections(proposals["items"]) or notify.NO_PROPOSALS,
         )
         provider = notify.PROVIDERS["CLOUDFLARE"] if real else notify.provider(getattr(env, "EMAIL_PROVIDER", None))
-        stored = await (await notification(env, provider, "SERVICE_PROPOSALS", recipient, subject, body, agreement_id)).first()
-        proposal_log(agreement_id, "finished", f"{len(runs)} runs, {len(proposals['items'])} services, email {stored['status']}")
+        # A second delivery of this start that got this far at the same moment sends no second email.
+        since = None if fresh else agreement["proposals_started_at"]
+        stored = await notification(env, provider, "SERVICE_PROPOSALS", recipient, subject, body, agreement_id, since)
+        proposal_log(agreement_id, "finished", f"{len(runs)} runs, {len(proposals['items'])} services, email {stored['status'] if stored else 'already recorded'}")
     except Exception as e:
         logger.error(json.dumps({"event": "carmen_proposals", "agreement_id": agreement_id, "step": "error", "error": type(e).__name__, "detail": str(e)[:300]}))
 

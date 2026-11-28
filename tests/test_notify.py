@@ -66,6 +66,13 @@ class Messages(unittest.TestCase):
         self.assertEqual(notify.digest_sections({}), "")
         self.assertEqual(notify.digest_sections({"tasks_due": [], "leads_unscored": []}), "")
 
+    def test_a_digest_names_a_message_that_may_not_have_been_sent(self):
+        rows = [{"kind": "RENEWAL_ALERT", "subject": "Renewal: Site build ends 2026-12-15", "created_at": "2026-11-28T09:00:00Z"}]
+        self.assertEqual(
+            notify.digest_sections({"unsent": rows}),
+            "Messages that may not have been sent (1)\n- Renewal: Site build ends 2026-12-15, recorded 2026-11-28T09:00:00Z",
+        )
+
     def test_a_digest_shows_only_the_lists_that_hold_something(self):
         text = notify.digest_sections(
             {
